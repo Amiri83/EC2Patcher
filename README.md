@@ -2,10 +2,10 @@
 
 A small, local, single-user web GUI for recurring security patching of Ubuntu EC2 servers.
 
-**Current scope: Phase 2.1.** This covers the application shell, the server inventory
+**Current scope: Phase 2.2.** This covers the application shell, the server inventory
 (with user-defined server tags), SSH connectivity testing, uploading/validating the
 security team's CVE report, and a **read-only pre-patch analysis** that produces a per-server
-report (with CVE severity and Excel export) and an exact package / .deb plan.
+report (with NVD CVSS severity and Excel export) and an exact package / .deb plan.
 Package downloads, installation, reboots and patch approval are **not** implemented yet;
 they come in Phase 3.
 
@@ -120,15 +120,33 @@ tag, and all remote facts, so later edits don't change historical results. Repor
 always matched against the canonical server **name**; `display_name` is shown but never used
 for matching. If the app is stopped during an analysis, the run is marked *interrupted*.
 
-**Severity (Phase 2.1).** Each CVE finding shows a Severity taken from Canonical's own priority
-("... classified this CVE as of *high* priority") as stored at analysis time: Critical, High,
-Medium or Low. Anything else (untriaged, negligible, missing, older runs without a priority)
-is shown as **Unknown**; nothing is guessed.
+**Severity (Phase 2.2).** Each CVE finding shows a **Severity** (Critical / High / Medium /
+Low / Unknown) and a compact **CVSS** value (e.g. `8.8 (v3.1)`) taken from the official
+[NVD CVE API 2.0](https://nvd.nist.gov/developers/vulnerabilities) during the analysis and
+stored with the finding. NVD is *only* used for severity: whether a CVE affects a server, the
+fixed version, the status and the package plan still come exclusively from Canonical.
+Canonical's own priority is still stored and shown as **Ubuntu Priority**.
+
+- CVSS selection (deterministic): the NVD/NIST assessment (`nvd@nist.gov`) if present, else
+  the CNA's *Primary* assessment, else any other; within each group CVSS v4.0 > v3.1 > v3.0
+  (ties by source name). CVSS v2 is only a last-resort fallback (never rated Critical).
+- The rating follows the numeric base score (0.1-3.9 Low, 4.0-6.9 Medium, 7.0-8.9 High,
+  9.0-10.0 Critical); a missing or inconsistent NVD `baseSeverity` is recorded, and a score of
+  0.0 (None) is shown as Unknown, never Low.
+- Each unique CVE is queried once per analysis, sequentially, 6 s apart (NVD's public limit of
+  5 requests / 30 s; 0.6 s with an API key). Set `NVD_API_KEY` to use a key; it is sent in the
+  `apiKey` request header and never stored, logged or exported.
+- Responses are cached per CVE in `~/.cache/ec2patcher/nvd/` for 24 hours. If NVD cannot be
+  reached, older cached data is used and marked *stale cache*; without a cache the severity is
+  **Unknown** ("NVD lookup failed"). NVD problems never change a finding's patch status.
+- Analyses made before Phase 2.2 keep their stored data and show Severity **Unknown**; they
+  are never re-fetched.
 
 **Export to Excel (Phase 2.1).** Each server report page has an *Export to Excel* button that
 downloads `ec2patcher_<server name>_<analysis date>.xlsx` with three sheets: *Summary*,
-*CVE Findings* (every stored finding) and *Package Plan*. The workbook is built on demand from
-the stored snapshot only; exporting never runs ssh, APT or metadata downloads.
+*CVE Findings* (every stored finding, including CVSS Score / Version / Vector, Severity Source
+and Ubuntu Priority) and *Package Plan*. The workbook is built on demand from the stored
+snapshot only; exporting never runs ssh, APT, NVD or metadata downloads.
 
 ### CVE report format
 
@@ -148,7 +166,8 @@ Case doesn't matter on input. IDs are normalized to uppercase and de-duplicated.
 - Python 3.10+
 - OpenSSH client (`ssh`) on `PATH` (for SSH tests and analysis)
 - Internet access to `security-metadata.canonical.com` for the security metadata (the cached
-  copy is used when offline)
+  copy is used when offline) and to `services.nvd.nist.gov` for CVSS severity (optional:
+  without it severities are Unknown)
 
 ## Install
 
@@ -184,11 +203,12 @@ Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
 | SQLite database | `~/.local/share/ec2patcher/ec2patcher.db` |
 | Log file | `~/.local/share/ec2patcher/ec2patcher.log` |
 | Canonical metadata cache | `~/.cache/ec2patcher/security-metadata/` |
+| NVD CVSS cache | `~/.cache/ec2patcher/nvd/` |
 
 Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
 user data directory. The schema is created and migrated automatically on startup. A database
 created by an earlier phase is upgraded in place (Phase 1.5 adds `server_tags`, Phase 2 adds the
-analysis tables); existing servers, tags and reports are kept.
+analysis tables, Phase 2.2 adds the CVSS columns); existing servers, tags and reports are kept.
 
 ## Test and lint
 
@@ -197,8 +217,9 @@ analysis tables); existing servers, tags and reports are kept.
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-The tests mock `ssh` and use fixture Canonical VEX data and captured APT output, so they never
-need a real EC2 server, a real PEM, internet access or package installs.
+The tests mock `ssh` and NVD and use fixture Canonical VEX data, NVD API responses and captured
+APT output, so they never need a real EC2 server, a real PEM, internet access or package
+installs.
 
 ## Project layout
 
@@ -217,6 +238,7 @@ src/ec2patcher/
     server_state.py       remote facts + dpkg inventory (binary -> source mapping)
     debversion.py         Debian version comparison (dpkg semantics)
     cve_resolver.py       CVE status, APT candidate check, package plan, reboot expectation
+    nvd.py                NVD CVE API 2.0 client + cache, CVSS selection (severity only)
     apt_planner.py        apt-cache / apt-get -s / --print-uris commands and parsers
     analysis_service.py   background analysis runs, persistence
   templates/         Jinja2 templates
