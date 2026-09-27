@@ -94,4 +94,53 @@
     </div>
   {% endif %}
 </div>
+
+<div class="card" id="analysis">
+  <div class="card-header">
+    <h2>Pre-Patch Analysis</h2>
+    {% if analysis_running %}<span class="badge badge-warning">RUNNING</span>{% endif %}
+  </div>
+  <p class="muted small">Connects to each server in the latest report (read-only, as <code>ubuntu</code>, no sudo),
+    checks installed packages against Canonical's Ubuntu security metadata and APT, and builds a per-server
+    pre-patch report. Nothing is downloaded, installed or restarted.</p>
+  {% if report %}
+    <form method="post" action="/reports/analyze" class="form-actions">
+      <button type="submit" class="btn btn-primary" {% if analysis_running %}disabled{% endif %}>Analyze Report</button>
+      <span class="muted small">{{ report.filename }} &middot; {{ report.server_count }} server{{ "" if report.server_count == 1 else "s" }} &middot; {{ report.cve_count }} CVE{{ "" if report.cve_count == 1 else "s" }}</span>
+    </form>
+  {% else %}
+    <p class="muted">Upload a valid report to enable analysis.</p>
+  {% endif %}
+
+  <dl class="kv metadata-kv">
+    <dt>Canonical security metadata</dt>
+    <dd>
+      {% if metadata_status.available %}
+        Published {{ metadata_status.updated_label }} &middot; cached {{ (metadata_status.checked_at or metadata_status.downloaded_at)|timestamp }}
+        &middot; {{ "{:,}".format(metadata_status.cve_count) }} CVEs
+        {% if metadata_status.stale %}<span class="badge badge-warning">STALE</span>{% endif %}
+      {% else %}
+        Not downloaded yet. The first analysis downloads it (about 70 MB) and indexes it locally; this takes several minutes.
+      {% endif %}
+    </dd>
+  </dl>
+  {% if metadata_status.warning %}<div class="alert alert-warning">{{ metadata_status.warning }}</div>{% endif %}
+
+  {% if runs %}
+    <table class="table">
+      <thead><tr><th>Analysis</th><th>Report</th><th>Started</th><th>Status</th><th>Servers</th></tr></thead>
+      <tbody>
+        {% for r in runs %}
+          <tr>
+            <td><a href="/analysis/{{ r.id }}">#{{ r.id }}</a>{% if loop.first %} <span class="badge badge-neutral">Latest</span>{% endif %}</td>
+            <td>{{ r.report_filename }}</td>
+            <td>{{ r.started_at|timestamp }}</td>
+            <td>{% include "_run_status.html" %}</td>
+            <td>{{ r.servers|selectattr("status", "equalto", "complete")|list|length }} of {{ r.servers|length }} complete</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
 {% endblock %}

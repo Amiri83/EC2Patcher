@@ -2,10 +2,12 @@
 
 A small, local, single-user web GUI for recurring security patching of Ubuntu EC2 servers.
 
-**Current scope: Phase 1.5.** This covers the application shell, the server inventory
-(with user-defined server tags), SSH connectivity testing, and uploading/validating the
-security team's CVE report.
-CVE analysis, package downloads and patching are **not** implemented yet; they come in later phases.
+**Current scope: Phase 2.** This covers the application shell, the server inventory
+(with user-defined server tags), SSH connectivity testing, uploading/validating the
+security team's CVE report, and a **read-only pre-patch analysis** that produces a per-server
+report and an exact package / .deb plan.
+Package downloads, installation, reboots and patch approval are **not** implemented yet;
+they come in Phase 3.
 
 ## Features (Phase 1 + 1.5)
 
@@ -40,6 +42,84 @@ CVE analysis, package downloads and patching are **not** implemented yet; they c
 - **History / Settings**: placeholders for later phases.
 - **Shutdown App**: stops the local server after you confirm. No data is removed.
 
+## Pre-patch analysis (Phase 2)
+
+On the **Reports** page, click **Analyze Report**. The analysis runs in the background and the
+page shows each server as *Waiting*, *Analyzing*, *Complete* or *Failed* (with the reason).
+Servers are analyzed one after another; one failing server never affects the others. When it
+finishes, **View Report** opens the per-server pre-patch report.
+
+**Read-only.** For each server in the latest report, EC2Patcher runs three fixed commands over
+the same SSH connection settings as the SSH test (`ubuntu@<ip>` with the configured PEM), as the
+unprivileged `ubuntu` user, **without sudo**:
+
+1. Facts: hostname, `/etc/os-release`, `dpkg --print-architecture`, `uname -r`,
+   `/run/reboot-required(.pkgs)`, APT list age, and `dpkg-query` (binary package, version,
+   **source package**, source version).
+2. APT candidates: `apt-cache policy` / `apt-cache show` for the affected binary packages, and
+   whether their installed maintainer scripts request a reboot.
+3. APT plan: `apt-get -s install ...` (simulation) and `apt-get --print-uris install ...` for
+   the exact candidate versions. `--print-uris` prints the URI, `.deb` file name, size and
+   SHA256 of every package the upgrade needs **without downloading anything**.
+
+Nothing is downloaded, copied, installed, removed or restarted. There is no SCP and no reboot.
+
+### How a CVE is decided
+
+Ubuntu tracks vulnerabilities per **source** package; APT installs **binary** packages. For
+each reported CVE and the server's Ubuntu release:
+
+1. Canonical's statement(s) for the release name the affected source package(s) and, when
+   fixed, the fixed version (Ubuntu Pro / ESM pockets such as `esm-infra/focal` are recognised).
+2. `dpkg-query` maps installed binary packages to their source package and source version
+   (no substring matching).
+3. Versions are compared with Debian semantics (epochs, revisions, `~`), identical to
+   `dpkg --compare-versions`.
+4. If a patch is required, the server's APT candidate must be at least the fixed version;
+   otherwise the finding says *Fix known - suitable APT candidate not available* and why.
+5. The APT simulation + `--print-uris` produce the exact .deb plan. Packages fixing several
+   CVEs appear once, linked to every CVE they fix.
+
+Statuses: *Patch required*, *Already fixed*, *Not affected*, *Package not installed*,
+*Fix not available*, *Fix requires Ubuntu Pro / ESM*, *Fix known - suitable APT candidate not
+available*, *Under investigation / needs evaluation*, *Ignored / no fix planned*,
+*Analysis error*. Anything that cannot be decided is shown as such, never as safe. A CVE that
+Canonical does not know is *needs evaluation*.
+
+**Kernels:** kernel CVEs are checked against the *running* kernel. The upgrade path is the
+installed kernel meta package (e.g. `linux-aws`), which pulls in the new ABI packages
+(`linux-image-<abi>-aws`, ...). If a fixed kernel is already installed but not running, the
+finding is *Already fixed* with a *reboot pending* note.
+
+**Reboot:** *Current reboot required* reads `/run/reboot-required`. *Expected reboot after
+planned patch* is YES when the plan contains a new kernel image/modules, or a package whose
+maintainer scripts request a reboot (e.g. `libc6`, `dbus`). The final requirement is verified
+after installation in Phase 3.
+
+### Canonical security metadata
+
+Source: Canonical's official Ubuntu OpenVEX data,
+<https://security-metadata.canonical.com/vex/vex-all.tar.xz> (NVD, ubuntu.com web pages and
+the Ubuntu Security API are not used). The ~70 MB archive (~26 GB uncompressed) is streamed
+once and reduced to a small local index; analyses then query it locally.
+
+- Cache: `~/.cache/ec2patcher/security-metadata/` (override with `$EC2PATCHER_CACHE_DIR`),
+  about 160 MB (archive + index).
+- The first analysis downloads and indexes the data; this takes several minutes. Later
+  analyses refresh it at most once a day, using a conditional request (no download if
+  unchanged).
+- If a refresh fails but a cache exists, the cached data is used and the report shows a
+  **STALE DATA** warning with the cache time. With no usable data, the analysis fails; nothing
+  is guessed.
+
+### Results
+
+Every analysis is stored as a new run in SQLite (older runs are kept and remain viewable from
+the Reports page). A run keeps a snapshot of the report, the server name, IP and `display_name`
+tag, and all remote facts, so later edits don't change historical results. Report keys are
+always matched against the canonical server **name**; `display_name` is shown but never used
+for matching. If the app is stopped during an analysis, the run is marked *interrupted*.
+
 ### CVE report format
 
 ```json
@@ -56,7 +136,9 @@ Case doesn't matter on input. IDs are normalized to uppercase and de-duplicated.
 ## Requirements
 
 - Python 3.10+
-- OpenSSH client (`ssh`) on `PATH` (only for SSH tests)
+- OpenSSH client (`ssh`) on `PATH` (for SSH tests and analysis)
+- Internet access to `security-metadata.canonical.com` for the security metadata (the cached
+  copy is used when offline)
 
 ## Install
 
@@ -91,11 +173,12 @@ Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
 |---|---|
 | SQLite database | `~/.local/share/ec2patcher/ec2patcher.db` |
 | Log file | `~/.local/share/ec2patcher/ec2patcher.log` |
+| Canonical metadata cache | `~/.cache/ec2patcher/security-metadata/` |
 
 Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
 user data directory. The schema is created and migrated automatically on startup. A database
-created by Phase 1 is upgraded in place: the `server_tags` table is added, and existing servers
-and reports are kept.
+created by an earlier phase is upgraded in place (Phase 1.5 adds `server_tags`, Phase 2 adds the
+analysis tables); existing servers, tags and reports are kept.
 
 ## Test and lint
 
@@ -104,7 +187,8 @@ and reports are kept.
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-The tests mock `ssh`, so they never need a real EC2 server.
+The tests mock `ssh` and use fixture Canonical VEX data and captured APT output, so they never
+need a real EC2 server, a real PEM, internet access or package installs.
 
 ## Project layout
 
@@ -117,8 +201,14 @@ src/ec2patcher/
   models.py          Server / Tag / StoredReport dataclasses
   validation.py      server name / IP / PEM path / tag validation
   services/
-    ssh_service.py     SSH connectivity test (subprocess, no shell)
-    report_service.py  CVE report structural validation
+    ssh_service.py        SSH connectivity test + read-only remote commands (no shell)
+    report_service.py     CVE report structural validation
+    security_metadata.py  Canonical VEX download, local index, stale-data handling
+    server_state.py       remote facts + dpkg inventory (binary -> source mapping)
+    debversion.py         Debian version comparison (dpkg semantics)
+    cve_resolver.py       CVE status, APT candidate check, package plan, reboot expectation
+    apt_planner.py        apt-cache / apt-get -s / --print-uris commands and parsers
+    analysis_service.py   background analysis runs, persistence
   templates/         Jinja2 templates
   static/            CSS + a small amount of vanilla JS
 tests/               pytest suite
@@ -130,4 +220,6 @@ tests/               pytest suite
   It also rejects cross-site POSTs, which guards against CSRF and DNS-rebinding attacks from
   websites open in your browser.
 - The app never reads PEM contents. Subprocesses never use `shell=True`.
+- Analysis commands are fixed strings; package names and versions are validated against strict
+  patterns and shell-quoted. No `sudo`, no downloads, no installs.
 - Unexpected errors show a generic message in the GUI; details go to the log.
