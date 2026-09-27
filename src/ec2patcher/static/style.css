@@ -172,6 +172,37 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 .format-help summary { cursor: pointer; color: var(--muted); }
 .error-list { margin: 0 0 12px; padding-left: 20px; color: var(--danger); }
 
+/* Analysis (Phase 2) */
+.badge-warning { background: var(--warning-bg); color: var(--warning); }
+.text-danger { color: var(--danger); }
+.text-warning { color: var(--warning); }
+.metadata-kv { margin-top: 16px; }
+.progress-message { font-weight: 500; }
+.progress-list { list-style: none; margin: 0; padding: 0; }
+.progress-item { display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; border-top: 1px solid #eceef1; }
+.progress-icon { width: 22px; text-align: center; font-size: 18px; line-height: 1.3; }
+.progress-main { flex: 1; min-width: 0; }
+.progress-state { margin-left: 8px; font-size: 13px; color: var(--muted); }
+.progress-complete .progress-icon { color: var(--success); }
+.progress-analyzing .progress-icon { color: var(--primary); }
+.progress-waiting .progress-icon { color: var(--muted); }
+.progress-failed .progress-icon, .progress-error { color: var(--danger); }
+.progress-error { font-size: 13px; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.summary-item { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; display: flex; flex-direction: column; }
+.summary-value { font-size: 22px; font-weight: 700; }
+.summary-label { font-size: 12px; color: var(--muted); }
+.summary-danger { border-color: #e8b4ae; background: var(--danger-bg); }
+.summary-warning { border-color: #f0d9a0; background: var(--warning-bg); }
+.status-breakdown { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.table-scroll { overflow-x: auto; }
+.finding-detail { margin-top: 4px; max-width: 360px; }
+.pkg-list code { display: inline-block; margin: 0 4px 4px 0; }
+.row-warning { background: #fffbf0; }
+.report-details summary { cursor: pointer; }
+.table .wrap { word-break: break-all; }
+.plain-list { margin: 0; padding-left: 18px; }
+
 /* Misc */
 .empty-state { text-align: center; padding: 28px 12px; }
 .empty-title { font-weight: 600; font-size: 16px; margin: 0 0 4px; }
