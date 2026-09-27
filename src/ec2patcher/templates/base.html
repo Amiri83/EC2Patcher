@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}EC2 Patcher{% endblock %} · EC2 Patcher</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-title">EC2 Patcher</span>
+      <span class="brand-sub">v{{ version }}</span>
+    </div>
+    <nav class="nav">
+      {% set items = [('dashboard', '/', 'Dashboard'), ('servers', '/servers', 'Servers'),
+                      ('reports', '/reports', 'Reports'), ('history', '/history', 'History'),
+                      ('settings', '/settings', 'Settings')] %}
+      {% for key, href, label in items %}
+        <a href="{{ href }}" class="nav-link{% if active == key %} active{% endif %}"
+           {% if active == key %}aria-current="page"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <div class="nav-bottom">
+      <a href="/shutdown" class="nav-link nav-shutdown{% if active == 'shutdown' %} active{% endif %}">Shutdown App</a>
+    </div>
+  </aside>
+  <main class="content">
+    <header class="page-header">
+      <h1>{% block heading %}{% endblock %}</h1>
+      {% block header_actions %}{% endblock %}
+    </header>
+    {% if notice %}<div class="alert alert-success" role="status">{{ notice }}</div>{% endif %}
+    {% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<script src="{{ url_for('static', path='app.js') }}"></script>
+</body>
+</html>

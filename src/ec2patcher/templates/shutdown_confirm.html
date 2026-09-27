@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Shutdown{% endblock %}
+{% block heading %}Shutdown App{% endblock %}
+{% block content %}
+<div class="card form-card">
+  <h2>Stop EC2 Patcher?</h2>
+  <p>This stops the local EC2 Patcher server. Your servers and the latest report are saved
+     and will be available the next time you start the app.</p>
+  <form method="post" action="/shutdown" class="form-actions">
+    <input type="hidden" name="confirm" value="yes">
+    <span class="spacer"></span>
+    <a href="/" class="btn btn-ghost">Cancel</a>
+    <button type="submit" class="btn btn-danger">Shutdown App</button>
+  </form>
+</div>
+{% endblock %}

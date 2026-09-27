@@ -1,0 +1,19 @@
+<div class="ssh-result {% if ssh_result.success %}ssh-ok{% else %}ssh-fail{% endif %}" role="status">
+  {% if ssh_result.success %}
+    <div class="ssh-title"><span class="badge badge-success">SSH CONNECTION SUCCESSFUL</span></div>
+    <dl class="kv">
+      <dt>Server</dt><dd>{{ ssh_result.server_name }}</dd>
+      <dt>IP</dt><dd>{{ ssh_result.ip_address }}</dd>
+      <dt>Hostname</dt><dd>{{ ssh_result.hostname }}</dd>
+      <dt>OS</dt><dd>{{ ssh_result.os_release }}</dd>
+      <dt>Architecture</dt><dd>{{ ssh_result.architecture }}</dd>
+    </dl>
+  {% else %}
+    <div class="ssh-title"><span class="badge badge-danger">SSH CONNECTION FAILED</span></div>
+    <dl class="kv">
+      <dt>Server</dt><dd>{{ ssh_result.server_name }}</dd>
+      <dt>IP</dt><dd>{{ ssh_result.ip_address or "—" }}</dd>
+      <dt>Error</dt><dd>{{ ssh_result.error }}</dd>
+    </dl>
+  {% endif %}
+</div>

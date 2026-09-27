@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Reports{% endblock %}
+{% block heading %}Reports{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Upload Security CVE Report</h2>
+  <form method="post" action="/reports/upload" enctype="multipart/form-data" class="upload-form">
+    <label class="dropzone" id="dropzone">
+      <input type="file" name="report_file" id="report_file" accept=".json,application/json" required>
+      <span class="dropzone-text" id="dropzone-text">Choose a JSON file or drag it here</span>
+      <span class="muted small">JSON only, up to {{ max_kib }} KiB</span>
+    </label>
+    <div class="form-actions">
+      <span class="spacer"></span>
+      <button type="submit" class="btn btn-primary">Upload &amp; Validate</button>
+    </div>
+  </form>
+  <details class="format-help">
+    <summary>Expected format</summary>
+    <pre>{
+  "app-prod-01": ["CVE-2026-12345", "CVE-2026-67890"],
+  "database-prod-01": ["CVE-2026-22222"]
+}</pre>
+    <p class="muted small">Each key must be the name of a configured server. Each value must be an array of CVE identifiers.</p>
+  </details>
+</div>
+
+{% if upload_error %}
+  <div class="alert alert-error" role="alert">{{ upload_error }}</div>
+{% endif %}
+
+{% if validation %}
+  <div class="card {% if validation.valid %}result-ok{% else %}result-fail{% endif %}">
+    <div class="card-header">
+      <h2>Validation Result</h2>
+      {% if validation.valid %}
+        <span class="badge badge-success">VALID</span>
+      {% else %}
+        <span class="badge badge-danger">VALIDATION FAILED</span>
+      {% endif %}
+    </div>
+    <dl class="kv">
+      <dt>Report</dt><dd>{{ validation.filename }}</dd>
+      {% if validation.valid %}
+        <dt>Servers in report</dt><dd>{{ validation.server_count }}</dd>
+        <dt>CVEs in report</dt><dd>{{ validation.cve_count }}</dd>
+        <dt>Validation</dt><dd>VALID</dd>
+      {% else %}
+        <dt>Validation</dt><dd>FAILED</dd>
+      {% endif %}
+    </dl>
+    {% if validation.valid %}
+      <p class="muted small">The report was accepted and saved as the latest report.</p>
+    {% else %}
+      <ul class="error-list">
+        {% for err in validation.errors %}<li>{{ err }}</li>{% endfor %}
+      </ul>
+      <p class="muted small">The report was not saved.{% if report %} The previously accepted report is still in use.{% endif %}</p>
+    {% endif %}
+  </div>
+{% endif %}
+
+<div class="card">
+  <div class="card-header">
+    <h2>Latest Accepted Report</h2>
+    {% if report %}<span class="badge badge-success">{{ report.status }}</span>{% endif %}
+  </div>
+  {% if report %}
+    <dl class="kv">
+      <dt>Report</dt><dd>{{ report.filename }}</dd>
+      <dt>Uploaded</dt><dd>{{ report.uploaded_at|timestamp }}</dd>
+      <dt>Servers in report</dt><dd>{{ report.server_count }}</dd>
+      <dt>CVEs in report</dt><dd>{{ report.cve_count }}</dd>
+    </dl>
+    {% if missing_servers %}
+      <div class="alert alert-warning">Some servers in this report are no longer configured: {{ missing_servers|join(", ") }}</div>
+    {% endif %}
+    <table class="table">
+      <thead><tr><th>Server</th><th class="num">CVEs</th><th>Identifiers</th></tr></thead>
+      <tbody>
+        {% for name, cves in report.servers.items() %}
+          <tr>
+            <td><strong>{{ name }}</strong></td>
+            <td class="num">{{ cves|length }} CVE{{ "" if cves|length == 1 else "s" }}</td>
+            <td class="cve-list">{% for c in cves %}<code>{{ c }}</code>{% endfor %}{% if not cves %}<span class="muted">none</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <div class="empty-state">
+      <p class="empty-title">No report uploaded yet</p>
+      <p class="muted">Upload the security team's CVE JSON report above.</p>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

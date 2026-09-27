@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Servers{% endblock %}
+{% block heading %}Servers{% endblock %}
+{% block header_actions %}<a href="/servers/new" class="btn btn-primary">+ Add Server</a>{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h2>Server Inventory</h2>
+    <span class="badge badge-neutral">{{ servers|length }} configured</span>
+  </div>
+  {% if servers %}
+    <p class="muted small">SSH user is fixed to <code>ubuntu</code>. Only PEM file paths are stored, never key contents.</p>
+    <ul class="server-list">
+      {% for s in servers %}
+        <li class="server-item" id="server-{{ s.id }}">
+          <div class="server-main">
+            <div class="server-name">{{ s.name }}</div>
+            <div class="server-meta">
+              <span><span class="meta-label">IP</span> <code>{{ s.ip_address }}</code></span>
+              <span><span class="meta-label">PEM</span> <code>{{ s.pem_path }}</code></span>
+            </div>
+          </div>
+          <div class="server-actions">
+            <form method="post" action="/servers/{{ s.id }}/test">
+              <button type="submit" class="btn btn-secondary btn-sm">Test SSH</button>
+            </form>
+            <a href="/servers/{{ s.id }}/edit" class="btn btn-secondary btn-sm">Edit</a>
+            <form method="post" action="/servers/{{ s.id }}/delete"
+                  data-confirm="Delete server '{{ s.name }}'?">
+              <button type="submit" class="btn btn-danger-outline btn-sm">Delete</button>
+            </form>
+          </div>
+          {% if ssh_result and tested_id == s.id %}
+            <div class="server-result">{% include "_ssh_result.html" %}</div>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <div class="empty-state">
+      <p class="empty-title">No servers configured</p>
+      <p class="muted">Add your first Ubuntu EC2 server to get started.</p>
+      <a href="/servers/new" class="btn btn-primary">+ Add Server</a>
+    </div>
+  {% endif %}
+</div>
+
+{% if servers %}
+<div class="card danger-zone">
+  <h2>Clear All Servers</h2>
+  <p>This will remove all configured servers. The latest uploaded report is not affected.
+     This cannot be undone.</p>
+  <form method="post" action="/servers/clear" class="clear-form">
+    <label for="confirm_text">Type <strong>{{ confirm_text }}</strong> to confirm</label>
+    <div class="inline">
+      <input type="text" id="confirm_text" name="confirm_text" autocomplete="off"
+             data-required-text="{{ confirm_text }}" placeholder="{{ confirm_text }}">
+      <button type="submit" class="btn btn-danger" data-enable-when-confirmed>Clear All Servers</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

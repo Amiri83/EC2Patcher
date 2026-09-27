@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block heading %}Dashboard{% endblock %}
+{% block content %}
+<div class="stat-grid">
+  <div class="card stat">
+    <div class="stat-label">Configured Servers</div>
+    <div class="stat-value">{{ server_count }}</div>
+    <a href="/servers" class="stat-link">Manage servers →</a>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Latest Report</div>
+    {% if report %}
+      <div class="stat-value stat-value-text" title="{{ report.filename }}">{{ report.filename }}</div>
+      <div class="muted small">{{ report.server_count }} servers · {{ report.cve_count }} CVEs · uploaded {{ report.uploaded_at|timestamp }}</div>
+    {% else %}
+      <div class="stat-value stat-value-text muted">None uploaded</div>
+    {% endif %}
+    <a href="/reports" class="stat-link">View reports →</a>
+  </div>
+  <div class="card stat">
+    <div class="stat-label">Application</div>
+    <div class="stat-value stat-value-text"><span class="badge badge-success">Running</span></div>
+    <div class="muted small">Listening locally · data stored in SQLite</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Getting started</h2>
+  <ol class="steps">
+    <li>Add your Ubuntu EC2 servers on the <a href="/servers">Servers</a> page and test SSH connectivity.</li>
+    <li>Upload the security team's CVE JSON report on the <a href="/reports">Reports</a> page.</li>
+  </ol>
+  <p class="muted small">Patch analysis and patching are not available yet; they arrive in later phases.</p>
+</div>
+{% endblock %}
