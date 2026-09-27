@@ -6,7 +6,6 @@ import signal
 import subprocess  # noqa: S404 - default runner handed to the ssh service
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
@@ -21,8 +20,16 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from ec2patcher import __version__
 from ec2patcher.config import DB_FILENAME, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
-from ec2patcher.services import analysis_service, cve_resolver, report_service, ssh_service
+from ec2patcher.formatting import format_size, format_timestamp
+from ec2patcher.services import (
+    analysis_service,
+    cve_resolver,
+    excel_export,
+    report_service,
+    ssh_service,
+)
 from ec2patcher.services.security_metadata import SecurityMetadata
+from ec2patcher.services.severity import SEVERITY_CLASSES
 from ec2patcher.validation import tag_rows, validate_server_input
 
 logger = logging.getLogger(__name__)
@@ -44,25 +51,6 @@ def _default_shutdown() -> None:
     # Used when the app is not started through ec2patcher.main (e.g. plain uvicorn):
     # SIGINT triggers uvicorn's normal graceful shutdown.
     os.kill(os.getpid(), signal.SIGINT)
-
-
-def format_timestamp(value: str) -> str:
-    """Render a stored UTC ISO timestamp in local time, e.g. '2026-09-26 23:25 MDT'."""
-    try:
-        return datetime.fromisoformat(value).astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    except (TypeError, ValueError):
-        return value
-
-
-def format_size(value: int | None) -> str:
-    if value is None:
-        return "-"
-    size = float(value)
-    for unit in ("B", "KiB", "MiB", "GiB"):
-        if size < 1024 or unit == "GiB":
-            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return str(value)
 
 
 STATUS_CLASSES = {
@@ -118,6 +106,7 @@ def create_app(
     templates.env.globals["status_labels"] = cve_resolver.STATUS_LABELS
     templates.env.globals["status_classes"] = STATUS_CLASSES
     templates.env.globals["reboot_help"] = cve_resolver.REBOOT_HELP
+    templates.env.globals["severity_classes"] = SEVERITY_CLASSES
     app.state.analyzer = analyzer
 
     def run_ssh_test(name: str, ip: str, pem: str) -> ssh_service.SSHTestResult:
@@ -388,12 +377,16 @@ def create_app(
             request, "analysis_run.html", "reports", run=run, summaries=summaries,
         )  # fmt: skip
 
-    @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
-    def server_report(request: Request, run_id: int, analysis_id: int):
+    def stored_server_report(run_id: int, analysis_id: int):
         run = db.get_analysis_run(run_id, details=False)
         analysis = db.get_server_analysis(analysis_id)
         if run is None or analysis is None or analysis.run_id != run_id:
             raise StarletteHTTPException(404)
+        return run, analysis
+
+    @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
+    def server_report(request: Request, run_id: int, analysis_id: int):
+        run, analysis = stored_server_report(run_id, analysis_id)
         latest = db.get_latest_analysis_run()
         return render(
             request, "server_report.html", "reports", run=run, analysis=analysis,
@@ -401,6 +394,19 @@ def create_app(
             finding_groups=analysis_service.group_findings(analysis),
             is_latest=latest is not None and latest.id == run_id,
         )  # fmt: skip
+
+    @app.get("/analysis/{run_id}/servers/{analysis_id}/export.xlsx")
+    def export_server_report(run_id: int, analysis_id: int):
+        # Built from the stored snapshot only: no ssh, metadata, APT or downloads.
+        run, analysis = stored_server_report(run_id, analysis_id)
+        filename = excel_export.export_filename(run, analysis)
+        content = excel_export.build_workbook(run, analysis)
+        logger.info("Excel export of analysis %s/%s (%s)", run_id, analysis_id, filename)
+        return Response(
+            content,
+            media_type=excel_export.MEDIA_TYPE,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     # --- history / settings --------------------------------------------------
 

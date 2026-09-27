@@ -17,6 +17,7 @@ from ec2patcher.services import debversion
 from ec2patcher.services.apt_planner import Candidate, DownloadPlan
 from ec2patcher.services.security_metadata import CveRecord, VexEntry
 from ec2patcher.services.server_state import InstalledPackage, ServerFacts
+from ec2patcher.services.severity import normalize_severity
 
 PATCH_REQUIRED = "PATCH_REQUIRED"
 ALREADY_FIXED = "ALREADY_FIXED"
@@ -78,12 +79,16 @@ class Finding:
     fixed_version: str | None = None
     binaries: list[str] = field(default_factory=list)
     pocket: str | None = None  # distro the fixed version was published in
-    priority: str | None = None
+    priority: str | None = None  # raw Canonical priority, persisted as-is
     is_kernel: bool = False
 
     @property
     def status_label(self) -> str:
         return STATUS_LABELS.get(self.status, self.status)
+
+    @property
+    def severity(self) -> str:
+        return normalize_severity(self.priority)
 
 
 @dataclass

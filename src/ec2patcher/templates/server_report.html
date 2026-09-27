@@ -1,7 +1,10 @@
 {% extends "base.html" %}
 {% block title %}{{ analysis.server_name }} - Pre-Patch Report{% endblock %}
 {% block heading %}Pre-Patch Report: {{ analysis.server_name }}{% endblock %}
-{% block header_actions %}<a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>{% endblock %}
+{% block header_actions %}<div class="header-actions">
+  <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/export.xlsx" class="btn btn-primary" download>Export to Excel</a>
+  <a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>
+</div>{% endblock %}
 {% block content %}
 {% if not is_latest %}
   <div class="alert alert-warning">This is a historical report from analysis #{{ run.id }}. A newer analysis exists.</div>
@@ -74,17 +77,17 @@
   {% if analysis.findings %}
     <div class="table-scroll">
     <table class="table findings-table">
-      <thead><tr><th>CVE</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Fixed Version</th><th>Status</th><th>Related Binary Package(s)</th></tr></thead>
+      <thead><tr><th>CVE</th><th>Severity</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Fixed Version</th><th>Status</th><th>Related Binary Package(s)</th></tr></thead>
       {% for g in finding_groups %}
       <tbody class="cve-group">
         {% for f in g.rows %}
           <tr>
             <td class="num">{% if loop.first %}<code>{{ f.cve }}</code>{% else %}<span class="muted small">&#8627; same CVE</span>{% endif %}</td>
+            <td><span class="badge {{ severity_classes[f.severity] }}"{% if f.priority %} title="Canonical priority: {{ f.priority }}"{% endif %}>{{ f.severity }}</span></td>
             <td>{{ f.source_package or "-" }}</td>
             <td><code>{{ f.installed_version or "-" }}</code></td>
             <td>{% if f.fixed_version %}<code>{{ f.fixed_version }}</code>{% if f.pocket and "/" in f.pocket %} <span class="muted small">({{ f.pocket }})</span>{% endif %}{% else %}-{% endif %}</td>
             <td><span class="badge {{ status_classes.get(f.status, 'badge-neutral') }}">{{ status_labels.get(f.status, f.status) }}</span>
-                {% if f.priority %}<span class="muted small">{{ f.priority }} priority</span>{% endif %}
                 {% if f.detail %}<div class="muted small finding-detail">{{ f.detail }}</div>{% endif %}</td>
             <td class="pkg-list">
               {% if f.binary_packages|length > 6 %}
@@ -98,6 +101,7 @@
         {% if g.not_installed %}
           <tr>
             <td class="num"><span class="muted small">&#8627; same CVE</span></td>
+            <td>{% for sev in g.not_installed|map(attribute="severity")|unique %}<span class="badge {{ severity_classes[sev] }}">{{ sev }}</span> {% endfor %}</td>
             <td colspan="3">
               <details><summary>{{ g.not_installed|length }} other source packages</summary>
                 {% for f in g.not_installed %}<code>{{ f.source_package }}</code> {% endfor %}</details>
