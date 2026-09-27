@@ -2,11 +2,12 @@
 
 A small, local, single-user web GUI for recurring security patching of Ubuntu EC2 servers.
 
-**Current scope: Phase 1.** This phase covers the application shell, the server inventory,
-SSH connectivity testing, and uploading/validating the security team's CVE report.
+**Current scope: Phase 1.5.** This covers the application shell, the server inventory
+(with user-defined server tags), SSH connectivity testing, and uploading/validating the
+security team's CVE report.
 CVE analysis, package downloads and patching are **not** implemented yet; they come in later phases.
 
-## Features (Phase 1)
+## Features (Phase 1 + 1.5)
 
 - **Dashboard**: number of configured servers, the latest accepted report, and application status.
 - **Servers**: add, edit, delete and SSH-test servers. **Clear All Servers** requires typing
@@ -17,6 +18,18 @@ CVE analysis, package downloads and patching are **not** implemented yet; they c
   - Only the PEM *path* is stored. Key contents are never read, stored or logged. `~` is expanded.
     The PEM file must exist and be readable when you save or test a server.
   - The SSH user is always `ubuntu`, and only key-based auth is used.
+- **Server tags** (Phase 1.5): optional free-form key/value labels per server, e.g.
+  `display_name = Billing API`, `env = prod`.
+  - Add, edit and remove tag rows on the Add/Edit Server form (**+ Add Tag** / **Remove**).
+    Saving stores exactly the rows shown; removed rows are deleted.
+  - Keys and values are trimmed. A key is required (max 64 chars); the value may be empty
+    (max 256 chars). Rows with a blank key *and* value are ignored. Up to 50 tags per server.
+  - Keys are unique per server, regardless of case (`Duplicate tag key: env`). Different
+    servers can use the same key.
+  - The Servers page shows the first two tags, sorted by key, then **+N more**. Hover over it
+    to see all tags.
+  - Deleting a server or using **Clear All Servers** also removes its tags.
+  - Tags are inventory metadata only. CVE reports are always matched by the server **name**.
 - **SSH test**: runs `ssh -i <pem> ubuntu@<ip>` with `BatchMode=yes` and `ConnectTimeout=10`,
   plus a 30 s overall limit. It shows the hostname, OS release and architecture, or a short error
   such as *Permission denied (publickey)* or *Connection timed out*. The system OpenSSH client
@@ -80,7 +93,9 @@ Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
 | Log file | `~/.local/share/ec2patcher/ec2patcher.log` |
 
 Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
-user data directory. The schema is created and migrated automatically on startup.
+user data directory. The schema is created and migrated automatically on startup. A database
+created by Phase 1 is upgraded in place: the `server_tags` table is added, and existing servers
+and reports are kept.
 
 ## Test and lint
 
@@ -98,9 +113,9 @@ src/ec2patcher/
   main.py            CLI entry point (argparse + uvicorn, shutdown hook)
   app.py             FastAPI app and all routes
   config.py          data directory / defaults
-  database.py        SQLite schema, migrations, server + report storage
-  models.py          Server / StoredReport dataclasses
-  validation.py      server name / IP / PEM path validation
+  database.py        SQLite schema, migrations, server + tag + report storage
+  models.py          Server / Tag / StoredReport dataclasses
+  validation.py      server name / IP / PEM path / tag validation
   services/
     ssh_service.py     SSH connectivity test (subprocess, no shell)
     report_service.py  CVE report structural validation

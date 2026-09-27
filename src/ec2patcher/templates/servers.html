@@ -19,6 +19,16 @@
               <span><span class="meta-label">IP</span> <code>{{ s.ip_address }}</code></span>
               <span><span class="meta-label">PEM</span> <code>{{ s.pem_path }}</code></span>
             </div>
+            {% if s.tags %}
+              <div class="server-tags">
+                {% for t in s.tags[:2] %}
+                  <span class="tag"><span class="tag-key">{{ t.key }}{% if t.value %}:{% endif %}</span>{% if t.value %} {{ t.value }}{% endif %}</span>
+                {% endfor %}
+                {% if s.tags|length > 2 %}
+                  <span class="tag-more" title="{% for t in s.tags %}{{ t.key }}={{ t.value }}{% if not loop.last %}, {% endif %}{% endfor %}">+{{ s.tags|length - 2 }} more</span>
+                {% endif %}
+              </div>
+            {% endif %}
           </div>
           <div class="server-actions">
             <form method="post" action="/servers/{{ s.id }}/test">

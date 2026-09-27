@@ -1,6 +1,16 @@
 """Plain data objects shared between the database layer and the web layer."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Tag:
+    """User-defined key/value metadata attached to a server (inventory only)."""
+
+    id: int
+    server_id: int
+    key: str
+    value: str
 
 
 @dataclass
@@ -11,6 +21,7 @@ class Server:
     pem_path: str
     created_at: str
     updated_at: str
+    tags: list[Tag] = field(default_factory=list)  # ordered by key (case-insensitive), then id
 
 
 @dataclass

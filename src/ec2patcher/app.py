@@ -19,9 +19,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ec2patcher import __version__
 from ec2patcher.config import DB_FILENAME, get_data_dir
-from ec2patcher.database import Database, DuplicateServerNameError
+from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
 from ec2patcher.services import report_service, ssh_service
-from ec2patcher.validation import validate_server_input
+from ec2patcher.validation import tag_rows, validate_server_input
 
 logger = logging.getLogger(__name__)
 
@@ -161,32 +161,54 @@ def create_app(
         )  # fmt: skip
 
     def handle_server_form(
-        request: Request, server_id: int | None, action: str, name: str, ip: str, pem: str
+        request: Request,
+        server_id: int | None,
+        action: str,
+        name: str,
+        ip: str,
+        pem: str,
+        tag_keys: list[str] | None,
+        tag_values: list[str] | None,
     ):
         form = {"name": name, "ip_address": ip, "pem_path": pem}
+        form["tags"] = tag_rows(tag_keys, tag_values)
         if action == "test":
             result = run_ssh_test(name.strip() or "(unsaved)", ip.strip(), pem)
             return server_form(request, server_id, form, ssh_result=result)
 
-        data = validate_server_input(db, name, ip, pem, exclude_id=server_id)
+        data = validate_server_input(
+            db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values
+        )
         if not data.is_valid:
             return server_form(request, server_id, form, status_code=422, errors=data.errors)
         try:
             if server_id is None:
-                db.create_server(data.name, data.ip_address, data.pem_path)
-                logger.info("Server created: %s (%s)", data.name, data.ip_address)
+                db.create_server(data.name, data.ip_address, data.pem_path, tags=data.tags)
+                logger.info(
+                    "Server created: %s (%s), %d tag(s)", data.name, data.ip_address, len(data.tags)
+                )
                 return redirect("/servers", notice="created", name=data.name)
-            if not db.update_server(server_id, data.name, data.ip_address, data.pem_path):
+            if not db.update_server(
+                server_id, data.name, data.ip_address, data.pem_path, tags=data.tags
+            ):
                 return redirect("/servers", notice="not_found")
-            logger.info("Server edited: id=%s %s (%s)", server_id, data.name, data.ip_address)
+            logger.info(
+                "Server edited: id=%s %s (%s), %d tag(s)",
+                server_id, data.name, data.ip_address, len(data.tags),
+            )  # fmt: skip
             return redirect("/servers", notice="updated", name=data.name)
         except DuplicateServerNameError:
             errors = {"name": f"A server named '{data.name}' already exists. Names must be unique."}
             return server_form(request, server_id, form, status_code=422, errors=errors)
+        except DuplicateTagKeyError as exc:
+            errors = {"tags": f"Duplicate tag key: {exc.args[0]}"}
+            return server_form(request, server_id, form, status_code=422, errors=errors)
 
     @app.get("/servers/new", response_class=HTMLResponse)
     def new_server(request: Request):
-        return server_form(request, None, {"name": "", "ip_address": "", "pem_path": ""})
+        return server_form(
+            request, None, {"name": "", "ip_address": "", "pem_path": "", "tags": []}
+        )
 
     @app.post("/servers/new", response_class=HTMLResponse)
     def create_server(
@@ -195,15 +217,24 @@ def create_app(
         name: str = Form(""),
         ip_address: str = Form(""),
         pem_path: str = Form(""),
+        tag_key: list[str] | None = Form(None),  # noqa: B008
+        tag_value: list[str] | None = Form(None),  # noqa: B008
     ):
-        return handle_server_form(request, None, action, name, ip_address, pem_path)
+        return handle_server_form(
+            request, None, action, name, ip_address, pem_path, tag_key, tag_value
+        )
 
     @app.get("/servers/{server_id}/edit", response_class=HTMLResponse)
     def edit_server(request: Request, server_id: int):
         server = db.get_server(server_id)
         if server is None:
             return redirect("/servers", notice="not_found")
-        form = {"name": server.name, "ip_address": server.ip_address, "pem_path": server.pem_path}
+        form = {
+            "name": server.name,
+            "ip_address": server.ip_address,
+            "pem_path": server.pem_path,
+            "tags": [{"key": t.key, "value": t.value} for t in server.tags],
+        }
         return server_form(request, server_id, form)
 
     @app.post("/servers/{server_id}/edit", response_class=HTMLResponse)
@@ -214,10 +245,14 @@ def create_app(
         name: str = Form(""),
         ip_address: str = Form(""),
         pem_path: str = Form(""),
+        tag_key: list[str] | None = Form(None),  # noqa: B008
+        tag_value: list[str] | None = Form(None),  # noqa: B008
     ):
         if db.get_server(server_id) is None:
             return redirect("/servers", notice="not_found")
-        return handle_server_form(request, server_id, action, name, ip_address, pem_path)
+        return handle_server_form(
+            request, server_id, action, name, ip_address, pem_path, tag_key, tag_value
+        )
 
     @app.post("/servers/{server_id}/delete")
     def delete_server(server_id: int):

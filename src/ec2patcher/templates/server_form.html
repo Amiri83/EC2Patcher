@@ -29,6 +29,34 @@
       {% if errors.pem_path %}<div class="field-error">{{ errors.pem_path }}</div>{% endif %}
     </div>
 
+    <fieldset class="field tags-field{% if errors.tags %} has-error{% endif %}">
+      <legend>Tags <span class="muted small">(optional)</span></legend>
+      <div class="hint">Free-form key/value labels, e.g. <code>display_name</code> = <code>Billing API</code>.
+        Keys must be unique per server. Empty rows are ignored.</div>
+      <div class="tag-rows" id="tag-rows">
+        {% for tag in form.tags or [{"key": "", "value": ""}] %}
+          <div class="tag-row">
+            <input type="text" name="tag_key" value="{{ tag.key }}" placeholder="Key"
+                   aria-label="Tag key" maxlength="64" autocomplete="off">
+            <input type="text" name="tag_value" value="{{ tag.value }}" placeholder="Value"
+                   aria-label="Tag value" maxlength="256" autocomplete="off">
+            <button type="button" class="btn btn-ghost btn-sm" data-remove-tag>Remove</button>
+          </div>
+        {% endfor %}
+      </div>
+      <template id="tag-row-template">
+        <div class="tag-row">
+          <input type="text" name="tag_key" value="" placeholder="Key"
+                 aria-label="Tag key" maxlength="64" autocomplete="off">
+          <input type="text" name="tag_value" value="" placeholder="Value"
+                 aria-label="Tag value" maxlength="256" autocomplete="off">
+          <button type="button" class="btn btn-ghost btn-sm" data-remove-tag>Remove</button>
+        </div>
+      </template>
+      <button type="button" class="btn btn-secondary btn-sm" id="add-tag">+ Add Tag</button>
+      {% if errors.tags %}<div class="field-error">{{ errors.tags }}</div>{% endif %}
+    </fieldset>
+
     {% if ssh_result %}{% include "_ssh_result.html" %}{% endif %}
 
     <div class="form-actions">
