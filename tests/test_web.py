@@ -31,7 +31,7 @@ def test_all_pages_render(client):
         ("/servers/new", "Save Server"),
         ("/reports", "Upload Security CVE Report"),
         ("/history", "No patch operations have been performed yet."),
-        ("/settings", "later phases"),
+        ("/settings", "Local Patch Download Directory"),
         ("/shutdown", "Stop EC2 Patcher?"),
     ]:
         r = client.get(path)
