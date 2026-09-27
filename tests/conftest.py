@@ -6,12 +6,24 @@ from fastapi.testclient import TestClient
 
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
+from ec2patcher.services import nvd
 
 
 @pytest.fixture(autouse=True)
 def isolated_metadata_cache(tmp_path: Path, monkeypatch):
     """Never read or write the user's real Canonical metadata cache during tests."""
     monkeypatch.setenv("EC2PATCHER_CACHE_DIR", str(tmp_path / "cache"))
+
+
+@pytest.fixture(autouse=True)
+def no_live_nvd(monkeypatch):
+    """Tests never reach the real NVD API; clients without a fake transport see it offline."""
+
+    def offline(url, headers, timeout):
+        raise OSError("network access to NVD is disabled in tests")
+
+    monkeypatch.setattr(nvd, "http_get", offline)
+    monkeypatch.delenv(nvd.API_KEY_ENV, raising=False)
 
 
 @pytest.fixture

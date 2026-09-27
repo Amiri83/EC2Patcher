@@ -5,6 +5,10 @@ unprivileged ``ubuntu`` user (no sudo): collect facts (dpkg-query, os-release, u
 query APT candidates (apt-cache), and plan the upgrade (apt-get -s / --print-uris). Nothing
 is downloaded, copied, installed or restarted.
 
+Canonical's metadata alone decides applicability, fixed versions and statuses. NVD is only
+queried afterwards for the CVSS severity of the server's CVEs (each unique CVE once per run,
+shared by all servers); an NVD failure leaves the severity Unknown and nothing else changes.
+
 Servers are analyzed sequentially in one background thread; one failing server (or CVE)
 never aborts the others.
 """
@@ -19,8 +23,9 @@ from datetime import datetime, timezone
 
 from ec2patcher.database import Database
 from ec2patcher.models import ServerAnalysis, StoredReport
-from ec2patcher.services import apt_planner, cve_resolver, server_state, ssh_service
+from ec2patcher.services import apt_planner, cve_resolver, nvd, server_state, ssh_service
 from ec2patcher.services.security_metadata import SecurityMetadata
+from ec2patcher.services.severity import SEVERITIES, UNKNOWN
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +52,11 @@ class AnalysisService:
         metadata: SecurityMetadata,
         runner: ssh_service.Runner = subprocess.run,
         starter: Starter = thread_starter,
+        nvd_client: nvd.NvdClient | None = None,
     ):
         self.db = db
         self.metadata = metadata
+        self.nvd = nvd_client or nvd.NvdClient()
         self.runner = runner
         self.starter = starter
         self._lock = threading.Lock()
@@ -136,10 +143,12 @@ class AnalysisService:
             logger.warning("Analysis run %s failed: %s", run_id, message)
             return
 
+        self.nvd.start_run()
         failures = 0
         for index, analysis in enumerate(run.servers, start=1):
-            progress(f"Analyzing {analysis.server_name} ({index} of {len(run.servers)})")
-            if not self.analyze_server(analysis):
+            label = f"{analysis.server_name} ({index} of {len(run.servers)})"
+            progress(f"Analyzing {label}")
+            if not self.analyze_server(analysis, lambda m, label=label: progress(f"{label}: {m}")):
                 failures += 1
         self.db.update_analysis_run(
             run_id,
@@ -151,10 +160,12 @@ class AnalysisService:
 
     # --- one server -----------------------------------------------------------------
 
-    def analyze_server(self, analysis: ServerAnalysis) -> bool:
+    def analyze_server(
+        self, analysis: ServerAnalysis, progress: Callable[[str], None] | None = None
+    ) -> bool:
         self.db.update_server_analysis(analysis.id, status="analyzing", started_at=_now())
         try:
-            error = self._analyze(analysis)
+            error = self._analyze(analysis, progress or (lambda message: None))
         except Exception as exc:
             logger.exception("Analysis of %s failed unexpectedly", analysis.server_name)
             error = f"Unexpected error: {exc}"
@@ -172,7 +183,7 @@ class AnalysisService:
             server.ip_address, server.pem_path, command, runner=self.runner, timeout=timeout
         )
 
-    def _analyze(self, analysis: ServerAnalysis) -> str | None:
+    def _analyze(self, analysis: ServerAnalysis, progress: Callable[[str], None]) -> str | None:
         """Analyze one server; return an error message if the whole server failed."""
         server = self.db.get_server(analysis.server_id) if analysis.server_id else None
         if server is None:
@@ -239,6 +250,7 @@ class AnalysisService:
             else:
                 plan = self._unresolved_plan(findings, requests, candidates, facts, download.error)
 
+        self._enrich_severity(findings, progress)
         reboot, reason = cve_resolver.expected_reboot(plan)
         self.db.save_server_results(
             analysis.id,
@@ -252,6 +264,16 @@ class AnalysisService:
             warnings=warnings,
         )
         return None
+
+    def _enrich_severity(self, findings: list, progress: Callable[[str], None]) -> None:
+        """Attach NVD CVSS data to the findings. Statuses and plans are never touched."""
+        cves = list(dict.fromkeys(f.cve for f in findings))
+        for index, cve in enumerate(cves, start=1):
+            progress(f"Fetching NVD severity data ({index} of {len(cves)})")
+            result = self.nvd.lookup(cve)  # never raises; cached / memoized per run
+            for f in findings:
+                if f.cve == cve:
+                    f.cvss = result
 
     def _plan(self, server, requests) -> apt_planner.DownloadPlan:
         try:
@@ -310,6 +332,7 @@ class ServerSummary:
     debs: int
     unresolved: int
     download_bytes: int
+    by_severity: dict[str, int]  # per reported CVE; independent of the patch status
 
     def count(self, *statuses: str) -> int:
         return sum(self.by_status.get(s, 0) for s in statuses)
@@ -346,12 +369,17 @@ def group_findings(analysis: ServerAnalysis) -> list[FindingGroup]:
 def summarize(analysis: ServerAnalysis) -> ServerSummary:
     """Per-CVE rollup; totals always reconcile with the number of reported CVEs."""
     grouped: dict[str, list[str]] = {}
+    severity: dict[str, str] = {}
     for f in analysis.findings:
         grouped.setdefault(f.cve, []).append(f.status)
+        severity.setdefault(f.cve, f.severity)  # CVSS is per CVE: same on every row
     cve_status = {}
     for cve in analysis.reported_cves:
         statuses = grouped.get(cve)
         cve_status[cve] = cve_resolver.rollup_status(statuses) if statuses else "NOT_ANALYZED"
+    by_severity = dict.fromkeys(SEVERITIES, 0)
+    for cve in cve_status:
+        by_severity[severity.get(cve, UNKNOWN)] += 1
     return ServerSummary(
         reported=len(analysis.reported_cves),
         by_status=dict(Counter(cve_status.values())),
@@ -360,4 +388,5 @@ def summarize(analysis: ServerAnalysis) -> ServerSummary:
         debs=len({p.deb_filename for p in analysis.plan if p.deb_filename}),
         unresolved=sum(1 for p in analysis.plan if p.status != "planned"),
         download_bytes=sum(p.size or 0 for p in analysis.plan if p.deb_filename),
+        by_severity=by_severity,
     )

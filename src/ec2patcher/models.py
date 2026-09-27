@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 
-from ec2patcher.services.severity import normalize_severity
+from ec2patcher.services.severity import cvss_label, normalize_severity
 
 
 @dataclass
@@ -58,10 +58,25 @@ class CveFindingRow:
     binary_packages: list[str]
     pocket: str | None
     priority: str | None  # raw Canonical priority captured at analysis time
+    # NVD CVSS snapshot captured at analysis time (Phase 2.2); all None for older findings.
+    cvss_severity: str | None = None
+    cvss_score: float | None = None
+    cvss_version: str | None = None
+    cvss_vector: str | None = None
+    cvss_source: str | None = None
+    cvss_source_type: str | None = None
+    nvd_last_modified: str | None = None
+    nvd_status: str | None = None
+    nvd_note: str | None = None
 
     @property
     def severity(self) -> str:
-        return normalize_severity(self.priority)
+        """Primary Severity: the stored NVD CVSS rating (not Canonical's priority)."""
+        return normalize_severity(self.cvss_severity)
+
+    @property
+    def cvss_label(self) -> str:
+        return cvss_label(self.cvss_score, self.cvss_version)
 
 
 @dataclass
