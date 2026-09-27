@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ec2patcher"
 version = "0.1.0"
-description = "Personal GUI for recurring Ubuntu EC2 security patching (inventory, SSH test, report upload, read-only pre-patch analysis)"
+description = "Personal GUI for recurring Ubuntu EC2 security patching (inventory, SSH test, report upload, read-only pre-patch analysis, Excel export)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,6 +14,7 @@ dependencies = [
     "jinja2>=3.1",
     "python-multipart>=0.0.9",
     "platformdirs>=4.0",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

@@ -2,10 +2,10 @@
 
 A small, local, single-user web GUI for recurring security patching of Ubuntu EC2 servers.
 
-**Current scope: Phase 2.** This covers the application shell, the server inventory
+**Current scope: Phase 2.1.** This covers the application shell, the server inventory
 (with user-defined server tags), SSH connectivity testing, uploading/validating the
 security team's CVE report, and a **read-only pre-patch analysis** that produces a per-server
-report and an exact package / .deb plan.
+report (with CVE severity and Excel export) and an exact package / .deb plan.
 Package downloads, installation, reboots and patch approval are **not** implemented yet;
 they come in Phase 3.
 
@@ -119,6 +119,16 @@ the Reports page). A run keeps a snapshot of the report, the server name, IP and
 tag, and all remote facts, so later edits don't change historical results. Report keys are
 always matched against the canonical server **name**; `display_name` is shown but never used
 for matching. If the app is stopped during an analysis, the run is marked *interrupted*.
+
+**Severity (Phase 2.1).** Each CVE finding shows a Severity taken from Canonical's own priority
+("... classified this CVE as of *high* priority") as stored at analysis time: Critical, High,
+Medium or Low. Anything else (untriaged, negligible, missing, older runs without a priority)
+is shown as **Unknown**; nothing is guessed.
+
+**Export to Excel (Phase 2.1).** Each server report page has an *Export to Excel* button that
+downloads `ec2patcher_<server name>_<analysis date>.xlsx` with three sheets: *Summary*,
+*CVE Findings* (every stored finding) and *Package Plan*. The workbook is built on demand from
+the stored snapshot only; exporting never runs ssh, APT or metadata downloads.
 
 ### CVE report format
 

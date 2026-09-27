@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 
+from ec2patcher.services.severity import normalize_severity
+
 
 @dataclass
 class Tag:
@@ -55,7 +57,11 @@ class CveFindingRow:
     detail: str | None
     binary_packages: list[str]
     pocket: str | None
-    priority: str | None
+    priority: str | None  # raw Canonical priority captured at analysis time
+
+    @property
+    def severity(self) -> str:
+        return normalize_severity(self.priority)
 
 
 @dataclass
