@@ -1,0 +1,23 @@
+@@EC2P simulate
+NOTE: This is only a simulation!
+      apt-get needs root privileges for real execution.
+      Keep also in mind that locking is deactivated,
+      so don't depend on the relevance to the real current situation!
+Inst bluez [5.85-4] (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+Inst bluez-cups [5.85-4] (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+Inst bluez-obexd [5.85-4] (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+Inst libbluetooth3 [5.85-4] (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+Conf bluez (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+Conf bluez-cups (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+Conf bluez-obexd (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+Conf libbluetooth3 (5.85-4ubuntu0.2 Ubuntu:26.04/resolute-updates [amd64])
+@@EC2P simulate-rc
+0
+@@EC2P uris
+'http://archive.ubuntu.com/ubuntu/pool/main/b/bluez/bluez_5.85-4ubuntu0.2_amd64.deb' bluez_5.85-4ubuntu0.2_amd64.deb 1550492 SHA256:3d10739644e47a795ca5605b8693f9821b0812c28daf95b11aa2d1f12d567d08
+'http://archive.ubuntu.com/ubuntu/pool/main/b/bluez/bluez-cups_5.85-4ubuntu0.2_amd64.deb' bluez-cups_5.85-4ubuntu0.2_amd64.deb 27846 SHA256:9204262033d802191aecee9f47c3d970c7147ea846bbd22f609c0793ce51ab7a
+'http://archive.ubuntu.com/ubuntu/pool/main/b/bluez/bluez-obexd_5.85-4ubuntu0.2_amd64.deb' bluez-obexd_5.85-4ubuntu0.2_amd64.deb 243752 SHA256:287ddfddf6074fb4dd4586e474bec54d7cccebc77dd2933b193dfcd125cbf1d3
+'http://archive.ubuntu.com/ubuntu/pool/main/b/bluez/libbluetooth3_5.85-4ubuntu0.2_amd64.deb' libbluetooth3_5.85-4ubuntu0.2_amd64.deb 78170 SHA256:b78dddd9ea8caf8ae075be519b79ca69689f6b8ce98727f0942cb81fcb0c69f9
+@@EC2P uris-rc
+0
+@@EC2P end

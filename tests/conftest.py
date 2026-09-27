@@ -8,6 +8,12 @@ from ec2patcher.app import create_app
 from ec2patcher.database import Database
 
 
+@pytest.fixture(autouse=True)
+def isolated_metadata_cache(tmp_path: Path, monkeypatch):
+    """Never read or write the user's real Canonical metadata cache during tests."""
+    monkeypatch.setenv("EC2PATCHER_CACHE_DIR", str(tmp_path / "cache"))
+
+
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     return tmp_path / "data" / "ec2patcher.db"

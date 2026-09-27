@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Analysis #{{ run.id }}{% endblock %}
+{% block head %}{% if run.is_running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block heading %}Pre-Patch Analysis #{{ run.id }}{% endblock %}
+{% block header_actions %}<a href="/reports#analysis" class="btn btn-secondary">Back to Reports</a>{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-header">
+    <h2>Analysis Status</h2>
+    {% set r = run %}{% include "_run_status.html" %}
+  </div>
+  <dl class="kv">
+    <dt>Report</dt><dd>{{ run.report_filename }} (uploaded {{ run.report_uploaded_at|timestamp }})</dd>
+    <dt>Started</dt><dd>{{ run.started_at|timestamp }}</dd>
+    {% if run.completed_at %}<dt>Finished</dt><dd>{{ run.completed_at|timestamp }}</dd>{% endif %}
+    <dt>Canonical security metadata</dt>
+    <dd>{% if run.metadata_updated_at %}Published {{ run.metadata_updated_at }}{% if run.metadata_checked_at %} &middot; cached {{ run.metadata_checked_at|timestamp }}{% endif %}{% else %}<span class="muted">not available</span>{% endif %}
+        {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}</dd>
+  </dl>
+  {% if run.is_running and run.progress_message %}
+    <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>
+  {% endif %}
+  {% if run.metadata_warning %}<div class="alert alert-warning">{{ run.metadata_warning }}</div>{% endif %}
+  {% if run.error %}<div class="alert alert-error">{{ run.error }}</div>{% endif %}
+  <p class="muted small">Read-only analysis. No packages were downloaded, copied or installed, and nothing was restarted.</p>
+</div>
+
+<div class="card">
+  <h2>Servers</h2>
+  <ul class="progress-list">
+    {% for s in run.servers %}
+      {% set sm = summaries[s.id] %}
+      <li class="progress-item progress-{{ s.status }}">
+        <span class="progress-icon" aria-hidden="true">{% if s.status == "complete" %}&#10003;{% elif s.status == "analyzing" %}&#9679;{% elif s.status == "waiting" %}&#9675;{% else %}&#10005;{% endif %}</span>
+        <div class="progress-main">
+          <div>
+            <strong>{{ s.server_name }}</strong>
+            {% if s.display_name %}<span class="muted">&middot; {{ s.display_name }}</span>{% endif %}
+            <span class="progress-state">
+              {% if s.status == "complete" %}Complete{% elif s.status == "analyzing" %}Analyzing{% elif s.status == "waiting" %}Waiting{% else %}Failed{% endif %}
+            </span>
+          </div>
+          {% if s.status == "failed" %}
+            <div class="progress-error">{{ s.error }}</div>
+          {% elif s.status == "complete" %}
+            <div class="server-meta">
+              <span>{{ sm.reported }} CVE{{ "" if sm.reported == 1 else "s" }}</span>
+              <span class="{% if sm.count('PATCH_REQUIRED') %}text-danger{% endif %}">{{ sm.count("PATCH_REQUIRED") }} patch required</span>
+              <span>{{ sm.count("ALREADY_FIXED", "NOT_AFFECTED", "PACKAGE_NOT_INSTALLED") }} no action</span>
+              {% set open = sm.count("CANDIDATE_UNAVAILABLE", "FIX_REQUIRES_PRO", "FIX_NOT_AVAILABLE", "NEEDS_EVALUATION", "IGNORED", "ANALYSIS_ERROR") %}
+              {% if open %}<span class="text-warning">{{ open }} unresolved / no fix</span>{% endif %}
+              <span>{{ sm.packages }} package{{ "" if sm.packages == 1 else "s" }} to update</span>
+              <span>Reboot: {% if s.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}no expected reboot{% endif %}</span>
+            </div>
+          {% endif %}
+        </div>
+        {% if s.status in ("complete", "failed") %}
+          <a href="/analysis/{{ run.id }}/servers/{{ s.id }}" class="btn btn-secondary btn-sm">View Report</a>
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endblock %}

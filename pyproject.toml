@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ec2patcher"
 version = "0.1.0"
-description = "Personal GUI for recurring Ubuntu EC2 security patching (Phase 1: inventory, SSH test, report upload)"
+description = "Personal GUI for recurring Ubuntu EC2 security patching (inventory, SSH test, report upload, read-only pre-patch analysis)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
