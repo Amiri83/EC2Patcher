@@ -1,4 +1,9 @@
-"""Phase 2.1: vulnerability severity and per-server Excel export (read-only)."""
+"""Phase 2.1: vulnerability severity and per-server Excel export (read-only).
+
+Phase 2.2 changed the meaning of Severity: it now comes from NVD CVSS (nvd_fixtures), while
+Canonical's priority is still captured and stored separately as "Ubuntu Priority". The
+fixtures below give every CVE an NVD rating that differs from its Canonical priority.
+"""
 
 import copy
 import io
@@ -8,6 +13,8 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from nvd_fixtures import REPORT_CVES, FakeNvd
+from nvd_fixtures import make_client as make_nvd_client
 from openpyxl import load_workbook
 from phase2_fixtures import (
     DOCS,
@@ -28,7 +35,7 @@ from ec2patcher.app import create_app
 from ec2patcher.database import _MIGRATIONS, SCHEMA_VERSION, Database
 from ec2patcher.formatting import format_size
 from ec2patcher.models import AnalysisRun, ServerAnalysis
-from ec2patcher.services import analysis_service, apt_planner, ssh_service
+from ec2patcher.services import analysis_service, apt_planner, nvd, ssh_service
 from ec2patcher.services import cve_resolver as cr
 from ec2patcher.services import excel_export as xl
 from ec2patcher.services.security_metadata import (
@@ -84,8 +91,11 @@ def test_normalize_severity(raw, expected):
         ("negligible", "Unknown"),
     ],
 )
-def test_severity_from_real_canonical_note(word, expected):
-    """Production path: Canonical note -> PRIORITY_RE -> VexEntry.priority -> Finding."""
+def test_priority_from_real_canonical_note_no_longer_drives_severity(word, expected):
+    """Production path: Canonical note -> PRIORITY_RE -> VexEntry.priority -> Finding.
+
+    Phase 2.2: the priority is still captured (and normalizes as before, shown as "Ubuntu
+    Priority"), but a finding's Severity comes only from NVD CVSS - Unknown without it."""
     entry = VexEntry(
         source="openssl", version="3.0.13-0ubuntu3.6", distro="noble", status="fixed",
         note=f"{FIXED_NOTE} {priority_note(word)}",
@@ -95,7 +105,10 @@ def test_severity_from_real_canonical_note(word, expected):
     installed = [p for p in facts.packages if p.source == "openssl"]
     finding = cr.resolve_source("CVE-2026-1", "openssl", [entry], installed, facts)
     assert finding.priority == word.capitalize()
-    assert finding.severity == expected
+    assert normalize_severity(finding.priority) == expected
+    assert finding.severity == "Unknown"
+    finding.cvss = nvd.CvssResult(status=nvd.OK, severity="Low", score=2.0, version="3.1")
+    assert finding.severity == "Low"
 
 
 def test_missing_priority_is_unknown():
@@ -127,11 +140,13 @@ def severity_docs():
 def web(db_path, tmp_path):
     archive = make_vex_archive(tmp_path / "sev.tar.xz", severity_docs())
 
-    def factory(ssh=None, fetcher=None):
+    def factory(ssh=None, fetcher=None, nvd_transport=None):
         meta = SecurityMetadata(tmp_path / "web-cache", fetcher=fetcher or archive_fetcher(archive))
+        nvd_client = make_nvd_client(tmp_path, nvd_transport or FakeNvd(REPORT_CVES))
         app = create_app(
             db_path=db_path, ssh_runner=ssh or ScriptedSSH(failures=AUTH_FAILURE),
             metadata=meta, analysis_starter=sync, shutdown_handler=lambda: None,
+            nvd_client=nvd_client,
         )  # fmt: skip
         return TestClient(app, base_url="http://127.0.0.1")
 
@@ -151,57 +166,54 @@ def analyzed(web, pem_file, db_path):
     return Database(db_path).get_latest_analysis_run(details=True)
 
 
-def sev_cells(html: str) -> list[str]:
-    return re.findall(
-        r'<span class="badge badge-[a-z]+"(?: title="[^"]*")?>(\w+)</span></td>', html
-    )
-
-
 def test_severity_persisted_with_findings(analyzed):
+    """Canonical priority is still stored raw; Severity is the stored NVD CVSS rating."""
     good = analyzed.servers[0]
     by_key = {(f.cve, f.source_package): f for f in good.findings}
     assert by_key[("CVE-2026-63076", "openssl")].priority == "Critical"
-    assert by_key[("CVE-2026-63076", "openssl")].severity == "Critical"
-    assert by_key[("CVE-2026-54874", "linux-aws")].severity == "High"
-    assert by_key[("CVE-2026-63075", "openssl")].severity == "Low"
-    assert by_key[("CVE-2026-63075", "curl")].severity == "Low"
+    assert by_key[("CVE-2026-63076", "openssl")].severity == "High"  # NVD 7.5
+    assert by_key[("CVE-2026-54874", "linux-aws")].priority == "High"
+    assert by_key[("CVE-2026-54874", "linux-aws")].severity == "Critical"  # CNA v4.0 9.3
+    assert by_key[("CVE-2026-63075", "openssl")].priority == "Low"
+    assert by_key[("CVE-2026-63075", "openssl")].severity == "Medium"
+    assert by_key[("CVE-2026-63075", "curl")].severity == "Medium"
     assert by_key[("CVE-2026-10004", "bash")].priority == "Untriaged"
-    assert by_key[("CVE-2026-10004", "bash")].severity == "Unknown"
+    assert by_key[("CVE-2026-10004", "bash")].severity == "Low"
     assert by_key[("CVE-2026-10005", "nginx")].priority is None
-    assert by_key[("CVE-2026-10005", "nginx")].severity == "Unknown"
-    # Stored raw in the existing cve_findings.priority column.
-    assert SCHEMA_VERSION == 3
+    assert by_key[("CVE-2026-10005", "nginx")].severity == "Unknown"  # not in NVD
+    assert SCHEMA_VERSION == 4
 
 
 def test_severity_column_rendered(web, analyzed):
     good = analyzed.servers[0]
     with web() as c:
         page = c.get(f"/analysis/{analyzed.id}/servers/{good.id}").text
-    assert "<th>CVE</th><th>Severity</th><th>Ubuntu Source Package</th>" in page
-    assert (
-        '<span class="badge badge-critical" title="Canonical priority: Critical">Critical</span>'
-        in page
-    )
-    assert '<span class="badge badge-danger" title="Canonical priority: High">High</span>' in page
-    assert '<span class="badge badge-neutral" title="Canonical priority: Low">Low</span>' in page
-    assert (
-        '<span class="badge badge-neutral" title="Canonical priority: Untriaged">Unknown</span>'
-        in page
-    )
-    assert '<span class="badge badge-neutral">Unknown</span>' in page  # nginx: no priority
-    assert "Medium" in page  # linux-azure (collapsed not-installed kernel flavour)
+    assert "<th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th>" in page
+    critical = '<span class="badge badge-critical">Critical</span>'
+    assert f'{critical}<div class="muted small">Ubuntu Priority: High</div>' in page
+    high = '<span class="badge badge-danger">High</span>'
+    assert f'{high}<div class="muted small">Ubuntu Priority: Critical</div>' in page
+    medium = '<span class="badge badge-warning">Medium</span>'
+    assert f'{medium}<div class="muted small">Ubuntu Priority: Low</div>' in page
+    low = '<span class="badge badge-low">Low</span>'
+    assert f'{low}<div class="muted small">Ubuntu Priority: Untriaged</div>' in page
+    assert '<span class="badge badge-neutral">Unknown</span>' in page  # nginx: not in NVD
+    assert "CVE not found in NVD" in page
 
 
 def test_severity_survives_restart_and_metadata_change(web, analyzed, tmp_path):
     good = analyzed.servers[0]
     other = make_vex_archive(tmp_path / "plain.tar.xz")  # no priorities at all
-    with web(fetcher=archive_fetcher(other)) as c:
+    changed = FakeNvd({})  # NVD now knows none of the CVEs
+    with web(fetcher=archive_fetcher(other), nvd_transport=changed) as c:
         page = c.get(f"/analysis/{analyzed.id}/servers/{good.id}").text
     assert ">Critical</span>" in page and ">High</span>" in page
-    with web(fetcher=failing_fetcher()) as c:
+    assert "Ubuntu Priority: Critical" in page
+    with web(fetcher=failing_fetcher(), nvd_transport=changed) as c:
         r = c.get(f"/analysis/{analyzed.id}/servers/{good.id}/export.xlsx")
     rows = list(load_workbook(io.BytesIO(r.content))["CVE Findings"].values)
-    assert ("CVE-2026-63076", "Critical") in {(row[0], row[1]) for row in rows}
+    assert ("CVE-2026-63076", "High") in {(row[0], row[1]) for row in rows}
+    assert changed.calls == []
 
 
 def test_export_button_per_server(web, analyzed):
@@ -282,8 +294,9 @@ def test_export_cve_findings_match_stored_rows(web, analyzed):
     good = analyzed.servers[0]
     _, wb = export(web, analyzed.id, good.id)
     headers, rows = table(wb, "CVE Findings")
-    assert headers[:8] == [
-        "CVE", "Severity", "Ubuntu Source Package", "Installed Version", "Fixed Version",
+    assert headers[:13] == [
+        "CVE", "Severity", "CVSS Score", "CVSS Version", "Severity Source", "CVSS Vector",
+        "Ubuntu Priority", "Ubuntu Source Package", "Installed Version", "Fixed Version",
         "Fix Pocket", "Status", "Related Binary Package(s)",
     ]  # fmt: skip
     assert len(rows) == len(good.findings)  # nothing collapsed or dropped
@@ -291,12 +304,14 @@ def test_export_cve_findings_match_stored_rows(web, analyzed):
     for f in good.findings:
         r = got[(f.cve, f.source_package)]
         assert r["Severity"] == f.severity
+        assert (r["Ubuntu Priority"] or "") == (f.priority or "")
         assert r["Installed Version"] == f.installed_version
         assert r["Fixed Version"] == f.fixed_version
         assert r["Status"] == cr.STATUS_LABELS[f.status]
         assert (r["Related Binary Package(s)"] or "") == ", ".join(f.binary_packages)
     openssl = got[("CVE-2026-63076", "openssl")]
-    assert openssl["Severity"] == "Critical" and openssl["Status"] == "Patch required"
+    assert openssl["Severity"] == "High" and openssl["Status"] == "Patch required"
+    assert openssl["Ubuntu Priority"] == "Critical"
     assert openssl["Installed Version"] == "3.0.13-0ubuntu3.4"
     assert openssl["Fixed Version"] == "3.0.13-0ubuntu3.6"
     assert openssl["Related Binary Package(s)"] == "libssl3t64:amd64, openssl"
@@ -427,6 +442,8 @@ def test_export_does_not_touch_ssh_metadata_apt_or_state(web, analyzed, db_path,
             monkeypatch.setattr(SecurityMetadata, method, forbidden(f"metadata.{method}"))
     monkeypatch.setattr(analysis_service.AnalysisService, "start", forbidden("analysis start"))
     monkeypatch.setattr(analysis_service.AnalysisService, "run", forbidden("analysis run"))
+    for method in ("lookup", "fetch"):
+        monkeypatch.setattr(nvd.NvdClient, method, forbidden(f"nvd.{method}"))
 
     def dump():
         with sqlite3.connect(db_path) as conn:
@@ -435,18 +452,22 @@ def test_export_does_not_touch_ssh_metadata_apt_or_state(web, analyzed, db_path,
     before = dump()
     ssh = ScriptedSSH()
     fetches = []
-    with web(ssh=ssh, fetcher=lambda *a: fetches.append(a)) as c:
+    nvd_transport = FakeNvd(REPORT_CVES)
+    with web(ssh=ssh, fetcher=lambda *a: fetches.append(a), nvd_transport=nvd_transport) as c:
         r = c.get(f"/analysis/{analyzed.id}/servers/{good.id}/export.xlsx")
     assert r.status_code == 200 and r.content[:2] == b"PK"
-    assert calls == [] and ssh.calls == [] and fetches == []
+    assert calls == [] and ssh.calls == [] and fetches == [] and nvd_transport.calls == []
     assert dump() == before  # no analysis/state change of any kind
 
 
 # --- schema / historical data ------------------------------------------------------------
 
 
-def test_existing_v3_database_opens_without_migration_or_data_loss(db_path, web):
-    """A Phase 2 (v3) database, including findings stored before Phase 2.1, stays readable."""
+def test_existing_v3_database_migrates_to_v4_without_data_loss(db_path, web):
+    """A Phase 2 (v3) database, including findings stored before Phase 2.1, stays readable.
+
+    Phase 2.2 adds schema v4 (NVD CVSS columns). Old findings keep their Canonical priority
+    but have no CVSS snapshot, so their Severity is Unknown - they are never re-fetched."""
     db_path.parent.mkdir(parents=True)
     conn = sqlite3.connect(db_path)
     for version in (1, 2, 3):
@@ -478,17 +499,18 @@ def test_existing_v3_database_opens_without_migration_or_data_loss(db_path, web)
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 4
     analysis = db.get_server_analysis(1)
-    assert [(f.cve, f.priority, f.severity) for f in analysis.findings] == [
-        ("CVE-2025-1", None, "Unknown"),
-        ("CVE-2025-2", "High", "High"),
+    assert [(f.cve, f.priority, f.severity, f.cvss_score) for f in analysis.findings] == [
+        ("CVE-2025-1", None, "Unknown", None),
+        ("CVE-2025-2", "High", "Unknown", None),
     ]
     assert db.get_server_by_name("old-server") is not None
     with web(fetcher=failing_fetcher()) as c:
         page = c.get("/analysis/1/servers/1").text
         assert '<span class="badge badge-neutral">Unknown</span>' in page
-        assert ">High</span>" in page and "Export to Excel" in page
+        assert "Ubuntu Priority: High" in page and "Export to Excel" in page
+        assert ">High</span>" not in page and "not captured" in page
         assert 'href="/analysis/1"' in c.get("/reports").text  # history intact
         assert "old-server" in c.get("/analysis/1").text
         r = c.get("/analysis/1/servers/1/export.xlsx")
@@ -496,9 +518,9 @@ def test_existing_v3_database_opens_without_migration_or_data_loss(db_path, web)
     assert 'filename="ec2patcher_old-server_' in r.headers["content-disposition"]
     wb = load_workbook(io.BytesIO(r.content))
     _, rows = table(wb, "CVE Findings")
-    assert [(r["CVE"], r["Severity"]) for r in rows] == [
-        ("CVE-2025-1", "Unknown"),
-        ("CVE-2025-2", "High"),
+    assert [(r["CVE"], r["Severity"], r["Ubuntu Priority"]) for r in rows] == [
+        ("CVE-2025-1", "Unknown", None),
+        ("CVE-2025-2", "Unknown", "High"),
     ]
     # Reopening keeps everything.
     assert Database(db_path).get_server_analysis(1).findings[1].priority == "High"

@@ -157,7 +157,7 @@ def test_phase1_database_migrates_in_place(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     conn.close()
     server = db.get_server_by_name("app-prod-01")
     assert (server.ip_address, server.pem_path, server.tags) == ("10.10.20.15", "/k.pem", [])

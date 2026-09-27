@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from ec2patcher.services import debversion
 from ec2patcher.services.apt_planner import Candidate, DownloadPlan
+from ec2patcher.services.nvd import CvssResult
 from ec2patcher.services.security_metadata import CveRecord, VexEntry
 from ec2patcher.services.server_state import InstalledPackage, ServerFacts
 from ec2patcher.services.severity import normalize_severity
@@ -79,8 +80,10 @@ class Finding:
     fixed_version: str | None = None
     binaries: list[str] = field(default_factory=list)
     pocket: str | None = None  # distro the fixed version was published in
-    priority: str | None = None  # raw Canonical priority, persisted as-is
+    priority: str | None = None  # raw Canonical priority, persisted as-is ("Ubuntu Priority")
     is_kernel: bool = False
+    # NVD CVSS enrichment (analysis_service); never affects the status above.
+    cvss: CvssResult | None = None
 
     @property
     def status_label(self) -> str:
@@ -88,7 +91,7 @@ class Finding:
 
     @property
     def severity(self) -> str:
-        return normalize_severity(self.priority)
+        return normalize_severity(self.cvss.severity if self.cvss else None)
 
 
 @dataclass

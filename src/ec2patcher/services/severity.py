@@ -1,10 +1,10 @@
-"""User-facing vulnerability severity derived from Canonical's CVE priority.
+"""User-facing vulnerability severity labels.
 
-The raw value is the word Canonical publishes in its OpenVEX notes ("... classified this CVE
-as of <priority> priority", see ``security_metadata.PRIORITY_RE``) and is persisted with each
-finding at analysis time. Severity is a pure function of that stored snapshot, so historical
-reports never change when the metadata does. Nothing is guessed: anything other than the four
-known levels (untriaged, negligible, missing, unexpected text, ...) is shown as Unknown.
+Since Phase 2.2 the Severity shown in reports is the CVSS rating selected from NVD
+(``nvd.py``) and persisted with each finding at analysis time (``cvss_severity``), so
+historical reports never change when NVD does. Canonical's priority is still stored
+separately and shown as "Ubuntu Priority"; it no longer drives Severity. Nothing is guessed:
+anything other than the four known levels (missing CVSS, 0.0, unexpected text, ...) is Unknown.
 """
 
 CRITICAL = "Critical"
@@ -20,13 +20,20 @@ SEVERITY_CLASSES = {
     CRITICAL: "badge-critical",
     HIGH: "badge-danger",
     MEDIUM: "badge-warning",
-    LOW: "badge-neutral",
+    LOW: "badge-low",
     UNKNOWN: "badge-neutral",
 }
 
 
-def normalize_severity(priority: object) -> str:
-    """Map a raw Canonical priority to Critical / High / Medium / Low / Unknown."""
-    if not isinstance(priority, str):
+def normalize_severity(value: object) -> str:
+    """Map a stored rating to Critical / High / Medium / Low / Unknown."""
+    if not isinstance(value, str):
         return UNKNOWN
-    return _KNOWN.get(priority.strip().casefold(), UNKNOWN)
+    return _KNOWN.get(value.strip().casefold(), UNKNOWN)
+
+
+def cvss_label(score: float | None, version: str | None) -> str:
+    """Compact CVSS cell, e.g. "9.8 (v3.1)"; "—" when no score was captured."""
+    if score is None:
+        return "—"
+    return f"{score:.1f} (v{version})" if version else f"{score:.1f}"

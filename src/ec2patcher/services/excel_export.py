@@ -1,8 +1,8 @@
 """Excel (.xlsx) export of one server's stored pre-patch report.
 
 The workbook is built in memory from the persisted analysis snapshot only: it never re-runs
-the analysis, opens ssh connections, reads Canonical metadata or talks to APT. Values mirror
-the server report page so the GUI and the workbook always agree.
+the analysis, opens ssh connections, reads Canonical metadata, queries NVD or talks to APT.
+Values mirror the server report page so the GUI and the workbook always agree.
 """
 
 import io
@@ -17,8 +17,8 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.models import AnalysisRun, ServerAnalysis
-from ec2patcher.services import analysis_service, cve_resolver
-from ec2patcher.services.severity import UNKNOWN
+from ec2patcher.services import analysis_service, cve_resolver, nvd
+from ec2patcher.services.severity import SEVERITIES, UNKNOWN
 
 MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 NOT_ANALYZED_LABEL = "Not analyzed"
@@ -31,12 +31,18 @@ WRAP = Alignment(wrap_text=True, vertical="top")
 CVE_COLUMNS = [
     ("CVE", 18),
     ("Severity", 11),
+    ("CVSS Score", 11),
+    ("CVSS Version", 12),
+    ("Severity Source", 22),
+    ("CVSS Vector", 44),
+    ("Ubuntu Priority", 15),
     ("Ubuntu Source Package", 24),
     ("Installed Version", 26),
     ("Fixed Version", 26),
     ("Fix Pocket", 18),
     ("Status", 28),
     ("Related Binary Package(s)", 40),
+    ("NVD Lookup", 30),
     ("Detail", 60),
 ]
 PLAN_COLUMNS = [
@@ -164,6 +170,7 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
     rows += [
         ("Reboot Note", cve_resolver.REBOOT_HELP),
         ("Reported CVEs", summary.reported),
+        *((f"Severity {s} (NVD CVSS)", summary.by_severity[s]) for s in SEVERITIES),
         ("Patch required", summary.count(cve_resolver.PATCH_REQUIRED)),
         ("Already fixed", summary.count(cve_resolver.ALREADY_FIXED)),
         ("Not affected", summary.count(cve_resolver.NOT_AFFECTED)),
@@ -225,19 +232,28 @@ def _cve_rows(analysis: ServerAnalysis) -> list[list]:
     for cve in dict.fromkeys(order):
         findings = by_cve.get(cve)
         if not findings:
-            rows.append([cve, UNKNOWN, "", "", "", "", NOT_ANALYZED_LABEL, "", ""])
+            rows.append([cve, UNKNOWN, *[""] * 9, NOT_ANALYZED_LABEL, "", "", ""])
             continue
         for f in findings:
+            lookup = nvd.STATUS_LABELS.get(f.nvd_status, f.nvd_status) if f.nvd_status else ""
+            if f.nvd_note:
+                lookup = f"{lookup}: {f.nvd_note}" if lookup else f.nvd_note
             rows.append(
                 [
                     f.cve,
                     f.severity,
+                    f.cvss_score,
+                    f.cvss_version or "",
+                    f.cvss_source or "",
+                    f.cvss_vector or "",
+                    f.priority or "",
                     f.source_package or "",
                     f.installed_version or "",
                     f.fixed_version or "",
                     f.pocket or "",
                     cve_resolver.STATUS_LABELS.get(f.status, f.status),
                     ", ".join(f.binary_packages),
+                    lookup or "Not captured (analysis predates NVD severity)",
                     f.detail or "",
                 ]
             )
