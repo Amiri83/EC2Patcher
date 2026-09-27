@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}Patch #{{ execution.id }} - {{ execution.server_name }}{% endblock %}
+{% block head %}{% if is_active %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block heading %}Patch Execution #{{ execution.id }}: {{ execution.server_name }}{% endblock %}
+{% block header_actions %}<div class="header-actions">
+  <a href="/analysis/{{ execution.analysis_run_id }}/servers/{{ execution.server_analysis_id }}" class="btn btn-secondary">Approved Report</a>
+  <a href="/history" class="btn btn-secondary">History</a>
+</div>{% endblock %}
+{% block content %}
+{% set ex = execution %}
+<div class="card {% if ex.state in ('SUCCESS', 'SUCCESS_WITH_CLEANUP_WARNING') %}result-ok{% elif ex.state in ('FAILED', 'UNKNOWN') %}result-fail{% endif %}">
+  <div class="card-header">
+    <h2>{% if ex.error_title %}{{ ex.error_title }}{% else %}{{ patch_labels.get(ex.state, ex.state) }}{% endif %}</h2>
+    <span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ ex.state }}</span>
+  </div>
+  <dl class="kv">
+    <dt>Server Name</dt><dd>{{ ex.server_name }}</dd>
+    {% if ex.display_name %}<dt>Display Name</dt><dd>{{ ex.display_name }}</dd>{% endif %}
+    <dt>IP</dt><dd><code>{{ ex.ip_address or "-" }}</code></dd>
+    <dt>Decision</dt><dd>{{ ex.decision }} &middot; {{ ex.decided_at|timestamp }}</dd>
+    {% if ex.started_at %}<dt>Started</dt><dd>{{ ex.started_at|timestamp }}</dd>{% endif %}
+    {% if ex.finished_at %}<dt>Finished</dt><dd>{{ ex.finished_at|timestamp }}</dd>{% endif %}
+    {% if ex.local_staging_path %}<dt>Local Staging</dt><dd><code>{{ ex.local_staging_path }}</code></dd>{% endif %}
+    {% if ex.remote_staging_path %}<dt>Remote Staging</dt><dd><code>{{ ex.remote_staging_path }}</code></dd>{% endif %}
+    <dt>Expected Reboot (analysis)</dt><dd>{% if ex.expected_reboot is none %}unknown{% elif ex.expected_reboot %}YES EXPECTED{% else %}NO{% endif %}</dd>
+    <dt>Reboot Required After Patch</dt>
+    <dd>{% if ex.reboot_required_after is none %}<span class="muted">not checked</span>{% elif ex.reboot_required_after %}<strong>YES</strong>{% if ex.reboot_required_packages %} <span class="muted small">({{ ex.reboot_required_packages|join(", ") }})</span>{% endif %}
+        <div class="muted small">EC2Patcher does not reboot servers. Schedule a reboot yourself.</div>{% else %}NO{% endif %}</dd>
+    {% if ex.cleanup_status %}<dt>Cleanup</dt><dd>{{ {"DELETED": "Local and remote staging deleted", "WARNING": "CLEANUP WARNING", "PRESERVED": "Temporary files preserved", "NOT_NEEDED": "Nothing to clean up", "NOT_STARTED": "Not started"}.get(ex.cleanup_status, ex.cleanup_status) }}
+        {% if ex.cleanup_detail %}<div class="muted small">{{ ex.cleanup_detail }}</div>{% endif %}</dd>{% endif %}
+  </dl>
+  {% if is_active %}<p class="progress-message">{{ patch_labels.get(ex.state, ex.state) }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>{% endif %}
+</div>
+
+{% if ex.state in ("FAILED", "UNKNOWN") %}
+<div class="card result-fail patch-failure">
+  <h2>{{ ex.error_title or "PATCH FAILED" }}</h2>
+  <dl class="kv">
+    <dt>Stage</dt><dd>{{ patch_labels.get(ex.failure_stage, ex.failure_stage or "-") }}</dd>
+    <dt>Server</dt><dd>{{ ex.server_name }}</dd>
+    {% if ex.error_package %}<dt>Package</dt><dd><code>{{ ex.error_package }}</code></dd>{% endif %}
+    <dt>Reason</dt><dd>{{ ex.error_summary }}</dd>
+    {% if ex.partial_state_possible %}<dt>Current State</dt><dd><strong>Partial state possible.</strong> See the detected versions below. No rollback or retry was attempted.</dd>{% endif %}
+  </dl>
+  {% if ex.cleanup_status == "PRESERVED" %}
+    <p><strong>Temporary files preserved for troubleshooting.</strong></p>
+    <ul class="plain-list">
+      {% if ex.local_staging_created %}<li>Local: <code>{{ ex.local_staging_path }}</code></li>{% endif %}
+      {% if ex.remote_staging_created %}<li>Remote: <code>{{ ex.remote_staging_path }}</code> on {{ ex.ip_address }}</li>{% endif %}
+    </ul>
+  {% endif %}
+  <p><strong>Run a new analysis before retrying.</strong></p>
+</div>
+{% endif %}
+
+{% if ex.state == "SUCCESS_WITH_CLEANUP_WARNING" %}
+  <div class="alert alert-warning"><strong>CLEANUP WARNING</strong> &mdash; the patch succeeded but temporary files could not be fully removed.
+    Local: <code>{{ ex.local_staging_path }}</code>, Remote: <code>{{ ex.remote_staging_path }}</code>. {{ ex.cleanup_detail or "" }}</div>
+{% endif %}
+
+{% if steps %}
+<div class="card">
+  <h2>Progress</h2>
+  <ul class="step-list">
+    {% for s in steps %}
+      <li class="step step-{{ s.status }}"><span class="progress-icon" aria-hidden="true">{% if s.status == "done" %}&#10003;{% elif s.status == "running" %}&#9679;{% elif s.status == "failed" %}&#10005;{% elif s.status == "warning" %}!{% else %}&#9675;{% endif %}</span> {{ s.label }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% if ex.packages %}
+<div class="card">
+  <h2>Packages</h2>
+  <div class="table-scroll">
+  <table class="table patch-packages">
+    <thead><tr><th>Package</th><th>Before</th><th>Target</th><th>After</th><th>Download</th><th>Transfer</th><th>Install</th><th>Result</th></tr></thead>
+    <tbody>
+      {% for p in ex.packages %}
+      <tr class="{% if p.verification_result == 'FAILED' %}row-warning{% endif %}">
+        <td><strong>{{ p.binary_package }}</strong> <span class="muted small">{{ p.architecture }}</span>
+            <div class="muted small"><code>{{ p.deb_filename }}</code></div></td>
+        <td><code>{{ p.before_version or "not installed" }}</code></td>
+        <td><code>{{ p.target_version }}</code></td>
+        <td><code>{{ p.after_version or "-" }}</code></td>
+        <td>{{ p.download_result or "-" }}{% if p.checksum_result %}<div class="muted small">checksum {{ p.checksum_result }}</div>{% endif %}</td>
+        <td>{{ p.transfer_result or "-" }}</td>
+        <td>{{ p.install_result or "-" }}</td>
+        <td>{% if p.verification_result == "VERIFIED" %}<span class="badge badge-success">VERIFIED</span>{% elif p.verification_result %}<span class="badge badge-danger">{{ p.verification_result }}</span>{% else %}<span class="muted">-</span>{% endif %}
+            {% if p.detail %}<div class="muted small">{{ p.detail }}</div>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endif %}
+
+{% if ex.cves %}
+<div class="card">
+  <h2>CVE Verification</h2>
+  <p>{{ ex.cves_verified }} of {{ ex.cves|length }} CVE check(s) verified against Canonical fixed versions.</p>
+  <div class="table-scroll">
+  <table class="table patch-cves">
+    <thead><tr><th>CVE</th><th>Source Package</th><th>Fixed Version</th><th>Resulting Version</th><th>Result</th></tr></thead>
+    <tbody>
+      {% for c in ex.cves %}
+      <tr><td><code>{{ c.cve }}</code></td><td>{{ c.source_package or "-" }}</td>
+          <td><code>{{ c.fixed_version or "-" }}</code></td><td><code>{{ c.resulting_version or "-" }}</code></td>
+          <td><span class="badge {{ 'badge-success' if c.result == 'VERIFIED' else 'badge-danger' }}">{{ c.result }}</span>
+              {% if c.detail %}<div class="muted small">{{ c.detail }}</div>{% endif %}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endif %}
+
+{% if ex.notes or ex.audit_ok is not none or ex.install_output or ex.simulation_output %}
+<div class="card">
+  <details class="report-details">
+    <summary><strong>Diagnostics</strong> <span class="muted small">(install result, dpkg health, APT output)</span></summary>
+    {% if ex.notes %}<ul class="plain-list">{% for n in ex.notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+    <dl class="kv">
+      <dt>Install Exit Status</dt><dd>{{ ex.install_exit_status if ex.install_exit_status is not none else "-" }}</dd>
+      <dt>dpkg --audit</dt><dd>{% if ex.audit_ok is none %}not run{% elif ex.audit_ok %}healthy{% else %}<span class="text-danger">problems reported</span>{% endif %}</dd>
+    </dl>
+    {% if ex.audit_output %}<pre>{{ ex.audit_output }}</pre>{% endif %}
+    {% if ex.simulation_output %}<p class="small">Install simulation output:</p><pre>{{ ex.simulation_output }}</pre>{% endif %}
+    {% if ex.install_output %}<p class="small">Install output:</p><pre>{{ ex.install_output }}</pre>{% endif %}
+  </details>
+</div>
+{% endif %}
+{% endblock %}

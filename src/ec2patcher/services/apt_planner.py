@@ -252,18 +252,25 @@ def expected_deb_filename(package: str, version: str, arch: str) -> str:
     return f"{package.split(':', 1)[0]}_{version.replace(':', '%3a')}_{arch}.deb"
 
 
-def _uri_matches(uri: str, filename: str) -> bool:
-    parts = urlsplit(uri)
-    if parts.scheme not in ("http", "https", "file", "mirror+http", "mirror+https"):
-        return False
-    basename = unquote(parts.path.rsplit("/", 1)[-1])
+def uri_basename_matches(uri: str, filename: str) -> bool:
+    """True if the URI's file name is ``filename``.
+
+    Ubuntu pool file names omit the epoch (pool/.../libaudit1_3.1.2-2_amd64.deb) while APT's
+    archive file name keeps it (libaudit1_1%3a3.1.2-2_amd64.deb), so both forms are accepted.
+    """
+    basename = unquote(urlsplit(uri).path.rsplit("/", 1)[-1])
     name = unquote(filename)
-    # apt's destination name keeps the epoch ("zlib1g_1%3a1.3..."); archive pool files never
-    # carry it ("pool/main/z/zlib/zlib1g_1.3...").
     package, _, rest = name.partition("_")
     version = rest.split("_", 1)[0]
     without_epoch = f"{package}_{rest.split(':', 1)[1]}" if ":" in version else name
     return basename in (name, without_epoch)
+
+
+def _uri_matches(uri: str, filename: str) -> bool:
+    parts = urlsplit(uri)
+    if parts.scheme not in ("http", "https", "file", "mirror+http", "mirror+https"):
+        return False
+    return uri_basename_matches(uri, filename)
 
 
 def _rc(sections: dict[str, list[str]], key: str) -> int | None:

@@ -12,6 +12,14 @@
     });
   });
 
+  // Buttons that must only submit once (e.g. Approve & Start Patching). The server also
+  // refuses duplicate approvals; this only avoids an accidental double click.
+  document.querySelectorAll("button[data-once]").forEach(function (button) {
+    button.form.addEventListener("submit", function () {
+      window.setTimeout(function () { button.disabled = true; }, 0);
+    });
+  });
+
   // "Clear All Servers": enable the button only when the exact text is typed.
   document.querySelectorAll("input[data-required-text]").forEach(function (input) {
     var button = input.form.querySelector("[data-enable-when-confirmed]");

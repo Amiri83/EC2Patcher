@@ -4,9 +4,31 @@
 {% block content %}
 <div class="card">
   <h2>Patch History</h2>
+  {% if executions %}
+  <div class="table-scroll">
+  <table class="table history-table">
+    <thead><tr><th>Server</th><th>Display Name</th><th>Date</th><th>Result</th><th>Packages</th><th>CVEs</th><th>Reboot Required</th><th></th></tr></thead>
+    <tbody>
+      {% for ex in executions %}
+      <tr>
+        <td><strong>{{ ex.server_name }}</strong></td>
+        <td>{{ ex.display_name or "-" }}</td>
+        <td class="num">{{ (ex.finished_at or ex.started_at or ex.decided_at)|timestamp }}</td>
+        <td><span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ patch_labels.get(ex.state, ex.state) }}</span></td>
+        <td>{% if ex.decision == "REJECTED" %}-{% else %}{{ ex.packages|selectattr("verification_result", "equalto", "VERIFIED")|list|length }}/{{ ex.packages|length }}{% endif %}</td>
+        <td>{% if ex.cves %}{{ ex.cves_verified }}/{{ ex.cves|length }} verified{% else %}-{% endif %}</td>
+        <td>{% if ex.reboot_required_after is none %}-{% elif ex.reboot_required_after %}<strong>YES</strong>{% else %}NO{% endif %}</td>
+        <td>{% if ex.decision == "REJECTED" %}<a href="/analysis/{{ ex.analysis_run_id }}/servers/{{ ex.server_analysis_id }}" class="btn btn-secondary btn-sm">Report</a>{% else %}<a href="/patch/{{ ex.id }}" class="btn btn-secondary btn-sm">Details</a>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
   <div class="empty-state">
     <p class="empty-title">No patch operations have been performed yet.</p>
-    <p class="muted">Completed patch runs will be listed here once patching is available in a later phase.</p>
+    <p class="muted">Approve or reject a server's pre-patch report to record a patch decision.</p>
   </div>
+  {% endif %}
 </div>
 {% endblock %}

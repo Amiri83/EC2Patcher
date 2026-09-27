@@ -2,12 +2,12 @@
 
 A small, local, single-user web GUI for recurring security patching of Ubuntu EC2 servers.
 
-**Current scope: Phase 2.2.** This covers the application shell, the server inventory
+**Current scope: Phase 3.** This covers the application shell, the server inventory
 (with user-defined server tags), SSH connectivity testing, uploading/validating the
-security team's CVE report, and a **read-only pre-patch analysis** that produces a per-server
-report (with NVD CVSS severity and Excel export) and an exact package / .deb plan.
-Package downloads, installation, reboots and patch approval are **not** implemented yet;
-they come in Phase 3.
+security team's CVE report, a **read-only pre-patch analysis** that produces a per-server
+report (with NVD CVSS severity and Excel export) and an exact package / .deb plan, and
+**per-server patch execution** of an approved plan with verification and patch history.
+EC2Patcher never reboots a server and never runs `apt upgrade` / `dist-upgrade`.
 
 ## Features (Phase 1 + 1.5)
 
@@ -158,6 +158,43 @@ downloads `ec2patcher_<server name>_<analysis date>.xlsx` with three sheets: *Su
 and Ubuntu Priority) and *Package Plan*. The workbook is built on demand from the stored
 snapshot only; exporting never runs ssh, APT, NVD or metadata downloads.
 
+## Patch execution (Phase 3)
+
+Each server report has a **Patch Decision** area with **Reject** and **Approve & Patch**
+(one server at a time; there is no bulk patching). Rejecting only records the decision.
+Approving (after a confirmation page) runs this pipeline; every step must pass:
+
+1. **Revalidate**: reconnect and compare hostname, Ubuntu version/codename, architecture and
+   the installed version of every planned package with the analysis. Any drift aborts with
+   *PATCH ABORTED — SERVER STATE CHANGED* before anything is downloaded. `sudo -n true` must
+   work (no password prompt, ever).
+2. **Download** each approved `.deb` once from its recorded URI into the local staging
+   directory as `<file>.part`; it is renamed only after size and SHA256 match the plan.
+3. **Transfer** with `scp` to `/tmp/<server name>` on the server and verify size + `sha256sum`.
+4. **Simulate** `apt-get -s install <explicit .deb paths>`; the simulation must install exactly
+   the approved packages/versions from the staged files, with no removal or downgrade.
+5. **Install** `sudo -n apt-get install -y <explicit .deb paths>`. APT runs with **no remote
+   sources** (`Dir::Etc::SourceList=/dev/null`, `Dir::Etc::SourceParts=/dev/null`), so it
+   cannot download anything or pull in other updates, plus `--no-remove`,
+   `DEBIAN_FRONTEND=noninteractive` and `NEEDRESTART_MODE=l`.
+6. **Verify** installed versions (Debian version comparison), `dpkg --audit`, each CVE against
+   Canonical's fixed version, and `/run/reboot-required` (reported, never acted on).
+7. **Clean up** local and remote staging (only after success and after history is saved).
+
+On any failure the staging files are kept and their paths shown; a new analysis is required
+before trying again. A failed or interrupted install is never retried or rolled back; if the
+connection drops, the server is inspected once more and the result is either proven or
+recorded as *EXECUTION STATE UNKNOWN*. Each approved report can be executed once, and only
+if it is the latest analysis for that server.
+
+**Local Patch Download Directory** (Settings) defaults to `/tmp/${server_name}`. The template
+must contain `${server_name}` and resolve to an absolute path (`~` is expanded); system
+directories, `/tmp` itself and `..` are refused. Existing directories are only reused when
+empty or when they hold EC2Patcher's own files; cleanup deletes only the files it staged.
+
+**History** lists every decision and execution with before/target/after versions, CVE
+verification, reboot state, cleanup result and errors.
+
 ### CVE report format
 
 ```json
@@ -223,7 +260,8 @@ Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
 Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
 user data directory. The schema is created and migrated automatically on startup. A database
 created by an earlier phase is upgraded in place (Phase 1.5 adds `server_tags`, Phase 2 adds the
-analysis tables, Phase 2.2 adds the CVSS columns); existing servers, tags and reports are kept.
+analysis tables, Phase 2.2 adds the CVSS columns, Phase 3 adds settings and patch history);
+existing servers, tags and reports are kept.
 
 ## Test and lint
 
@@ -232,9 +270,10 @@ analysis tables, Phase 2.2 adds the CVSS columns); existing servers, tags and re
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-The tests mock `ssh`, NVD and the local `apt-get` / `apt-cache` backend and use fixture
-Canonical VEX data, NVD API responses and captured APT output, so they never need a real EC2
-server, a real PEM, internet access or package installs.
+The tests mock `ssh`, `scp`, package downloads, NVD and the local `apt-get` / `apt-cache`
+backend, and use fixture Canonical VEX data, NVD API responses and captured APT output, so they
+never need a real EC2 server, a real PEM, internet access or package installs. Patch execution
+runs against a scripted fake server.
 
 ## Project layout
 
@@ -257,6 +296,11 @@ src/ec2patcher/
     apt_planner.py        apt-cache / apt-get -s / --print-uris arguments and parsers
     local_apt.py          private per-release APT state on the workstation (update, queries)
     analysis_service.py   background analysis runs, persistence
+    patch_service.py      Phase 3 approval/rejection, eligibility, execution pipeline
+    patch_state.py        execution states and allowed transitions
+    patch_remote.py       patch-time remote commands (staging, simulate, install, verify)
+    downloader.py         approved .deb download + size/SHA256 verification
+    staging.py            local/remote staging path rules and safe cleanup
   templates/         Jinja2 templates
   static/            CSS + a small amount of vanilla JS
 tests/               pytest suite
@@ -269,5 +313,9 @@ tests/               pytest suite
   websites open in your browser.
 - The app never reads PEM contents. Subprocesses never use `shell=True`.
 - The remote analysis command is a fixed string. Local APT commands are argument lists; package
-  names and versions are validated against strict patterns. No `sudo`, no downloads, no installs.
+  names and versions are validated against strict patterns. Analysis uses no `sudo`, no
+  downloads, no installs.
+- Patch commands only use validated `/tmp/<server>` paths and APT archive file names, and
+  `sudo -n` (non-interactive). Only one patch execution runs at a time. No reboot, no
+  `apt upgrade`/`dist-upgrade`, no rollback. PEM paths and key material are never logged.
 - Unexpected errors show a generic message in the GUI; details go to the log.
