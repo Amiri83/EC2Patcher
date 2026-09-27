@@ -175,6 +175,8 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 /* Analysis (Phase 2) */
 .badge-warning { background: var(--warning-bg); color: var(--warning); }
 .badge-critical { background: var(--danger); color: #fff; }
+.badge-low { background: #e6effa; color: #1f5fa8; }
+.severity-breakdown .badge { margin-right: 4px; }
 .header-actions { display: flex; gap: 8px; }
 .text-danger { color: var(--danger); }
 .text-warning { color: var(--warning); }

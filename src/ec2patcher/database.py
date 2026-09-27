@@ -21,7 +21,7 @@ from ec2patcher.models import (
     Tag,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _MIGRATIONS = {
     1: """
@@ -145,6 +145,19 @@ _MIGRATIONS = {
             PRIMARY KEY (package_plan_id, cve)
         );
     """,
+    # Phase 2.2: NVD CVSS snapshot per finding, captured at analysis time. Existing rows keep
+    # NULLs (shown as Unknown severity); Canonical's priority column is unchanged.
+    4: """
+        ALTER TABLE cve_findings ADD COLUMN cvss_severity TEXT;
+        ALTER TABLE cve_findings ADD COLUMN cvss_score REAL;
+        ALTER TABLE cve_findings ADD COLUMN cvss_version TEXT;
+        ALTER TABLE cve_findings ADD COLUMN cvss_vector TEXT;
+        ALTER TABLE cve_findings ADD COLUMN cvss_source TEXT;
+        ALTER TABLE cve_findings ADD COLUMN cvss_source_type TEXT;
+        ALTER TABLE cve_findings ADD COLUMN nvd_last_modified TEXT;
+        ALTER TABLE cve_findings ADD COLUMN nvd_status TEXT;
+        ALTER TABLE cve_findings ADD COLUMN nvd_note TEXT;
+    """,
 }
 
 
@@ -254,6 +267,15 @@ def _row_to_finding(row: sqlite3.Row) -> CveFindingRow:
         binary_packages=json.loads(row["binary_packages"] or "[]"),
         pocket=row["pocket"],
         priority=row["priority"],
+        cvss_severity=row["cvss_severity"],
+        cvss_score=row["cvss_score"],
+        cvss_version=row["cvss_version"],
+        cvss_vector=row["cvss_vector"],
+        cvss_source=row["cvss_source"],
+        cvss_source_type=row["cvss_source_type"],
+        nvd_last_modified=row["nvd_last_modified"],
+        nvd_status=row["nvd_status"],
+        nvd_note=row["nvd_note"],
     )
 
 
@@ -536,13 +558,21 @@ class Database:
             conn.execute("DELETE FROM cve_findings WHERE server_analysis_id = ?", (analysis_id,))
             conn.execute("DELETE FROM package_plans WHERE server_analysis_id = ?", (analysis_id,))
             for f in findings:
+                c = f.cvss
                 conn.execute(
                     "INSERT INTO cve_findings (server_analysis_id, cve, source_package, "
                     "installed_version, fixed_version, status, detail, binary_packages, pocket, "
-                    "priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "priority, cvss_severity, cvss_score, cvss_version, cvss_vector, cvss_source, "
+                    "cvss_source_type, nvd_last_modified, nvd_status, nvd_note) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         analysis_id, f.cve, f.source, f.installed_version, f.fixed_version,
                         f.status, f.detail, json.dumps(f.binaries), f.pocket, f.priority,
+                        *(
+                            (c.severity, c.score, c.version, c.vector, c.source, c.source_type,
+                             c.last_modified, c.status, c.note)
+                            if c else (None,) * 9
+                        ),
                     ),
                 )  # fmt: skip
             for p in plan:

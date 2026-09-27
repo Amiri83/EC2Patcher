@@ -6,6 +6,9 @@
   <a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>
 </div>{% endblock %}
 {% block content %}
+{% macro severity_cell(f) %}<span class="badge {{ severity_classes[f.severity] }}"{% if f.nvd_note %} title="{{ f.nvd_note }}"{% endif %}>{{ f.severity }}</span>{% if f.priority %}<div class="muted small">Ubuntu Priority: {{ f.priority }}</div>{% endif %}{% endmacro %}
+{% macro cvss_cell(f) %}{% if f.cvss_score is not none %}<span{% if f.cvss_vector %} title="{{ f.cvss_vector }}"{% endif %}>{{ f.cvss_label }}</span>{% else %}<span class="muted">—</span>{% endif %}
+  <div class="muted small">{% if f.nvd_status is none %}not captured{% elif f.nvd_status in ("ok", "stale") %}Source: {{ "NVD" if f.cvss_source == "nvd@nist.gov" else (f.cvss_source or "unknown") }}{% if f.cvss_source_type and f.cvss_source != "nvd@nist.gov" %} ({{ f.cvss_source_type }}){% endif %}{% if f.nvd_status == "stale" %} &middot; stale cache{% endif %}{% else %}{{ nvd_status_labels.get(f.nvd_status, f.nvd_status) }}{% endif %}</div>{% endmacro %}
 {% if not is_latest %}
   <div class="alert alert-warning">This is a historical report from analysis #{{ run.id }}. A newer analysis exists.</div>
 {% endif %}
@@ -60,6 +63,9 @@
     <div class="summary-item"><span class="summary-value">{{ summary.download_bytes|filesize }}</span><span class="summary-label">Estimated download size</span></div>
     <div class="summary-item {% if analysis.expected_reboot %}summary-warning{% endif %}"><span class="summary-value">{% if analysis.expected_reboot is none %}?{% elif analysis.expected_reboot %}YES{% else %}NO{% endif %}</span><span class="summary-label">Expected reboot</span></div>
   </div>
+  <p class="muted small severity-breakdown">Severity (NVD CVSS, per reported CVE):
+    {% for sev in severities %}<span class="badge {{ severity_classes[sev] }}">{{ sev }}: {{ summary.by_severity[sev] }}</span>{% endfor %}
+  </p>
   {% if summary.by_status %}
     <p class="muted small status-breakdown">By status:
       {% for status, count in summary.by_status|dictsort %}
@@ -77,13 +83,14 @@
   {% if analysis.findings %}
     <div class="table-scroll">
     <table class="table findings-table">
-      <thead><tr><th>CVE</th><th>Severity</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Fixed Version</th><th>Status</th><th>Related Binary Package(s)</th></tr></thead>
+      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Fixed Version</th><th>Status</th><th>Related Binary Package(s)</th></tr></thead>
       {% for g in finding_groups %}
       <tbody class="cve-group">
         {% for f in g.rows %}
           <tr>
             <td class="num">{% if loop.first %}<code>{{ f.cve }}</code>{% else %}<span class="muted small">&#8627; same CVE</span>{% endif %}</td>
-            <td><span class="badge {{ severity_classes[f.severity] }}"{% if f.priority %} title="Canonical priority: {{ f.priority }}"{% endif %}>{{ f.severity }}</span></td>
+            <td>{{ severity_cell(f) }}</td>
+            <td class="cvss">{{ cvss_cell(f) }}</td>
             <td>{{ f.source_package or "-" }}</td>
             <td><code>{{ f.installed_version or "-" }}</code></td>
             <td>{% if f.fixed_version %}<code>{{ f.fixed_version }}</code>{% if f.pocket and "/" in f.pocket %} <span class="muted small">({{ f.pocket }})</span>{% endif %}{% else %}-{% endif %}</td>
@@ -101,7 +108,8 @@
         {% if g.not_installed %}
           <tr>
             <td class="num"><span class="muted small">&#8627; same CVE</span></td>
-            <td>{% for sev in g.not_installed|map(attribute="severity")|unique %}<span class="badge {{ severity_classes[sev] }}">{{ sev }}</span> {% endfor %}</td>
+            <td>{{ severity_cell(g.not_installed[0]) }}</td>
+            <td class="cvss">{{ cvss_cell(g.not_installed[0]) }}</td>
             <td colspan="3">
               <details><summary>{{ g.not_installed|length }} other source packages</summary>
                 {% for f in g.not_installed %}<code>{{ f.source_package }}</code> {% endfor %}</details>

@@ -25,11 +25,12 @@ from ec2patcher.services import (
     analysis_service,
     cve_resolver,
     excel_export,
+    nvd,
     report_service,
     ssh_service,
 )
 from ec2patcher.services.security_metadata import SecurityMetadata
-from ec2patcher.services.severity import SEVERITY_CLASSES
+from ec2patcher.services.severity import SEVERITIES, SEVERITY_CLASSES
 from ec2patcher.validation import tag_rows, validate_server_input
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ def create_app(
     allowed_hosts: list[str] | None = None,
     metadata: SecurityMetadata | None = None,
     analysis_starter: analysis_service.Starter | None = None,
+    nvd_client: nvd.NvdClient | None = None,
 ) -> FastAPI:
     db = Database(db_path or get_data_dir() / DB_FILENAME)
     interrupted = db.mark_interrupted_runs()
@@ -85,6 +87,7 @@ def create_app(
         metadata,
         runner=ssh_runner or subprocess.run,
         starter=analysis_starter or analysis_service.thread_starter,
+        nvd_client=nvd_client,
     )
 
     @asynccontextmanager
@@ -107,6 +110,8 @@ def create_app(
     templates.env.globals["status_classes"] = STATUS_CLASSES
     templates.env.globals["reboot_help"] = cve_resolver.REBOOT_HELP
     templates.env.globals["severity_classes"] = SEVERITY_CLASSES
+    templates.env.globals["severities"] = SEVERITIES
+    templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
     app.state.analyzer = analyzer
 
     def run_ssh_test(name: str, ip: str, pem: str) -> ssh_service.SSHTestResult:
