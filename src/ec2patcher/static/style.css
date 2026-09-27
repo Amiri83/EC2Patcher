@@ -115,6 +115,12 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 .inline { display: flex; gap: 8px; flex-wrap: wrap; }
 .inline input { max-width: 260px; }
 .clear-form label { display: block; margin-bottom: 6px; }
+.tags-field { border: 0; padding: 0; margin: 0 0 16px; min-width: 0; }
+.tags-field legend { font-weight: 600; padding: 0; margin-bottom: 4px; }
+.tag-rows { margin: 8px 0; }
+.tag-row { display: flex; gap: 8px; margin-bottom: 6px; }
+.tag-row input[name="tag_key"] { flex: 2; }
+.tag-row input[name="tag_value"] { flex: 3; }
 
 /* Server list */
 .server-list { list-style: none; margin: 0; padding: 0; }
@@ -128,6 +134,13 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 .server-actions { display: flex; gap: 6px; }
 .server-actions form { margin: 0; }
 .server-result { flex-basis: 100%; }
+.server-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.tag {
+  display: inline-block; max-width: 280px; padding: 1px 8px; border: 1px solid var(--border); border-radius: 999px;
+  background: #f7f8fa; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tag-key { color: var(--muted); }
+.tag-more { font-size: 12px; color: var(--muted); cursor: default; }
 
 /* SSH result */
 .ssh-result { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; margin-top: 8px; }

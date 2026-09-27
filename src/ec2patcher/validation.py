@@ -1,9 +1,10 @@
-"""Validation of user-supplied server settings."""
+"""Validation of user-supplied server settings and server tags."""
 
 import ipaddress
 import os
 import re
 from dataclasses import dataclass, field
+from itertools import zip_longest
 from pathlib import Path
 
 from ec2patcher.database import Database
@@ -13,6 +14,9 @@ from ec2patcher.database import Database
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 NAME_MAX_LENGTH = 64
 PEM_PATH_MAX_LENGTH = 1024
+TAG_KEY_MAX_LENGTH = 64
+TAG_VALUE_MAX_LENGTH = 256
+MAX_TAGS_PER_SERVER = 50
 
 
 @dataclass
@@ -20,6 +24,7 @@ class ServerInput:
     name: str
     ip_address: str
     pem_path: str
+    tags: list[tuple[str, str]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
 
     @property
@@ -74,8 +79,50 @@ def check_name(name: str) -> str | None:
     return None
 
 
+def tag_rows(keys: list[str] | None, values: list[str] | None) -> list[dict[str, str]]:
+    """Pair up submitted tag keys/values (parallel form arrays), trimmed.
+
+    Rows where both key and value are blank are dropped. Mismatched array lengths are
+    padded with empty strings instead of failing.
+    """
+    rows = []
+    for key, value in zip_longest(keys or [], values or [], fillvalue=""):
+        key, value = str(key or "").strip(), str(value or "").strip()
+        if key or value:
+            rows.append({"key": key, "value": value})
+    return rows
+
+
+def check_tags(rows: list[dict[str, str]]) -> str | None:
+    """Return an error message for invalid tag rows, or None. Keys are case-insensitive."""
+    if len(rows) > MAX_TAGS_PER_SERVER:
+        return f"A server can have at most {MAX_TAGS_PER_SERVER} tags."
+    problems = []
+    seen: set[str] = set()
+    for number, row in enumerate(rows, start=1):
+        key, value = row["key"], row["value"]
+        if not key:
+            problems.append(f"Tag {number}: key is required.")
+        elif len(key) > TAG_KEY_MAX_LENGTH:
+            problems.append(f"Tag {number}: key must be at most {TAG_KEY_MAX_LENGTH} characters.")
+        elif key.casefold() in seen:
+            problems.append(f"Duplicate tag key: {key}")
+        if len(value) > TAG_VALUE_MAX_LENGTH:
+            problems.append(
+                f"Tag {number}: value must be at most {TAG_VALUE_MAX_LENGTH} characters."
+            )
+        seen.add(key.casefold())
+    return " ".join(problems) or None
+
+
 def validate_server_input(
-    db: Database, name: str, ip_address: str, pem_path: str, exclude_id: int | None = None
+    db: Database,
+    name: str,
+    ip_address: str,
+    pem_path: str,
+    exclude_id: int | None = None,
+    tag_keys: list[str] | None = None,
+    tag_values: list[str] | None = None,
 ) -> ServerInput:
     """Validate and normalize server form input. Uniqueness is checked against the DB."""
     result = ServerInput(
@@ -101,5 +148,12 @@ def validate_server_input(
     pem_error = check_pem_path(result.pem_path)
     if pem_error:
         result.errors["pem_path"] = pem_error
+
+    rows = tag_rows(tag_keys, tag_values)
+    tags_error = check_tags(rows)
+    if tags_error:
+        result.errors["tags"] = tags_error
+    else:
+        result.tags = [(row["key"], row["value"]) for row in rows]
 
     return result

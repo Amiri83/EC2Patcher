@@ -21,6 +21,21 @@
     update();
   });
 
+  // Server form: add/remove tag rows. Blank rows are ignored server-side.
+  var tagRows = document.getElementById("tag-rows");
+  var addTag = document.getElementById("add-tag");
+  var tagTemplate = document.getElementById("tag-row-template");
+  if (tagRows && addTag && tagTemplate) {
+    addTag.addEventListener("click", function () {
+      tagRows.appendChild(tagTemplate.content.cloneNode(true));
+      tagRows.lastElementChild.querySelector("input").focus();
+    });
+    tagRows.addEventListener("click", function (event) {
+      var button = event.target.closest("[data-remove-tag]");
+      if (button) { button.closest(".tag-row").remove(); }
+    });
+  }
+
   // Report upload: show chosen file name and support drag & drop.
   var dropzone = document.getElementById("dropzone");
   var fileInput = document.getElementById("report_file");

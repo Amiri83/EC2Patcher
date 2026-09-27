@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from ec2patcher.database import Database, DuplicateServerNameError
+from ec2patcher.database import SCHEMA_VERSION, Database, DuplicateServerNameError
 
 
 def test_create_and_get_server(db):
@@ -104,4 +104,4 @@ def test_only_latest_report_kept(db):
 
 def test_schema_version_set(db):
     with sqlite3.connect(db.path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
