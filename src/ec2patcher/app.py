@@ -3,6 +3,7 @@
 import logging
 import os
 import signal
+import subprocess  # noqa: S404 - default runner handed to the ssh service
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -20,7 +21,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from ec2patcher import __version__
 from ec2patcher.config import DB_FILENAME, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
-from ec2patcher.services import report_service, ssh_service
+from ec2patcher.services import analysis_service, cve_resolver, report_service, ssh_service
+from ec2patcher.services.security_metadata import SecurityMetadata
 from ec2patcher.validation import tag_rows, validate_server_input
 
 logger = logging.getLogger(__name__)
@@ -52,13 +54,50 @@ def format_timestamp(value: str) -> str:
         return value
 
 
+def format_size(value: int | None) -> str:
+    if value is None:
+        return "-"
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return str(value)
+
+
+STATUS_CLASSES = {
+    cve_resolver.PATCH_REQUIRED: "badge-danger",
+    cve_resolver.ANALYSIS_ERROR: "badge-danger",
+    cve_resolver.CANDIDATE_UNAVAILABLE: "badge-warning",
+    cve_resolver.FIX_REQUIRES_PRO: "badge-warning",
+    cve_resolver.FIX_NOT_AVAILABLE: "badge-warning",
+    cve_resolver.NEEDS_EVALUATION: "badge-warning",
+    cve_resolver.IGNORED: "badge-neutral",
+    cve_resolver.ALREADY_FIXED: "badge-success",
+    cve_resolver.NOT_AFFECTED: "badge-success",
+    cve_resolver.PACKAGE_NOT_INSTALLED: "badge-success",
+}
+
+
 def create_app(
     db_path: Path | None = None,
     shutdown_handler: Callable[[], None] | None = None,
     ssh_runner: ssh_service.Runner | None = None,
     allowed_hosts: list[str] | None = None,
+    metadata: SecurityMetadata | None = None,
+    analysis_starter: analysis_service.Starter | None = None,
 ) -> FastAPI:
     db = Database(db_path or get_data_dir() / DB_FILENAME)
+    interrupted = db.mark_interrupted_runs()
+    if interrupted:
+        logger.warning("Marked %d unfinished analysis run(s) as interrupted", interrupted)
+    metadata = metadata or SecurityMetadata()
+    analyzer = analysis_service.AnalysisService(
+        db,
+        metadata,
+        runner=ssh_runner or subprocess.run,
+        starter=analysis_starter or analysis_service.thread_starter,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -75,6 +114,11 @@ def create_app(
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
     templates.env.filters["timestamp"] = format_timestamp
+    templates.env.filters["filesize"] = format_size
+    templates.env.globals["status_labels"] = cve_resolver.STATUS_LABELS
+    templates.env.globals["status_classes"] = STATUS_CLASSES
+    templates.env.globals["reboot_help"] = cve_resolver.REBOOT_HELP
+    app.state.analyzer = analyzer
 
     def run_ssh_test(name: str, ip: str, pem: str) -> ssh_service.SSHTestResult:
         if ssh_runner is not None:
@@ -290,7 +334,9 @@ def create_app(
         return render(
             request, "reports.html", "reports", status_code=status_code,
             report=report, missing_servers=missing,
-            max_kib=report_service.MAX_REPORT_BYTES // 1024, **ctx,
+            max_kib=report_service.MAX_REPORT_BYTES // 1024,
+            runs=db.list_analysis_runs(limit=10), analysis_running=analyzer.is_running,
+            metadata_status=metadata.status(), **ctx,
         )  # fmt: skip
 
     @app.get("/reports", response_class=HTMLResponse)
@@ -314,6 +360,47 @@ def create_app(
             result.filename, result.server_count, result.cve_count,
         )  # fmt: skip
         return reports_page(request, validation=result)
+
+    # --- analysis (Phase 2, read-only) -----------------------------------------
+
+    @app.post("/reports/analyze", response_class=HTMLResponse)
+    def analyze_report(request: Request):
+        report = db.get_latest_report()
+        if report is None:
+            return reports_page(request, status_code=400, error="Upload a valid report first.")
+        if analyzer.is_running:
+            latest = db.get_latest_analysis_run()
+            if latest is not None and latest.is_running:
+                return redirect(f"/analysis/{latest.id}")
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        run_id = analyzer.start(report)
+        if run_id is None:
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        return redirect(f"/analysis/{run_id}")
+
+    @app.get("/analysis/{run_id}", response_class=HTMLResponse)
+    def analysis_run(request: Request, run_id: int):
+        run = db.get_analysis_run(run_id, details=True)
+        if run is None:
+            raise StarletteHTTPException(404)
+        summaries = {s.id: analysis_service.summarize(s) for s in run.servers}
+        return render(
+            request, "analysis_run.html", "reports", run=run, summaries=summaries,
+        )  # fmt: skip
+
+    @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
+    def server_report(request: Request, run_id: int, analysis_id: int):
+        run = db.get_analysis_run(run_id, details=False)
+        analysis = db.get_server_analysis(analysis_id)
+        if run is None or analysis is None or analysis.run_id != run_id:
+            raise StarletteHTTPException(404)
+        latest = db.get_latest_analysis_run()
+        return render(
+            request, "server_report.html", "reports", run=run, analysis=analysis,
+            summary=analysis_service.summarize(analysis),
+            finding_groups=analysis_service.group_findings(analysis),
+            is_latest=latest is not None and latest.id == run_id,
+        )  # fmt: skip
 
     # --- history / settings --------------------------------------------------
 

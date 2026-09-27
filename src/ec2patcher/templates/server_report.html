@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% block title %}{{ analysis.server_name }} - Pre-Patch Report{% endblock %}
+{% block heading %}Pre-Patch Report: {{ analysis.server_name }}{% endblock %}
+{% block header_actions %}<a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>{% endblock %}
+{% block content %}
+{% if not is_latest %}
+  <div class="alert alert-warning">This is a historical report from analysis #{{ run.id }}. A newer analysis exists.</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-header">
+    <h2>Server</h2>
+    {% if analysis.status == "complete" %}<span class="badge badge-success">ANALYSIS COMPLETE</span>
+    {% elif analysis.status == "failed" %}<span class="badge badge-danger">ANALYSIS FAILED</span>
+    {% else %}<span class="badge badge-warning">{{ analysis.status|upper }}</span>{% endif %}
+  </div>
+  {% if analysis.error %}<div class="alert alert-error">{{ analysis.error }}</div>{% endif %}
+  <dl class="kv report-header">
+    <dt>Server Name</dt><dd>{{ analysis.server_name }}</dd>
+    {% if analysis.display_name %}<dt>Display Name</dt><dd>{{ analysis.display_name }}</dd>{% endif %}
+    <dt>IP</dt><dd><code>{{ analysis.ip_address or "-" }}</code></dd>
+    <dt>Remote Hostname</dt><dd>{{ analysis.remote_hostname or "-" }}</dd>
+    <dt>Ubuntu</dt><dd>{{ analysis.os_pretty_name or "-" }}</dd>
+    <dt>Codename</dt><dd>{{ analysis.os_codename or "-" }}</dd>
+    <dt>Architecture</dt><dd>{{ analysis.architecture or "-" }}</dd>
+    <dt>Running Kernel</dt><dd>{{ analysis.running_kernel or "-" }}</dd>
+    <dt>Analysis Time</dt><dd>{{ (analysis.completed_at or analysis.started_at or run.started_at)|timestamp }}</dd>
+    <dt>Canonical Security Metadata</dt>
+    <dd>{% if run.metadata_updated_at %}Published {{ run.metadata_updated_at }}{% if run.metadata_checked_at %} &middot; cached {{ run.metadata_checked_at|timestamp }}{% endif %}{% else %}not available{% endif %}
+        {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}
+        <div class="muted small">{{ run.metadata_source or "" }}</div></dd>
+    <dt>APT Metadata</dt>
+    <dd>{% if analysis.apt_updated_at %}Updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">unknown</span>{% endif %}</dd>
+    <dt>Current Reboot Required</dt>
+    <dd>{% if analysis.current_reboot_required is none %}<span class="muted">unknown</span>{% elif analysis.current_reboot_required %}<strong>YES</strong>{% if analysis.reboot_required_packages %} <span class="muted small">({{ analysis.reboot_required_packages|join(", ") }})</span>{% endif %}{% else %}NO{% endif %}</dd>
+    <dt>Expected Reboot After Planned Patch</dt>
+    <dd>{% if analysis.expected_reboot is none %}<span class="muted">unknown</span>{% elif analysis.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}NO EXPECTED REBOOT{% endif %}
+        <div class="muted small">{{ reboot_help }}</div></dd>
+  </dl>
+  {% if analysis.warnings %}
+    <div class="alert alert-warning"><ul class="plain-list">{% for w in analysis.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Summary</h2>
+  <div class="summary-grid">
+    <div class="summary-item"><span class="summary-value">{{ summary.reported }}</span><span class="summary-label">Reported CVEs</span></div>
+    <div class="summary-item {% if summary.count('PATCH_REQUIRED') %}summary-danger{% endif %}"><span class="summary-value">{{ summary.count("PATCH_REQUIRED") }}</span><span class="summary-label">Patch required</span></div>
+    <div class="summary-item"><span class="summary-value">{{ summary.count("ALREADY_FIXED") }}</span><span class="summary-label">Already fixed</span></div>
+    <div class="summary-item"><span class="summary-value">{{ summary.count("NOT_AFFECTED") }}</span><span class="summary-label">Not affected</span></div>
+    <div class="summary-item"><span class="summary-value">{{ summary.count("PACKAGE_NOT_INSTALLED") }}</span><span class="summary-label">Package not installed</span></div>
+    <div class="summary-item {% if summary.count('FIX_NOT_AVAILABLE', 'FIX_REQUIRES_PRO', 'CANDIDATE_UNAVAILABLE', 'IGNORED') %}summary-warning{% endif %}"><span class="summary-value">{{ summary.count("FIX_NOT_AVAILABLE", "FIX_REQUIRES_PRO", "CANDIDATE_UNAVAILABLE", "IGNORED") }}</span><span class="summary-label">Fix unavailable</span></div>
+    <div class="summary-item {% if summary.count('NEEDS_EVALUATION', 'ANALYSIS_ERROR', 'NOT_ANALYZED') %}summary-warning{% endif %}"><span class="summary-value">{{ summary.count("NEEDS_EVALUATION", "ANALYSIS_ERROR", "NOT_ANALYZED") }}</span><span class="summary-label">Needs investigation / errors</span></div>
+    <div class="summary-item"><span class="summary-value">{{ summary.packages }}</span><span class="summary-label">Binary packages to update</span></div>
+    <div class="summary-item"><span class="summary-value">{{ summary.debs }}</span><span class="summary-label">.deb files required</span></div>
+    <div class="summary-item"><span class="summary-value">{{ summary.download_bytes|filesize }}</span><span class="summary-label">Estimated download size</span></div>
+    <div class="summary-item {% if analysis.expected_reboot %}summary-warning{% endif %}"><span class="summary-value">{% if analysis.expected_reboot is none %}?{% elif analysis.expected_reboot %}YES{% else %}NO{% endif %}</span><span class="summary-label">Expected reboot</span></div>
+  </div>
+  {% if summary.by_status %}
+    <p class="muted small status-breakdown">By status:
+      {% for status, count in summary.by_status|dictsort %}
+        <span class="badge {{ status_classes.get(status, 'badge-neutral') }}">{{ status_labels.get(status, "Not analyzed" if status == "NOT_ANALYZED" else status) }}: {{ count }}</span>
+      {% endfor %}
+    </p>
+  {% endif %}
+  {% if summary.unresolved %}
+    <div class="alert alert-warning">{{ summary.unresolved }} package(s) in the plan could not be resolved to an exact .deb file. See the package plan below.</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>CVE Findings</h2>
+  {% if analysis.findings %}
+    <div class="table-scroll">
+    <table class="table findings-table">
+      <thead><tr><th>CVE</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Fixed Version</th><th>Status</th><th>Related Binary Package(s)</th></tr></thead>
+      {% for g in finding_groups %}
+      <tbody class="cve-group">
+        {% for f in g.rows %}
+          <tr>
+            <td class="num">{% if loop.first %}<code>{{ f.cve }}</code>{% else %}<span class="muted small">&#8627; same CVE</span>{% endif %}</td>
+            <td>{{ f.source_package or "-" }}</td>
+            <td><code>{{ f.installed_version or "-" }}</code></td>
+            <td>{% if f.fixed_version %}<code>{{ f.fixed_version }}</code>{% if f.pocket and "/" in f.pocket %} <span class="muted small">({{ f.pocket }})</span>{% endif %}{% else %}-{% endif %}</td>
+            <td><span class="badge {{ status_classes.get(f.status, 'badge-neutral') }}">{{ status_labels.get(f.status, f.status) }}</span>
+                {% if f.priority %}<span class="muted small">{{ f.priority }} priority</span>{% endif %}
+                {% if f.detail %}<div class="muted small finding-detail">{{ f.detail }}</div>{% endif %}</td>
+            <td class="pkg-list">
+              {% if f.binary_packages|length > 6 %}
+                <details><summary>{{ f.binary_packages|length }} packages</summary>{% for b in f.binary_packages %}<code>{{ b }}</code> {% endfor %}</details>
+              {% else %}
+                {% for b in f.binary_packages %}<code>{{ b }}</code> {% else %}<span class="muted">-</span>{% endfor %}
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        {% if g.not_installed %}
+          <tr>
+            <td class="num"><span class="muted small">&#8627; same CVE</span></td>
+            <td colspan="3">
+              <details><summary>{{ g.not_installed|length }} other source packages</summary>
+                {% for f in g.not_installed %}<code>{{ f.source_package }}</code> {% endfor %}</details>
+            </td>
+            <td><span class="badge {{ status_classes.get('PACKAGE_NOT_INSTALLED') }}">{{ status_labels.get("PACKAGE_NOT_INSTALLED") }}</span></td>
+            <td><span class="muted">-</span></td>
+          </tr>
+        {% endif %}
+      </tbody>
+      {% endfor %}
+    </table>
+    </div>
+  {% else %}
+    <p class="muted">No findings{% if analysis.status == "failed" %} - the analysis of this server failed before CVEs could be evaluated. Reported CVEs: {{ analysis.reported_cves|join(", ") }}{% endif %}.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Package / .deb Plan</h2>
+  {% if analysis.plan %}
+    <p class="muted small">Planned only &mdash; nothing has been downloaded. Target versions are the current APT candidates on the server.</p>
+    <div class="table-scroll">
+    <table class="table plan-table">
+      <thead><tr><th>Binary Package</th><th>Current Version</th><th>Target Version</th><th>.deb Filename</th><th class="num">Size</th><th>Related CVEs</th><th>Reboot Impact</th></tr></thead>
+      <tbody>
+        {% for p in analysis.plan %}
+          <tr class="{% if p.status != 'planned' %}row-warning{% endif %}">
+            <td><strong>{{ p.binary_package }}</strong> <span class="muted small">{{ p.architecture }}</span>
+                {% if p.is_dependency %}<div class="muted small">dependency{% if p.current_version is none %} (new package){% endif %}</div>{% endif %}</td>
+            <td><code>{{ p.current_version or "not installed" }}</code></td>
+            <td><code>{{ p.target_version }}</code></td>
+            <td>{% if p.deb_filename %}<code>{{ p.deb_filename }}</code>{% else %}<span class="text-danger">Unable to resolve package download plan</span><div class="muted small">{{ p.reason }}</div>{% endif %}</td>
+            <td class="num">{{ p.size|filesize }}</td>
+            <td class="cve-list">{% for c in p.cves %}<code>{{ c }}</code>{% else %}<span class="muted small">required dependency</span>{% endfor %}</td>
+            <td>{{ p.reboot_impact or "No reboot expected" }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% else %}
+    <p class="muted">No package updates are planned for this server.</p>
+  {% endif %}
+</div>
+
+{% if analysis.plan or analysis.apt_arguments %}
+<div class="card">
+  <details class="report-details">
+    <summary><strong>Technical details</strong> <span class="muted small">(download URIs, checksums, APT invocation)</span></summary>
+    {% if analysis.apt_arguments %}
+      <p class="small">APT invocation used for planning (simulation / <code>--print-uris</code> only):</p>
+      <pre>apt-get {{ analysis.apt_arguments|join(" ") }}</pre>
+    {% endif %}
+    <div class="table-scroll">
+    <table class="table small">
+      <thead><tr><th>.deb</th><th>Source Package</th><th>URI</th><th>Checksum</th></tr></thead>
+      <tbody>
+        {% for p in analysis.plan %}
+          <tr>
+            <td><code>{{ p.deb_filename or p.binary_package }}</code></td>
+            <td>{{ p.source_package or "-" }}</td>
+            <td class="wrap">{% if p.uri %}<code>{{ p.uri }}</code>{% else %}-{% endif %}</td>
+            <td class="wrap">{% if p.checksum %}<code>{{ p.checksum }}</code>{% else %}-{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% if analysis.expected_reboot_reason %}<p class="small">Expected reboot: {{ analysis.expected_reboot_reason }}</p>{% endif %}
+  </details>
+</div>
+{% endif %}
+{% endblock %}

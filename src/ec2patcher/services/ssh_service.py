@@ -42,8 +42,25 @@ class SSHTestResult:
     error: str | None = None
 
 
-def build_ssh_command(ip_address: str, pem_path: str) -> list[str]:
-    """Build the ssh argument list. PEM path '~' is expanded here."""
+@dataclass
+class RemoteResult:
+    """Outcome of running one fixed, read-only command on a server over ssh."""
+
+    ok: bool
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int | None = None
+    error: str | None = None  # user-friendly message when ok is False
+
+
+def build_ssh_command(
+    ip_address: str, pem_path: str, remote_command: str = REMOTE_COMMAND
+) -> list[str]:
+    """Build the ssh argument list. PEM path '~' is expanded here.
+
+    ``remote_command`` is passed as a single argument and interpreted by the remote login
+    shell, so callers must only pass constant text or values quoted with shlex.quote().
+    """
     return [
         SSH_BINARY,
         "-i", str(expand_pem_path(pem_path)),
@@ -54,7 +71,7 @@ def build_ssh_command(ip_address: str, pem_path: str) -> list[str]:
         "-o", "StrictHostKeyChecking=accept-new",
         "--",
         f"{SSH_USER}@{ip_address}",
-        REMOTE_COMMAND,
+        remote_command,
     ]  # fmt: skip
 
 
@@ -95,6 +112,53 @@ def describe_ssh_error(stderr: str) -> str:
     if lines:
         return f"SSH connection failed: {lines[-1][:300]}"
     return "SSH connection failed for an unknown reason."
+
+
+def run_remote(
+    ip_address: str,
+    pem_path: str,
+    remote_command: str,
+    runner: Runner = subprocess.run,
+    timeout: int = PROCESS_TIMEOUT_SECONDS,
+    accept_returncodes: tuple[int, ...] = (0,),
+) -> RemoteResult:
+    """Run a command as ``ubuntu@<ip>`` with the same safe ssh options as the SSH test.
+
+    The PEM path and IP are validated first. ssh itself exits 255 on connection/auth errors.
+    """
+    normalized_ip, ip_error = check_ip_address(ip_address)
+    if ip_error:
+        return RemoteResult(ok=False, error=ip_error)
+    pem_error = check_pem_path(pem_path)
+    if pem_error:
+        return RemoteResult(ok=False, error=pem_error)
+    command = build_ssh_command(normalized_ip, pem_path, remote_command)
+    try:
+        proc = runner(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return RemoteResult(ok=False, error=f"The remote command did not finish within {timeout}s.")
+    except FileNotFoundError:
+        return RemoteResult(ok=False, error="The 'ssh' command was not found.")
+    except OSError as exc:
+        logger.exception("Could not start ssh process")
+        return RemoteResult(ok=False, error=f"Could not run ssh: {exc.strerror or exc}")
+    stdout, stderr = proc.stdout or "", proc.stderr or ""
+    if proc.returncode == 255:
+        return RemoteResult(False, stdout, stderr, 255, describe_ssh_error(stderr))
+    if proc.returncode not in accept_returncodes:
+        detail = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+        message = f"Remote command failed (exit {proc.returncode})"
+        if detail:
+            message += f": {detail[-1][:300]}"
+        return RemoteResult(False, stdout, stderr, proc.returncode, message)
+    return RemoteResult(True, stdout, stderr, proc.returncode)
 
 
 def check_connection(
