@@ -104,4 +104,4 @@ def test_only_latest_report_kept(db):
 
 def test_schema_version_set(db):
     with sqlite3.connect(db.path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6

@@ -123,25 +123,17 @@ class AnalysisService:
 
         progress("Checking Canonical security metadata")
         meta = self.metadata.ensure_fresh(progress)
+        metadata_warning = meta.warning
+        if not meta.available:
+            metadata_warning = f"Canonical security metadata is unavailable: {meta.error}"
         self.db.update_analysis_run(
             run_id,
             metadata_source=meta.source,
             metadata_updated_at=meta.updated_label if meta.available else None,
             metadata_checked_at=meta.checked_at or meta.downloaded_at,
             metadata_stale=meta.stale,
-            metadata_warning=meta.warning,
+            metadata_warning=metadata_warning,
         )
-        if not meta.available:
-            message = f"Canonical security metadata is unavailable: {meta.error}"
-            for analysis in run.servers:
-                self.db.update_server_analysis(
-                    analysis.id, status="failed", completed_at=_now(), error=message
-                )
-            self.db.update_analysis_run(
-                run_id, status="failed", completed_at=_now(), progress_message=None, error=message
-            )
-            logger.warning("Analysis run %s failed: %s", run_id, message)
-            return
 
         self.nvd.start_run()
         failures = 0
@@ -214,7 +206,19 @@ class AnalysisService:
             return unsupported
 
         warnings = list(facts.warnings)
-        findings = cve_resolver.resolve_all(analysis.reported_cves, self.metadata.lookup, facts)
+        metadata_status = self.metadata.status()
+        lookup = self.metadata.lookup if metadata_status.available else (lambda _cve: None)
+        findings = cve_resolver.resolve_all(analysis.reported_cves, lookup, facts)
+        if not metadata_status.available:
+            warning = f"Canonical security metadata is unavailable: {metadata_status.error}"
+            warnings.append(warning)
+            for finding in findings:
+                finding.status = cve_resolver.METADATA_UNAVAILABLE
+                finding.detail = warning
+        elif any(f.status == cve_resolver.METADATA_UNAVAILABLE for f in findings):
+            warnings.append("Some Canonical metadata lookups failed; those CVEs remain unresolved.")
+        elif any(f.status == cve_resolver.UNKNOWN for f in findings):
+            warnings.append("Some CVEs have no usable Canonical statement for this Ubuntu release.")
         candidates: dict[str, apt_planner.Candidate] = {}
         requests: list[tuple[str, str]] = []
         query = cve_resolver.candidate_query_packages(findings, facts)
@@ -295,7 +299,7 @@ class AnalysisService:
         installed = facts.by_name()
         cves_by_source: dict[str, set[str]] = {}
         for f in findings:
-            if f.status == cve_resolver.PATCH_REQUIRED and f.source:
+            if f.status == cve_resolver.PATCH_AVAILABLE and f.source:
                 cves_by_source.setdefault(f.source, set()).add(f.cve)
         entries = []
         for name, version in requests:

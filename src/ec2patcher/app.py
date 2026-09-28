@@ -55,13 +55,14 @@ def _default_shutdown() -> None:
 
 
 STATUS_CLASSES = {
-    cve_resolver.PATCH_REQUIRED: "badge-danger",
+    cve_resolver.PATCH_AVAILABLE: "badge-danger",
     cve_resolver.ANALYSIS_ERROR: "badge-danger",
-    cve_resolver.CANDIDATE_UNAVAILABLE: "badge-warning",
-    cve_resolver.FIX_REQUIRES_PRO: "badge-warning",
-    cve_resolver.FIX_NOT_AVAILABLE: "badge-warning",
-    cve_resolver.NEEDS_EVALUATION: "badge-warning",
-    cve_resolver.IGNORED: "badge-neutral",
+    cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS: "badge-warning",
+    cve_resolver.PRO_OR_ESM_REQUIRED: "badge-warning",
+    cve_resolver.NO_FIX_PUBLISHED: "badge-warning",
+    cve_resolver.PENDING_OR_DEFERRED: "badge-warning",
+    cve_resolver.UNKNOWN: "badge-warning",
+    cve_resolver.METADATA_UNAVAILABLE: "badge-warning",
     cve_resolver.ALREADY_FIXED: "badge-success",
     cve_resolver.NOT_AFFECTED: "badge-success",
     cve_resolver.PACKAGE_NOT_INSTALLED: "badge-success",

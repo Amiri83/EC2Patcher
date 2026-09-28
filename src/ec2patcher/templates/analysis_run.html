@@ -45,9 +45,9 @@
           {% elif s.status == "complete" %}
             <div class="server-meta">
               <span>{{ sm.reported }} CVE{{ "" if sm.reported == 1 else "s" }}</span>
-              <span class="{% if sm.count('PATCH_REQUIRED') %}text-danger{% endif %}">{{ sm.count("PATCH_REQUIRED") }} patch required</span>
+              <span class="{% if sm.count('PATCH_AVAILABLE') %}text-danger{% endif %}">{{ sm.count("PATCH_AVAILABLE") }} patch available</span>
               <span>{{ sm.count("ALREADY_FIXED", "NOT_AFFECTED", "PACKAGE_NOT_INSTALLED") }} no action</span>
-              {% set open = sm.count("CANDIDATE_UNAVAILABLE", "FIX_REQUIRES_PRO", "FIX_NOT_AVAILABLE", "NEEDS_EVALUATION", "IGNORED", "ANALYSIS_ERROR") %}
+              {% set open = sm.count("FIX_NOT_IN_CONFIGURED_REPOS", "PRO_OR_ESM_REQUIRED", "NO_FIX_PUBLISHED", "PENDING_OR_DEFERRED", "UNKNOWN", "METADATA_UNAVAILABLE", "ANALYSIS_ERROR") %}
               {% if open %}<span class="text-warning">{{ open }} unresolved / no fix</span>{% endif %}
               <span>{{ sm.packages }} package{{ "" if sm.packages == 1 else "s" }} to update</span>
               <span>Reboot: {% if s.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}no expected reboot{% endif %}</span>

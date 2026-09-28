@@ -52,12 +52,13 @@
   <h2>Summary</h2>
   <div class="summary-grid">
     <div class="summary-item"><span class="summary-value">{{ summary.reported }}</span><span class="summary-label">Reported CVEs</span></div>
-    <div class="summary-item {% if summary.count('PATCH_REQUIRED') %}summary-danger{% endif %}"><span class="summary-value">{{ summary.count("PATCH_REQUIRED") }}</span><span class="summary-label">Patch required</span></div>
+    <div class="summary-item {% if summary.count('PATCH_AVAILABLE') %}summary-danger{% endif %}"><span class="summary-value">{{ summary.count("PATCH_AVAILABLE") }}</span><span class="summary-label">Patch available</span></div>
     <div class="summary-item"><span class="summary-value">{{ summary.count("ALREADY_FIXED") }}</span><span class="summary-label">Already fixed</span></div>
     <div class="summary-item"><span class="summary-value">{{ summary.count("NOT_AFFECTED") }}</span><span class="summary-label">Not affected</span></div>
     <div class="summary-item"><span class="summary-value">{{ summary.count("PACKAGE_NOT_INSTALLED") }}</span><span class="summary-label">Package not installed</span></div>
-    <div class="summary-item {% if summary.count('FIX_NOT_AVAILABLE', 'FIX_REQUIRES_PRO', 'CANDIDATE_UNAVAILABLE', 'IGNORED') %}summary-warning{% endif %}"><span class="summary-value">{{ summary.count("FIX_NOT_AVAILABLE", "FIX_REQUIRES_PRO", "CANDIDATE_UNAVAILABLE", "IGNORED") }}</span><span class="summary-label">Fix unavailable</span></div>
-    <div class="summary-item {% if summary.count('NEEDS_EVALUATION', 'ANALYSIS_ERROR', 'NOT_ANALYZED') %}summary-warning{% endif %}"><span class="summary-value">{{ summary.count("NEEDS_EVALUATION", "ANALYSIS_ERROR", "NOT_ANALYZED") }}</span><span class="summary-label">Needs investigation / errors</span></div>
+    <div class="summary-item {% if summary.count('FIX_NOT_IN_CONFIGURED_REPOS', 'PRO_OR_ESM_REQUIRED') %}summary-warning{% endif %}"><span class="summary-value">{{ summary.count("FIX_NOT_IN_CONFIGURED_REPOS", "PRO_OR_ESM_REQUIRED") }}</span><span class="summary-label">Published fix requires repository access</span></div>
+    <div class="summary-item {% if summary.count('NO_FIX_PUBLISHED', 'PENDING_OR_DEFERRED') %}summary-warning{% endif %}"><span class="summary-value">{{ summary.count("NO_FIX_PUBLISHED", "PENDING_OR_DEFERRED") }}</span><span class="summary-label">No published fix / deferred</span></div>
+    <div class="summary-item {% if summary.count('UNKNOWN', 'METADATA_UNAVAILABLE', 'ANALYSIS_ERROR', 'NOT_ANALYZED') %}summary-warning{% endif %}"><span class="summary-value">{{ summary.count("UNKNOWN", "METADATA_UNAVAILABLE", "ANALYSIS_ERROR", "NOT_ANALYZED") }}</span><span class="summary-label">Needs investigation / errors</span></div>
     <div class="summary-item"><span class="summary-value">{{ summary.packages }}</span><span class="summary-label">Binary packages to update</span></div>
     <div class="summary-item"><span class="summary-value">{{ summary.debs }}</span><span class="summary-label">.deb files required</span></div>
     <div class="summary-item"><span class="summary-value">{{ summary.download_bytes|filesize }}</span><span class="summary-label">Estimated download size</span></div>
@@ -83,7 +84,7 @@
   {% if analysis.findings %}
     <div class="table-scroll">
     <table class="table findings-table">
-      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Fixed Version</th><th>Status</th><th>Related Binary Package(s)</th></tr></thead>
+      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Canonical Status</th><th>Canonical Fixed Version</th><th>APT Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th></tr></thead>
       {% for g in finding_groups %}
       <tbody class="cve-group">
         {% for f in g.rows %}
@@ -93,7 +94,9 @@
             <td class="cvss">{{ cvss_cell(f) }}</td>
             <td>{{ f.source_package or "-" }}</td>
             <td><code>{{ f.installed_version or "-" }}</code></td>
+            <td>{{ f.canonical_status or "-" }}</td>
             <td>{% if f.fixed_version %}<code>{{ f.fixed_version }}</code>{% if f.pocket and "/" in f.pocket %} <span class="muted small">({{ f.pocket }})</span>{% endif %}{% else %}-{% endif %}</td>
+            <td><code>{{ f.apt_candidate or "-" }}</code></td>
             <td><span class="badge {{ status_classes.get(f.status, 'badge-neutral') }}">{{ status_labels.get(f.status, f.status) }}</span>
                 {% if f.detail %}<div class="muted small finding-detail">{{ f.detail }}</div>{% endif %}</td>
             <td class="pkg-list">
@@ -110,7 +113,7 @@
             <td class="num"><span class="muted small">&#8627; same CVE</span></td>
             <td>{{ severity_cell(g.not_installed[0]) }}</td>
             <td class="cvss">{{ cvss_cell(g.not_installed[0]) }}</td>
-            <td colspan="3">
+            <td colspan="5">
               <details><summary>{{ g.not_installed|length }} other source packages</summary>
                 {% for f in g.not_installed %}<code>{{ f.source_package }}</code> {% endfor %}</details>
             </td>

@@ -78,9 +78,9 @@ def test_real_report_shape_end_to_end(setup, metadata):
     summary = summarize(good)
     assert summary.reported == 3
     assert summary.cve_status == {
-        "CVE-2026-63076": cr.PATCH_REQUIRED,
-        "CVE-2026-54874": cr.PATCH_REQUIRED,
-        "CVE-2026-63075": cr.PATCH_REQUIRED,
+        "CVE-2026-63076": cr.PATCH_AVAILABLE,
+        "CVE-2026-54874": cr.PATCH_AVAILABLE,
+        "CVE-2026-63075": cr.PATCH_AVAILABLE,
     }
     assert summary.packages == 6 and summary.debs == 6 and summary.unresolved == 0
     assert summary.download_bytes == 1940000 + 1003000 + 30500000 + 14600000 + 2400 + 1700
@@ -152,13 +152,15 @@ def test_malformed_remote_output(setup, metadata):
     assert good.status == "failed" and "Malformed remote output" in good.error
 
 
-def test_metadata_unavailable_fails_without_guessing(setup, tmp_path):
+def test_metadata_unavailable_reports_unknown_and_continues_discovery(setup, tmp_path):
     meta = SecurityMetadata(tmp_path / "empty", fetcher=failing_fetcher())
     ssh = ScriptedSSH()
     run = run_analysis(setup, meta, ssh)
-    assert run.status == "failed" and "Canonical security metadata is unavailable" in run.error
-    assert all(s.status == "failed" and not s.findings for s in run.servers)
-    assert ssh.calls == []  # no server was touched without metadata
+    assert run.status == "completed"
+    assert "Canonical security metadata is unavailable" in run.metadata_warning
+    assert all(s.status == "complete" for s in run.servers)
+    assert all(f.status == cr.METADATA_UNAVAILABLE for s in run.servers for f in s.findings)
+    assert len(ssh.calls) == 2  # facts only; no candidate check or package plan
 
 
 def test_stale_metadata_is_used_and_flagged(setup, tmp_path):
@@ -177,7 +179,7 @@ def test_plan_failure_keeps_required_updates_visible(setup, metadata):
     assert good.status == "complete"
     assert good.plan and all(p.status == "unresolved" and p.deb_filename is None for p in good.plan)
     assert all("Unable to resolve package download plan" in p.reason for p in good.plan)
-    assert summarize(good).cve_status["CVE-2026-63076"] == cr.PATCH_REQUIRED
+    assert summarize(good).cve_status["CVE-2026-63076"] == cr.PATCH_AVAILABLE
 
 
 def test_candidate_query_failure_marks_errors(setup, metadata):
@@ -196,8 +198,8 @@ def test_all_status_types_reconcile(setup, metadata):
     summary = summarize(good)
     assert summary.reported == len(ALL_CVES) + 1 == sum(summary.by_status.values())
     for status in (
-        cr.PATCH_REQUIRED, cr.ALREADY_FIXED, cr.PACKAGE_NOT_INSTALLED, cr.FIX_NOT_AVAILABLE,
-        cr.FIX_REQUIRES_PRO, cr.CANDIDATE_UNAVAILABLE, cr.NEEDS_EVALUATION, cr.IGNORED,
+        cr.PATCH_AVAILABLE, cr.ALREADY_FIXED, cr.PACKAGE_NOT_INSTALLED, cr.NO_FIX_PUBLISHED,
+        cr.PRO_OR_ESM_REQUIRED, cr.FIX_NOT_IN_CONFIGURED_REPOS, cr.UNKNOWN, cr.PENDING_OR_DEFERRED,
     ):  # fmt: skip
         assert summary.by_status.get(status), status
 
@@ -358,7 +360,7 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "Permission denied (publickey)" in page
         assert "Billing API" in page
         assert '<meta http-equiv="refresh"' not in page  # finished runs do not auto-refresh
-        assert "3 patch required" in page and "Reboot: <strong>YES EXPECTED</strong>" in page
+        assert "3 patch available" in page and "Reboot: <strong>YES EXPECTED</strong>" in page
 
         links = re.findall(r'href="(/analysis/\d+/servers/\d+)"', page)
         assert len(links) == 2
@@ -489,7 +491,7 @@ def test_group_findings_collapses_not_installed_rows(setup, metadata):
     groups = {g.cve: g for g in group_findings(good)}
     assert list(groups) == REAL_REPORT[GOOD]  # report order
     kernel = groups["CVE-2026-54874"]
-    assert kernel.status == cr.PATCH_REQUIRED
+    assert kernel.status == cr.PATCH_AVAILABLE
     assert [f.source_package for f in kernel.rows] == ["linux-aws", "linux-signed-aws"]
     assert sorted(f.source_package for f in kernel.not_installed) == [
         "linux", "linux-azure", "linux-gcp",

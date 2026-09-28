@@ -181,7 +181,7 @@ def test_severity_persisted_with_findings(analyzed):
     assert by_key[("CVE-2026-10004", "bash")].severity == "Low"
     assert by_key[("CVE-2026-10005", "nginx")].priority is None
     assert by_key[("CVE-2026-10005", "nginx")].severity == "Unknown"  # not in NVD
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 6
 
 
 def test_severity_column_rendered(web, analyzed):
@@ -278,11 +278,11 @@ def test_export_summary_matches_stored_snapshot(web, analyzed):
     assert s["Current Reboot Required"] == "NO"
     assert s["Expected Reboot After Planned Patch"] == "YES EXPECTED"
     assert s["Reported CVEs"] == 5 == summary.reported
-    assert s["Patch required"] == summary.count(cr.PATCH_REQUIRED) == 3
+    assert s["Patch available"] == summary.count(cr.PATCH_AVAILABLE) == 3
     assert s["Already fixed"] == summary.count(cr.ALREADY_FIXED)
     assert s["Not affected"] == summary.count(cr.NOT_AFFECTED)
     assert s["Package not installed"] == summary.count(cr.PACKAGE_NOT_INSTALLED) == 1
-    assert s["Fix unavailable"] == 1  # bash CVE-2026-10004
+    assert s["No published fix / deferred"] == 1  # bash CVE-2026-10004
     assert s["Needs investigation / errors"] == 0
     assert s["Binary packages to update"] == summary.packages == 6
     assert s[".deb files required"] == summary.debs == 6
@@ -294,10 +294,10 @@ def test_export_cve_findings_match_stored_rows(web, analyzed):
     good = analyzed.servers[0]
     _, wb = export(web, analyzed.id, good.id)
     headers, rows = table(wb, "CVE Findings")
-    assert headers[:13] == [
+    assert headers[:15] == [
         "CVE", "Severity", "CVSS Score", "CVSS Version", "Severity Source", "CVSS Vector",
-        "Ubuntu Priority", "Ubuntu Source Package", "Installed Version", "Fixed Version",
-        "Fix Pocket", "Status", "Related Binary Package(s)",
+        "Ubuntu Priority", "Ubuntu Source Package", "Installed Version", "Canonical Status",
+        "Fixed Version", "APT Candidate", "Fix Pocket", "Status", "Related Binary Package(s)",
     ]  # fmt: skip
     assert len(rows) == len(good.findings)  # nothing collapsed or dropped
     got = {(r["CVE"], r["Ubuntu Source Package"]): r for r in rows}
@@ -306,11 +306,13 @@ def test_export_cve_findings_match_stored_rows(web, analyzed):
         assert r["Severity"] == f.severity
         assert (r["Ubuntu Priority"] or "") == (f.priority or "")
         assert r["Installed Version"] == f.installed_version
+        assert r["Canonical Status"] == f.canonical_status
         assert r["Fixed Version"] == f.fixed_version
+        assert (r["APT Candidate"] or "") == (f.apt_candidate or "")
         assert r["Status"] == cr.STATUS_LABELS[f.status]
         assert (r["Related Binary Package(s)"] or "") == ", ".join(f.binary_packages)
     openssl = got[("CVE-2026-63076", "openssl")]
-    assert openssl["Severity"] == "High" and openssl["Status"] == "Patch required"
+    assert openssl["Severity"] == "High" and openssl["Status"] == "Patch available"
     assert openssl["Ubuntu Priority"] == "Critical"
     assert openssl["Installed Version"] == "3.0.13-0ubuntu3.4"
     assert openssl["Fixed Version"] == "3.0.13-0ubuntu3.6"
@@ -463,7 +465,7 @@ def test_export_does_not_touch_ssh_metadata_apt_or_state(web, analyzed, db_path,
 # --- schema / historical data ------------------------------------------------------------
 
 
-def test_existing_v3_database_migrates_to_v4_without_data_loss(db_path, web):
+def test_existing_v3_database_migrates_to_v6_without_data_loss(db_path, web):
     """A Phase 2 (v3) database, including findings stored before Phase 2.1, stays readable.
 
     Phase 2.2 adds schema v4 (NVD CVSS columns). Old findings keep their Canonical priority
@@ -499,7 +501,7 @@ def test_existing_v3_database_migrates_to_v4_without_data_loss(db_path, web):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     analysis = db.get_server_analysis(1)
     assert [(f.cve, f.priority, f.severity, f.cvss_score) for f in analysis.findings] == [
         ("CVE-2025-1", None, "Unknown", None),
