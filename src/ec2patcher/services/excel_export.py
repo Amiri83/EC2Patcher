@@ -38,7 +38,9 @@ CVE_COLUMNS = [
     ("Ubuntu Priority", 15),
     ("Ubuntu Source Package", 24),
     ("Installed Version", 26),
+    ("Canonical Status", 22),
     ("Fixed Version", 26),
+    ("APT Candidate", 40),
     ("Fix Pocket", 18),
     ("Status", 28),
     ("Related Binary Package(s)", 40),
@@ -171,23 +173,28 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         ("Reboot Note", cve_resolver.REBOOT_HELP),
         ("Reported CVEs", summary.reported),
         *((f"Severity {s} (NVD CVSS)", summary.by_severity[s]) for s in SEVERITIES),
-        ("Patch required", summary.count(cve_resolver.PATCH_REQUIRED)),
+        ("Patch available", summary.count(cve_resolver.PATCH_AVAILABLE)),
         ("Already fixed", summary.count(cve_resolver.ALREADY_FIXED)),
         ("Not affected", summary.count(cve_resolver.NOT_AFFECTED)),
         ("Package not installed", summary.count(cve_resolver.PACKAGE_NOT_INSTALLED)),
         (
-            "Fix unavailable",
+            "Published fix requires repository access",
             summary.count(
-                cve_resolver.FIX_NOT_AVAILABLE,
-                cve_resolver.FIX_REQUIRES_PRO,
-                cve_resolver.CANDIDATE_UNAVAILABLE,
-                cve_resolver.IGNORED,
+                cve_resolver.PRO_OR_ESM_REQUIRED,
+                cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS,
             ),
+        ),
+        (
+            "No published fix / deferred",
+            summary.count(cve_resolver.NO_FIX_PUBLISHED, cve_resolver.PENDING_OR_DEFERRED),
         ),
         (
             "Needs investigation / errors",
             summary.count(
-                cve_resolver.NEEDS_EVALUATION, cve_resolver.ANALYSIS_ERROR, "NOT_ANALYZED"
+                cve_resolver.UNKNOWN,
+                cve_resolver.METADATA_UNAVAILABLE,
+                cve_resolver.ANALYSIS_ERROR,
+                "NOT_ANALYZED",
             ),
         ),
         ("Binary packages to update", summary.packages),
@@ -232,7 +239,7 @@ def _cve_rows(analysis: ServerAnalysis) -> list[list]:
     for cve in dict.fromkeys(order):
         findings = by_cve.get(cve)
         if not findings:
-            rows.append([cve, UNKNOWN, *[""] * 9, NOT_ANALYZED_LABEL, "", "", ""])
+            rows.append([cve, UNKNOWN, *[""] * 11, NOT_ANALYZED_LABEL, "", "", ""])
             continue
         for f in findings:
             lookup = nvd.STATUS_LABELS.get(f.nvd_status, f.nvd_status) if f.nvd_status else ""
@@ -249,7 +256,9 @@ def _cve_rows(analysis: ServerAnalysis) -> list[list]:
                     f.priority or "",
                     f.source_package or "",
                     f.installed_version or "",
+                    f.canonical_status or "",
                     f.fixed_version or "",
+                    f.apt_candidate or "",
                     f.pocket or "",
                     cve_resolver.STATUS_LABELS.get(f.status, f.status),
                     ", ".join(f.binary_packages),

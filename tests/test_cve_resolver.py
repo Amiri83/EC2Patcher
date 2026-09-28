@@ -38,7 +38,7 @@ def single(cve, **kwargs):
 
 def test_patch_required():
     f = single("CVE-2026-63076")
-    assert (f.source, f.status) == ("openssl", cr.PATCH_REQUIRED)
+    assert (f.source, f.status) == ("openssl", cr.FIX_NOT_IN_CONFIGURED_REPOS)
     assert (f.installed_version, f.fixed_version) == ("3.0.13-0ubuntu3.4", "3.0.13-0ubuntu3.6")
     assert f.binaries == ["libssl3t64:amd64", "openssl"]
     assert f.pocket == "noble"
@@ -63,22 +63,22 @@ def test_not_affected():
 
 def test_fix_not_available():
     f = single("CVE-2026-10004")
-    assert f.status == cr.FIX_NOT_AVAILABLE and f.fixed_version is None
+    assert f.status == cr.NO_FIX_PUBLISHED and f.fixed_version is None
     assert f.priority == "Medium"
 
 
 def test_under_investigation():
-    assert single("CVE-2026-10001").status == cr.NEEDS_EVALUATION
+    assert single("CVE-2026-10001").status == cr.NO_FIX_PUBLISHED
 
 
 def test_ignored_no_fix_planned():
     f = single("CVE-2026-10002")
-    assert f.status == cr.IGNORED and "decided to not fix" in f.detail
+    assert f.status == cr.PENDING_OR_DEFERRED and "decided to not fix" in f.detail
 
 
 def test_fix_requires_pro():
     f = single("CVE-2026-10003")
-    assert f.status == cr.FIX_REQUIRES_PRO
+    assert f.status == cr.PRO_OR_ESM_REQUIRED
     assert (f.fixed_version, f.pocket) == ("7:6.1.1-3ubuntu5+esm2", "esm-apps/noble")
 
 
@@ -93,13 +93,13 @@ def test_pro_fix_already_installed():
 
 def test_cve_not_in_metadata():
     f = single("CVE-2026-99999")
-    assert f.status == cr.NEEDS_EVALUATION and f.source is None
+    assert f.status == cr.UNKNOWN and f.source is None
     assert "not found in Canonical" in f.detail
 
 
 def test_installed_source_tracked_only_for_other_release():
     f = single("CVE-2026-10007")
-    assert (f.source, f.status) == ("sudo", cr.NEEDS_EVALUATION)
+    assert (f.source, f.status) == ("sudo", cr.UNKNOWN)
     assert "no statement for noble" in f.detail
 
 
@@ -111,7 +111,9 @@ def test_release_matching_uses_server_codename():
     f = cr.resolve_cve(
         "CVE-2026-63076", RECORDS["CVE-2026-63076"], facts(os_release=jammy_release, packages=pkgs)
     )
-    assert [(x.fixed_version, x.status) for x in f] == [("3.0.2-0ubuntu1.20", cr.PATCH_REQUIRED)]
+    assert [(x.fixed_version, x.status) for x in f] == [
+        ("3.0.2-0ubuntu1.20", cr.FIX_NOT_IN_CONFIGURED_REPOS)
+    ]
     focal_release = 'ID=ubuntu\nVERSION_ID="20.04"\nVERSION_CODENAME=focal'
     pkgs = [("openssl", "1.1.1f-1ubuntu2.20", "openssl", "1.1.1f-1ubuntu2.20", "amd64", "ii ")]
     f = cr.resolve_cve(
@@ -122,13 +124,13 @@ def test_release_matching_uses_server_codename():
 
 def test_multiple_source_packages_for_one_cve():
     findings = resolve("CVE-2026-54874")
-    assert findings["linux-aws"].status == cr.PATCH_REQUIRED
-    assert findings["linux-signed-aws"].status == cr.PATCH_REQUIRED
+    assert findings["linux-aws"].status == cr.FIX_NOT_IN_CONFIGURED_REPOS
+    assert findings["linux-signed-aws"].status == cr.FIX_NOT_IN_CONFIGURED_REPOS
     assert findings["linux"].status == cr.PACKAGE_NOT_INSTALLED
     assert findings["linux-azure"].status == cr.PACKAGE_NOT_INSTALLED
     assert findings["linux-aws"].is_kernel
     statuses = cr.cve_statuses(list(findings.values()))
-    assert statuses == {"CVE-2026-54874": cr.PATCH_REQUIRED}
+    assert statuses == {"CVE-2026-54874": cr.FIX_NOT_IN_CONFIGURED_REPOS}
 
 
 def test_one_bad_cve_does_not_break_others():
@@ -138,13 +140,13 @@ def test_one_bad_cve_does_not_break_others():
         return RECORDS.get(cve)
 
     findings = cr.resolve_all(["CVE-2026-63075", "CVE-2026-63076"], lookup, facts())
-    assert findings[0].status == cr.ANALYSIS_ERROR and "boom" in findings[0].detail
-    assert findings[1].status == cr.PATCH_REQUIRED
+    assert findings[0].status == cr.METADATA_UNAVAILABLE and "boom" in findings[0].detail
+    assert findings[1].status == cr.FIX_NOT_IN_CONFIGURED_REPOS
 
 
 def test_rollup_prefers_actionable_status():
-    assert cr.rollup_status([cr.PACKAGE_NOT_INSTALLED, cr.PATCH_REQUIRED]) == cr.PATCH_REQUIRED
-    assert cr.rollup_status([cr.NOT_AFFECTED, cr.NEEDS_EVALUATION]) == cr.NEEDS_EVALUATION
+    assert cr.rollup_status([cr.PACKAGE_NOT_INSTALLED, cr.PATCH_AVAILABLE]) == cr.PATCH_AVAILABLE
+    assert cr.rollup_status([cr.NOT_AFFECTED, cr.UNKNOWN]) == cr.UNKNOWN
 
 
 # --- kernels ------------------------------------------------------------------------------
@@ -208,7 +210,7 @@ def test_candidate_query_uses_binaries_and_kernel_meta_packages():
 def test_candidate_older_than_fix():
     _, findings, _, _, requests = analyzed(("CVE-2026-10008",))
     f = findings[0]
-    assert f.status == cr.CANDIDATE_UNAVAILABLE
+    assert f.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
     assert (
         "APT candidate 2.9.14+dfsg-1.3ubuntu3.4 is older than 2.9.14+dfsg-1.3ubuntu3.5" in f.detail
     )
@@ -219,7 +221,7 @@ def test_no_candidate_at_all():
     f = facts()
     findings = cr.resolve_all(["CVE-2026-63076"], RECORDS.get, f)
     requests = cr.apply_candidates(findings, {}, f)
-    assert findings[0].status == cr.CANDIDATE_UNAVAILABLE and requests == []
+    assert findings[0].status == cr.FIX_NOT_IN_CONFIGURED_REPOS and requests == []
     assert "no installation candidate" in findings[0].detail
 
 
@@ -233,7 +235,7 @@ def test_candidate_unavailable_mentions_stale_apt_lists():
 
 def test_pro_fix_without_pro_candidate_stays_pro():
     _, findings, _, _, requests = analyzed(("CVE-2026-10003",))
-    assert findings[0].status == cr.FIX_REQUIRES_PRO and requests == []
+    assert findings[0].status == cr.PRO_OR_ESM_REQUIRED and requests == []
 
 
 def test_pro_fix_with_pro_enabled_is_patchable():
@@ -244,7 +246,7 @@ def test_pro_fix_with_pro_enabled_is_patchable():
         "7:6.1.1-3ubuntu5+esm2",
     )  # fmt: skip
     requests = cr.apply_candidates(findings, {"libavcodec60:amd64": cand}, f)
-    assert findings[0].status == cr.PATCH_REQUIRED and "Ubuntu Pro" in findings[0].detail
+    assert findings[0].status == cr.PATCH_AVAILABLE and "Ubuntu Pro" in findings[0].detail
     assert requests == [("libavcodec60:amd64", "7:6.1.1-3ubuntu5+esm2")]
 
 
@@ -294,16 +296,16 @@ def test_multiple_binaries_one_source_share_versions():
     )
     findings = cr.resolve_cve("CVE-2026-7", parse_vex_document(doc), facts())
     assert findings[0].binaries == ["curl", "libcurl4t64:amd64"]
-    assert findings[0].status == cr.PATCH_REQUIRED
+    assert findings[0].status == cr.FIX_NOT_IN_CONFIGURED_REPOS
 
 
 def test_cve_only_tracked_for_unsupported_releases_is_not_reported_safe():
     doc = vex_doc("CVE-2016-1", statement("CVE-2016-1", "fixed", [("foo", "1.0-1", "xenial")]))
     findings = cr.resolve_cve("CVE-2016-1", parse_vex_document(doc), facts())
-    assert [(f.source, f.status) for f in findings] == [(None, cr.NEEDS_EVALUATION)]
+    assert [(f.source, f.status) for f in findings] == [(None, cr.UNKNOWN)]
 
 
-def test_cve_tracked_for_other_supported_release_only_and_not_installed():
+def test_cve_tracked_for_other_supported_release_only_is_unknown():
     doc = vex_doc("CVE-2026-8", statement("CVE-2026-8", "fixed", [("foo", "1.0-1", "jammy")]))
     findings = cr.resolve_cve("CVE-2026-8", parse_vex_document(doc), facts())
-    assert [(f.source, f.status) for f in findings] == [(None, cr.PACKAGE_NOT_INSTALLED)]
+    assert [(f.source, f.status) for f in findings] == [(None, cr.UNKNOWN)]

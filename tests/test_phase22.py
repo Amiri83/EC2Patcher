@@ -374,8 +374,8 @@ def test_stale_cache_used_when_nvd_fails(tmp_path):
 def test_no_cache_and_failure_is_unknown(tmp_path):
     r = make_client(tmp_path, FakeNvd(replies=[OSError("down")])).lookup(CVE)
     assert r.status == nvd.FAILED and r.severity is None
-    finding = cve_resolver.Finding(cve=CVE, source="x", status="PATCH_REQUIRED", cvss=r)
-    assert finding.severity == "Unknown" and finding.status == "PATCH_REQUIRED"
+    finding = cve_resolver.Finding(cve=CVE, source="x", status="PATCH_AVAILABLE", cvss=r)
+    assert finding.severity == "Unknown" and finding.status == "PATCH_AVAILABLE"
 
 
 def test_not_found_is_cached_too(tmp_path):
@@ -509,7 +509,7 @@ def test_nvd_failure_never_changes_patch_analysis(servers, tmp_path):
                 for s in run.servers]  # fmt: skip
 
     assert canonical(ok) == canonical(down) and plans(ok) == plans(down)
-    assert any(f.status == "PATCH_REQUIRED" for f in down.servers[0].findings)
+    assert any(f.status == "PATCH_AVAILABLE" for f in down.servers[0].findings)
     assert {f.severity for s in down.servers for f in s.findings} == {"Unknown"}
     assert {f.nvd_status for s in down.servers for f in s.findings} == {nvd.FAILED}
     assert down.status == "completed"
@@ -602,7 +602,7 @@ def test_report_renders_when_nvd_failed(web, pem_file, db_path):
     run, page = analyzed_page(web, pem_file, db_path, FakeNvd(replies=[OSError("down")]))
     assert run.servers[0].status == "complete"
     assert "NVD lookup failed" in page and ">Unknown: 5</span>" in page
-    assert "Patch required" in page  # Canonical status unaffected
+    assert "Patch available" in page  # Canonical status unaffected
 
 
 def test_report_shows_stale_cache_marker(web, pem_file, db_path, tmp_path):
