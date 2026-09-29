@@ -245,6 +245,16 @@ class AnalysisService:
                         f.detail = f"APT candidate check failed: {exc}"
             else:
                 requests = cve_resolver.apply_candidates(findings, candidates, facts)
+                inconclusive = sum(
+                    1 for f in findings if cve_resolver.STALE_APT_DETAIL in (f.detail or "")
+                )
+                if inconclusive:
+                    warnings.append(
+                        f"{inconclusive} finding(s) could not be confirmed as missing from the "
+                        "configured repositories because the APT package lists are not current "
+                        "(or their age is unknown). Run 'sudo apt-get update' on the server and "
+                        "re-analyze."
+                    )
 
         plan: list[cve_resolver.PlanEntry] = []
         apt_arguments: list[str] = []
@@ -356,12 +366,18 @@ class RemediationGroup:
 
 
 def remediation_groups(findings: list) -> list[RemediationGroup]:
-    """Collapse findings with the same source and fix for report presentation only."""
-    grouped: dict[tuple[str, str], list] = {}
+    """Collapse findings with the same source, fix and status for report presentation only.
+
+    The status is part of the key so a group only ever counts CVEs that share one remediation
+    outcome: rows that are already fixed / not affected / not installed never inflate the CVE
+    count or raise the severity of an actionable group with the same source and fix.
+    """
+    grouped: dict[tuple[str, str, str], list] = {}
     ungrouped = []
     for finding in findings:
         if finding.source_package and finding.fixed_version:
-            grouped.setdefault((finding.source_package, finding.fixed_version), []).append(finding)
+            key = (finding.source_package, finding.fixed_version, finding.status)
+            grouped.setdefault(key, []).append(finding)
         else:
             ungrouped.append([finding])
 
@@ -404,6 +420,74 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
             )
         )
     return result
+
+
+ACTION_REQUIRED = "action"
+INVESTIGATE = "investigate"
+NO_ACTION = "no_action"
+
+BUCKETS = (
+    (
+        ACTION_REQUIRED,
+        "Action required",
+        (
+            cve_resolver.PATCH_AVAILABLE,
+            cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS,
+            cve_resolver.PRO_OR_ESM_REQUIRED,
+        ),
+    ),
+    (
+        INVESTIGATE,
+        "Investigate",
+        (
+            cve_resolver.UNKNOWN,
+            cve_resolver.METADATA_UNAVAILABLE,
+            cve_resolver.ANALYSIS_ERROR,
+            cve_resolver.PENDING_OR_DEFERRED,
+            cve_resolver.NO_FIX_PUBLISHED,
+        ),
+    ),
+    (
+        NO_ACTION,
+        "No action",
+        (
+            cve_resolver.ALREADY_FIXED,
+            cve_resolver.NOT_AFFECTED,
+            cve_resolver.PACKAGE_NOT_INSTALLED,
+        ),
+    ),
+)
+_BUCKET_OF_STATUS = {status: key for key, _, statuses in BUCKETS for status in statuses}
+
+
+@dataclass
+class FindingBucket:
+    key: str
+    title: str
+    groups: list[RemediationGroup]
+
+    @property
+    def count(self) -> int:
+        return len(self.groups)
+
+    @property
+    def cve_count(self) -> int:
+        return len({cve for g in self.groups for cve in g.cves})
+
+
+def bucket_for_status(status: str | None) -> str:
+    """Report bucket of a remediation status. Unrecognised statuses need investigation."""
+    return _BUCKET_OF_STATUS.get(cve_resolver.current_status(status or ""), INVESTIGATE)
+
+
+def bucket_groups(groups: list[RemediationGroup]) -> list[FindingBucket]:
+    """Split remediation groups into the three report buckets (always all three, in order).
+
+    Presentation only: statuses are read, never changed."""
+    buckets = {key: FindingBucket(key, title, []) for key, title, _ in BUCKETS}
+    for group in groups:
+        buckets[bucket_for_status(group.status)].groups.append(group)
+    return list(buckets.values())
 
 
 @dataclass
