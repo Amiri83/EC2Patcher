@@ -20,40 +20,59 @@ from ec2patcher.services.security_metadata import CveRecord, VexEntry
 from ec2patcher.services.server_state import InstalledPackage, ServerFacts
 from ec2patcher.services.severity import normalize_severity
 
-PATCH_REQUIRED = "PATCH_REQUIRED"
+PATCH_AVAILABLE = "PATCH_AVAILABLE"
 ALREADY_FIXED = "ALREADY_FIXED"
 NOT_AFFECTED = "NOT_AFFECTED"
 PACKAGE_NOT_INSTALLED = "PACKAGE_NOT_INSTALLED"
-FIX_NOT_AVAILABLE = "FIX_NOT_AVAILABLE"
-FIX_REQUIRES_PRO = "FIX_REQUIRES_PRO"
-CANDIDATE_UNAVAILABLE = "CANDIDATE_UNAVAILABLE"
-NEEDS_EVALUATION = "NEEDS_EVALUATION"
-IGNORED = "IGNORED"
+NO_FIX_PUBLISHED = "NO_FIX_PUBLISHED"
+PRO_OR_ESM_REQUIRED = "PRO_OR_ESM_REQUIRED"
+FIX_NOT_IN_CONFIGURED_REPOS = "FIX_NOT_IN_CONFIGURED_REPOS"
+PENDING_OR_DEFERRED = "PENDING_OR_DEFERRED"
+UNKNOWN = "UNKNOWN"
+METADATA_UNAVAILABLE = "METADATA_UNAVAILABLE"
 ANALYSIS_ERROR = "ANALYSIS_ERROR"
 
 STATUS_LABELS = {
-    PATCH_REQUIRED: "Patch required",
+    PATCH_AVAILABLE: "Patch available",
     ALREADY_FIXED: "Already fixed",
     NOT_AFFECTED: "Not affected",
     PACKAGE_NOT_INSTALLED: "Package not installed",
-    FIX_NOT_AVAILABLE: "Fix not available",
-    FIX_REQUIRES_PRO: "Fix requires Ubuntu Pro / ESM",
-    CANDIDATE_UNAVAILABLE: "Fix known - suitable APT candidate not available",
-    NEEDS_EVALUATION: "Under investigation / needs evaluation",
-    IGNORED: "Ignored / no fix planned",
+    NO_FIX_PUBLISHED: "No fix published for this release",
+    PRO_OR_ESM_REQUIRED: "Ubuntu Pro / ESM required",
+    FIX_NOT_IN_CONFIGURED_REPOS: "Fixed version not in configured repositories",
+    PENDING_OR_DEFERRED: "Pending or deferred by Canonical",
+    UNKNOWN: "Canonical status unknown",
+    METADATA_UNAVAILABLE: "Canonical metadata unavailable",
     ANALYSIS_ERROR: "Analysis error",
 }
+
+# Older stored snapshots remain readable under the current vocabulary. An old
+# PATCH_REQUIRED row has no saved APT decision, so its historical meaning is ambiguous.
+LEGACY_STATUSES = {
+    "PATCH_REQUIRED": PATCH_AVAILABLE,
+    "CANDIDATE_UNAVAILABLE": FIX_NOT_IN_CONFIGURED_REPOS,
+    "FIX_REQUIRES_PRO": PRO_OR_ESM_REQUIRED,
+    "FIX_NOT_AVAILABLE": NO_FIX_PUBLISHED,
+    "NEEDS_EVALUATION": UNKNOWN,
+    "IGNORED": PENDING_OR_DEFERRED,
+}
+
+
+def current_status(status: str) -> str:
+    return LEGACY_STATUSES.get(status, status)
+
 
 # When one CVE maps to several source packages, the CVE's overall status is the most
 # action-relevant one (highest in this list).
 STATUS_PRIORITY = [
     ANALYSIS_ERROR,
-    PATCH_REQUIRED,
-    CANDIDATE_UNAVAILABLE,
-    FIX_REQUIRES_PRO,
-    NEEDS_EVALUATION,
-    FIX_NOT_AVAILABLE,
-    IGNORED,
+    PATCH_AVAILABLE,
+    FIX_NOT_IN_CONFIGURED_REPOS,
+    PRO_OR_ESM_REQUIRED,
+    METADATA_UNAVAILABLE,
+    UNKNOWN,
+    PENDING_OR_DEFERRED,
+    NO_FIX_PUBLISHED,
     ALREADY_FIXED,
     NOT_AFFECTED,
     PACKAGE_NOT_INSTALLED,
@@ -78,6 +97,8 @@ class Finding:
     detail: str = ""
     installed_version: str | None = None
     fixed_version: str | None = None
+    apt_candidate: str | None = None
+    canonical_status: str | None = None
     binaries: list[str] = field(default_factory=list)
     pocket: str | None = None  # distro the fixed version was published in
     priority: str | None = None  # raw Canonical priority, persisted as-is ("Ubuntu Priority")
@@ -156,9 +177,12 @@ def _installed_version(packages: list[InstalledPackage], kernel: str, is_kernel:
 def _is_ignored(entry: VexEntry) -> bool:
     note = entry.note.lower()
     return (
-        "decided to not fix" in note
+        entry.status in {"deferred", "pending", "ignored"}
+        or "ignored" in note
+        or "decided to not fix" in note
         or "no longer supported" in note
         or "deferred" in note
+        or "pending" in note
         or "will not fix" in note
     )
 
@@ -167,12 +191,12 @@ def _unfixed_status(entry: VexEntry) -> tuple[str, str]:
     """Status for a statement that is not 'fixed' / 'not_affected'."""
     note = entry.note.strip()
     if _is_ignored(entry):
-        return IGNORED, note or "Canonical does not plan to fix this package in this release."
+        return PENDING_OR_DEFERRED, note or f"Canonical marked this fix {entry.status}."
     if entry.status == "under_investigation":
-        return NEEDS_EVALUATION, note or "Canonical is still evaluating this CVE."
+        return NO_FIX_PUBLISHED, note or "Canonical is still evaluating this CVE."
     if entry.status == "affected":
-        return FIX_NOT_AVAILABLE, note or "Vulnerable; Canonical has not published a fix yet."
-    return NEEDS_EVALUATION, f"Unrecognised Canonical status '{entry.status}'."
+        return NO_FIX_PUBLISHED, note or "Canonical has not published a fix for this release."
+    return UNKNOWN, f"Unrecognised Canonical status '{entry.status}'."
 
 
 def _pick(entries: list[VexEntry], pro: bool) -> VexEntry | None:
@@ -194,10 +218,12 @@ def resolve_source(
     facts: ServerFacts,
 ) -> Finding:
     """Decide the status of one (CVE, source package) pair for this server."""
-    finding = Finding(cve=cve, source=source, status=NEEDS_EVALUATION)
+    finding = Finding(cve=cve, source=source, status=UNKNOWN)
     finding.binaries = sorted(p.name for p in installed)
     finding.is_kernel = is_kernel_source(installed)
     standard, pro = _pick(entries, pro=False), _pick(entries, pro=True)
+    authoritative = standard or pro
+    finding.canonical_status = authoritative.status if authoritative else None
     finding.priority = next((e.priority for e in entries if e.priority), None)
 
     if not installed:
@@ -221,29 +247,35 @@ def resolve_source(
                 finding.status = ALREADY_FIXED
                 finding.detail = "Installed version is at or above Canonical's fixed version."
             else:
-                finding.status = PATCH_REQUIRED
+                finding.status = FIX_NOT_IN_CONFIGURED_REPOS
                 finding.detail = "Installed version is older than Canonical's fixed version."
         elif standard and standard.status == "not_affected":
             finding.status = NOT_AFFECTED
             reason = standard.justification.replace("_", " ") or "not affected"
             finding.detail = f"Canonical: not affected ({reason})."
         elif pro and pro.status == "fixed":
+            finding.canonical_status = pro.status
             finding.fixed_version, finding.pocket = pro.version, pro.distro
             if fixed_by(pro):
                 finding.status = ALREADY_FIXED
                 finding.detail = f"Installed version includes the Ubuntu Pro fix ({pro.distro})."
             else:
-                finding.status = FIX_REQUIRES_PRO
+                finding.status = PRO_OR_ESM_REQUIRED
                 finding.detail = f"The fix is only published in Ubuntu Pro ({pro.distro})." + (
                     f" Standard archive: {standard.note}" if standard and standard.note else ""
                 )
         elif pro and pro.status == "not_affected" and standard is None:
+            finding.canonical_status = pro.status
             finding.status = NOT_AFFECTED
             reason = pro.justification.replace("_", " ") or "not affected"
             finding.detail = f"Canonical: not affected ({reason})."
         else:
             entry = standard or pro
-            finding.status, finding.detail = _unfixed_status(entry)
+            finding.status, finding.detail = (
+                _unfixed_status(entry)
+                if entry
+                else (UNKNOWN, "Canonical has no usable statement for this source package.")
+            )
     except debversion.InvalidVersionError as exc:
         finding.status, finding.detail = ANALYSIS_ERROR, str(exc)
         return finding
@@ -252,7 +284,7 @@ def resolve_source(
     # installed there is nothing to download - but the server stays vulnerable until reboot.
     if (
         finding.is_kernel
-        and finding.status in (PATCH_REQUIRED, FIX_REQUIRES_PRO)
+        and finding.status in (FIX_NOT_IN_CONFIGURED_REPOS, PRO_OR_ESM_REQUIRED)
         and newest
         and debversion.compare_versions(newest, finding.fixed_version) >= 0
     ):
@@ -271,7 +303,7 @@ def resolve_cve(cve: str, record: CveRecord | None, facts: ServerFacts) -> list[
             Finding(
                 cve=cve,
                 source=None,
-                status=NEEDS_EVALUATION,
+                status=UNKNOWN,
                 detail="CVE not found in Canonical's Ubuntu security metadata.",
             )
         ]
@@ -293,7 +325,7 @@ def resolve_cve(cve: str, record: CveRecord | None, facts: ServerFacts) -> list[
                 Finding(
                     cve=cve,
                     source=source,
-                    status=NEEDS_EVALUATION,
+                    status=UNKNOWN,
                     installed_version=_min_version([p.source_version for p in installed]),
                     binaries=sorted(p.name for p in installed),
                     detail=(
@@ -302,7 +334,7 @@ def resolve_cve(cve: str, record: CveRecord | None, facts: ServerFacts) -> list[
                     ),
                 )
             )
-    if not findings and record.entries:
+    if not findings and release_entries:
         findings.append(
             Finding(
                 cve=cve,
@@ -318,7 +350,7 @@ def resolve_cve(cve: str, record: CveRecord | None, facts: ServerFacts) -> list[
             Finding(
                 cve=cve,
                 source=None,
-                status=NEEDS_EVALUATION,
+                status=UNKNOWN,
                 detail=(
                     "Canonical's metadata has no statement for any supported Ubuntu release "
                     f"(including {facts.codename}) for this CVE."
@@ -332,7 +364,9 @@ def resolve_cve(cve: str, record: CveRecord | None, facts: ServerFacts) -> list[
 
 
 def needs_candidate_check(finding: Finding) -> bool:
-    return finding.status in (PATCH_REQUIRED, FIX_REQUIRES_PRO) and bool(finding.fixed_version)
+    return finding.status in (FIX_NOT_IN_CONFIGURED_REPOS, PRO_OR_ESM_REQUIRED) and bool(
+        finding.fixed_version
+    )
 
 
 def meta_packages(facts: ServerFacts) -> list[str]:
@@ -368,7 +402,7 @@ def apply_candidates(
             continue
         names = meta_packages(facts) if f.is_kernel else f.binaries
         if not names:
-            f.status = CANDIDATE_UNAVAILABLE
+            f.status = FIX_NOT_IN_CONFIGURED_REPOS
             f.detail = (
                 "No kernel meta package (e.g. linux-aws) is installed to select the fixed kernel."
             )
@@ -378,6 +412,12 @@ def apply_candidates(
         problems: list[str] = []
         for name in names:
             cand = candidates.get(name)
+            if cand and cand.candidate:
+                f.apt_candidate = (
+                    f"{f.apt_candidate}; {name}: {cand.candidate}"
+                    if f.apt_candidate
+                    else f"{name}: {cand.candidate}"
+                )
             if cand is None or not cand.candidate:
                 problems.append(f"{name}: no installation candidate in the configured APT sources")
                 continue
@@ -393,17 +433,17 @@ def apply_candidates(
                 problems.append(f"{name}: APT candidate {cand.candidate} is older than {wanted}")
         if problems:
             reasons = "; ".join(problems)
-            if f.status == FIX_REQUIRES_PRO:
+            if f.status == PRO_OR_ESM_REQUIRED:
                 f.detail = f"{f.detail} APT has no suitable candidate: {reasons}."
                 continue
-            f.status = CANDIDATE_UNAVAILABLE
+            f.status = FIX_NOT_IN_CONFIGURED_REPOS
             hint = f" {stale}" if stale else " Possible causes: APT lists not updated, repository"
             if not stale:
                 hint += " missing from the APT configuration, or architecture mismatch."
             f.detail = f"Fixed version {f.fixed_version} is known but {reasons}.{hint}"
             continue
-        if f.status == FIX_REQUIRES_PRO:
-            f.status = PATCH_REQUIRED
+        if f.status == PRO_OR_ESM_REQUIRED:
+            f.status = PATCH_AVAILABLE
             f.detail = (
                 f"Fix available from Ubuntu Pro ({f.pocket}), which is enabled on this server."
             )
@@ -411,6 +451,7 @@ def apply_candidates(
             f.status = ANALYSIS_ERROR
             f.detail = "APT candidate equals the installed version although a fix is required."
             continue
+        f.status = PATCH_AVAILABLE
         requests.update(ok)
     return sorted(requests.items())
 
@@ -438,7 +479,7 @@ def build_plan(
     cves_by_source: dict[str, set[str]] = {}
     kernel_cves: set[str] = set()
     for f in findings:
-        if f.status == PATCH_REQUIRED and f.source:
+        if f.status == PATCH_AVAILABLE and f.source:
             cves_by_source.setdefault(f.source, set()).add(f.cve)
             if f.is_kernel:
                 kernel_cves.add(f.cve)
@@ -507,7 +548,19 @@ def resolve_all(
     findings: list[Finding] = []
     for cve in cves:
         try:
-            findings.extend(resolve_cve(cve, lookup(cve), facts))
+            record = lookup(cve)
+        except Exception as exc:  # noqa: BLE001 - one bad CVE must not break the server report
+            findings.append(
+                Finding(
+                    cve=cve,
+                    source=None,
+                    status=METADATA_UNAVAILABLE,
+                    detail=f"Canonical metadata lookup failed: {exc}",
+                )
+            )
+            continue
+        try:
+            findings.extend(resolve_cve(cve, record, facts))
         except Exception as exc:  # noqa: BLE001 - one bad CVE must not break the server report
             findings.append(
                 Finding(

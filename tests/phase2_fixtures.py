@@ -6,14 +6,10 @@ Ubuntu 24.04 (noble) EC2 instance running an AWS kernel. APT output formats were
 from real apt 3.x runs (fixtures/apt_*_real.txt).
 """
 
-import io
-import json
-import shutil
 import subprocess
-import tarfile
 from pathlib import Path
 
-from ec2patcher.services.security_metadata import SecurityMetadata
+from ec2patcher.services.security_metadata import SecurityMetadata, parse_cve_document
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -181,43 +177,84 @@ DOCS = [
 ALL_CVES = [d["statements"][0]["vulnerability"]["name"] for d in DOCS]
 
 
-def make_vex_archive(path: Path, docs=None) -> Path:
-    """Write a vex-all.tar.xz with the same layout as Canonical's archive."""
-    docs = DOCS if docs is None else docs
-    with tarfile.open(path, "w:xz") as tar:
-        for doc in docs:
-            cve = doc["statements"][0]["vulnerability"]["name"]
-            data = json.dumps(doc).encode()
-            info = tarfile.TarInfo(f"vex/cve/{cve[4:8]}/{cve}.json")
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-        usn = b'{"not": "a cve"}'
-        info = tarfile.TarInfo("vex/usn/USN-7000-1.json")
-        info.size = len(usn)
-        tar.addfile(info, io.BytesIO(usn))
-    return path
+def as_api_document(doc):
+    """Turn historical statement fixtures into Canonical Security JSON API replies."""
+    statements = doc["statements"]
+    cve = statements[0]["vulnerability"]["name"]
+    packages = {}
+    for statement in statements:
+        old_status = statement["status"]
+        note = " ".join(str(statement.get(k) or "") for k in ("status_notes", "action_statement"))
+        priority = ""
+        if "classified this CVE as of " in note:
+            priority = note.split("classified this CVE as of ", 1)[1].split(" priority", 1)[0]
+        status = {
+            "fixed": "released",
+            "not_affected": "not-affected",
+            "under_investigation": "needs-triage",
+            "affected": "needed",
+        }[old_status]
+        if "decided to not fix" in note or "no longer supported" in note:
+            status = "ignored"
+        for product in statement["products"]:
+            purl = product["@id"]
+            if "arch=source" not in purl:
+                continue
+            source = purl.split("/ubuntu/", 1)[1].split("@", 1)[0]
+            version = purl.split("@", 1)[1].split("?", 1)[0]
+            distro = purl.split("distro=", 1)[1]
+            if "/" in distro:
+                pocket, codename = distro.split("/", 1)
+            else:
+                pocket, codename = None, distro
+            packages.setdefault(source, []).append(
+                {
+                    "release_codename": codename,
+                    "status": status,
+                    "pocket": pocket,
+                    "description": version,
+                    "priority": priority,
+                }
+            )
+    return {
+        "id": cve,
+        "description": statements[0]["vulnerability"].get("description", ""),
+        "packages": [
+            {"name": source, "statuses": statuses} for source, statuses in packages.items()
+        ],
+    }
 
 
-def archive_fetcher(archive: Path, calls: list | None = None):
-    def fetch(url, dest, headers):
+def parse_fixture_document(doc):
+    api = as_api_document(doc)
+    return parse_cve_document(api, api["id"])
+
+
+def online_fetcher(docs=None, calls=None):
+    replies = {api["id"]: api for api in map(as_api_document, DOCS if docs is None else docs)}
+
+    def fetch(url):
+        cve = url.rsplit("/", 1)[1].removesuffix(".json")
         if calls is not None:
-            calls.append(headers)
-        shutil.copy(archive, dest)
-        return {"last_modified": "Fri, 25 Sep 2026 18:09:55 GMT", "etag": '"abc"'}
+            calls.append(url)
+        if cve not in replies:
+            from urllib.error import HTTPError
+
+            raise HTTPError(url, 404, "Not Found", None, None)
+        return replies[cve]
 
     return fetch
 
 
 def failing_fetcher(message="Network error: [Errno -3] Temporary failure in name resolution"):
-    def fetch(url, dest, headers):
+    def fetch(url):
         raise OSError(message)
 
     return fetch
 
 
 def make_metadata(tmp_path: Path, docs=None) -> SecurityMetadata:
-    archive = make_vex_archive(tmp_path / "fixture-vex.tar.xz", docs)
-    return SecurityMetadata(tmp_path / "metadata-cache", fetcher=archive_fetcher(archive))
+    return SecurityMetadata(fetcher=online_fetcher(docs))
 
 
 # --- remote server output -----------------------------------------------------------

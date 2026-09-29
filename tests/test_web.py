@@ -271,6 +271,17 @@ def test_upload_unknown_server(client, pem_file):
     assert "Unknown server: app-prod-99. This server is not configured in EC2Patcher." in r.text
 
 
+def test_unknown_server_error_is_specific_and_known_servers_can_still_upload(make_client, pem_file):
+    c = make_client()
+    add(c, "app-prod-01", "10.0.0.1", pem_file)
+    add(c, "app-prod-02", "10.0.0.2", pem_file)
+    bad = upload(c, {"app-prod-01": ["CVE-2026-12345"], "missing": ["CVE-2026-11111"]})
+    assert bad.status_code == 422
+    assert "Unknown server: missing" in bad.text
+    assert "Unknown server: app-prod-01" not in bad.text
+    assert upload(c, {"app-prod-01": ["CVE-2026-12345"]}).status_code == 200
+
+
 def test_failed_upload_keeps_previous_report(client, pem_file):
     add(client, "app-prod-01", "10.0.0.1", pem_file)
     upload(client, {"app-prod-01": ["CVE-2026-12345"]}, filename="good.json")
@@ -340,6 +351,31 @@ def test_cross_site_post_rejected(client, pem_file, db_path):
     )
     assert r.status_code == 403
     assert Database(db_path).count_servers() == 1
+
+
+def test_cross_site_post_rejected_on_settings_forms(client, pem_file, db_path):
+    add(client, "app-prod-01", "10.0.0.1", pem_file)
+    for path, data in (
+        ("/settings/reset-database", {"confirm_text": "RESET"}),
+        ("/settings/clear-cache", {}),
+    ):
+        for headers in (
+            {"Origin": "http://evil.example"},
+            {"Origin": "http://127.0.0.1:9999"},  # same host, different port
+            {"Sec-Fetch-Site": "cross-site"},
+        ):
+            r = client.post(path, data=data, headers=headers, follow_redirects=False)
+            assert r.status_code == 403, (path, headers)
+            assert "Cross-site request rejected" in r.text
+    assert Database(db_path).count_servers() == 1  # reset never ran
+    same_origin = client.post(
+        "/settings/reset-database",
+        data={"confirm_text": "RESET"},
+        headers={"Origin": "http://127.0.0.1"},
+        follow_redirects=False,
+    )
+    assert same_origin.status_code == 303
+    assert Database(db_path).count_servers() == 0
 
 
 def test_untrusted_host_rejected(make_client):
