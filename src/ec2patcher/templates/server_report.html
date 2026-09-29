@@ -103,6 +103,7 @@
     {% if ex %}<span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ patch_labels.get(ex.state, ex.state)|upper }}</span>
     {% else %}<span class="badge badge-neutral">PENDING REVIEW</span>{% endif %}
   </div>
+  {% if patch.not_checked_warning %}<div class="alert alert-warning not-checked-warning">{{ patch.not_checked_warning }}</div>{% endif %}
   {% if ex and ex.decision == "REJECTED" %}
     <p><strong>Rejected</strong> on {{ ex.decided_at|timestamp }}. No packages were downloaded, copied or installed. The report remains available for reference.</p>
   {% elif ex %}
@@ -226,7 +227,8 @@
     </table>
     </div>
   {% else %}
-    <p class="muted">No package updates are planned for this server.</p>
+    <p class="muted">No package updates are planned for this server{% if patch.not_checked_warning %} for the CVEs that were checked{% endif %}.</p>
+    {% if patch.not_checked_warning %}<div class="alert alert-warning">{{ patch.not_checked_warning }}</div>{% endif %}
   {% endif %}
 </div>
 
