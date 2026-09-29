@@ -1,12 +1,14 @@
 """Canonical Security JSON API mapping and online lookup behavior."""
 
+import socket
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 import pytest
 from phase2_fixtures import facts_output, online_fetcher
 
 from ec2patcher.services import cve_resolver as cr
+from ec2patcher.services import security_metadata
 from ec2patcher.services.security_metadata import (
     MetadataUnreachable,
     SecurityMetadata,
@@ -205,6 +207,61 @@ def test_network_error_trips_breaker_for_rest_of_run_and_clear_resets():
     with pytest.raises(OSError, match="connection timed out"):
         meta.lookup("CVE-2026-50002")
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    "timeout_exc",
+    [
+        TimeoutError("timed out"),  # read timeout from getresponse()/response.read()
+        TimeoutError("timed out"),  # alias of TimeoutError since Python 3.10
+        URLError(TimeoutError("timed out")),  # connect timeout, wrapped by urlopen
+    ],
+    ids=["TimeoutError", "socket.timeout", "URLError(TimeoutError)"],
+)
+def test_request_timeout_trips_breaker(timeout_exc):
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        raise timeout_exc
+
+    meta = SecurityMetadata(fetcher=fetch)
+    with pytest.raises(type(timeout_exc)):
+        meta.lookup("CVE-2026-50001")
+    for cve in ("CVE-2026-50002", "CVE-2026-50003"):
+        with pytest.raises(MetadataUnreachable, match="skipped after earlier network error"):
+            meta.lookup(cve)
+    assert len(calls) == 1  # no HTTP after the timeout
+
+    meta.start_run()
+    with pytest.raises(type(timeout_exc)):
+        meta.lookup("CVE-2026-50002")
+    assert len(calls) == 2
+
+
+def test_real_http_get_timeout_trips_breaker(monkeypatch):
+    """A server that accepts TCP but never answers makes urlopen time out for real."""
+    monkeypatch.setattr(security_metadata, "REQUEST_TIMEOUT_SECONDS", 0.2)
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(4)  # kernel completes the handshake; nothing ever replies
+    url = f"http://127.0.0.1:{server.getsockname()[1]}/cve.json"
+    calls = []
+
+    def fetch(_url):
+        calls.append(_url)
+        return security_metadata.http_get(url)
+
+    try:
+        meta = SecurityMetadata(fetcher=fetch)
+        with pytest.raises((TimeoutError, URLError)) as excinfo:
+            meta.lookup("CVE-2026-50001")
+        assert isinstance(excinfo.value, OSError)
+        with pytest.raises(MetadataUnreachable):
+            meta.lookup("CVE-2026-50002")
+        assert len(calls) == 1
+    finally:
+        server.close()
 
 
 def test_http_5xx_trips_breaker_but_parse_errors_do_not():
