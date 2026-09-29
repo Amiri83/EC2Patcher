@@ -23,9 +23,16 @@ from datetime import datetime, timezone
 
 from ec2patcher.database import Database
 from ec2patcher.models import ServerAnalysis, StoredReport
-from ec2patcher.services import apt_planner, cve_resolver, nvd, server_state, ssh_service
+from ec2patcher.services import (
+    apt_planner,
+    cve_resolver,
+    debversion,
+    nvd,
+    server_state,
+    ssh_service,
+)
 from ec2patcher.services.security_metadata import SecurityMetadata
-from ec2patcher.services.severity import SEVERITIES, UNKNOWN
+from ec2patcher.services.severity import SEVERITIES, UNKNOWN, normalize_severity
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +332,75 @@ class AnalysisService:
 
 
 # --- presentation helpers -------------------------------------------------------------
+
+
+@dataclass
+class RemediationGroup:
+    source: str | None
+    cves: list[str]
+    cve_count: int
+    severity: str
+    cvss_score: float | None
+    cvss_label: str
+    ubuntu_priority: str | None
+    installed_version: str | None
+    fixed_version: str | None
+    candidate_version: str | None
+    status: str
+    detail: str | None
+    binary_packages: list[str]
+    pockets: list[str]
+    rows: list
+
+
+def remediation_groups(findings: list) -> list[RemediationGroup]:
+    """Collapse findings with the same source and fix for report presentation only."""
+    grouped: dict[tuple[str, str], list] = {}
+    ungrouped = []
+    for finding in findings:
+        if finding.source_package and finding.fixed_version:
+            grouped.setdefault((finding.source_package, finding.fixed_version), []).append(finding)
+        else:
+            ungrouped.append([finding])
+
+    result = []
+    for rows in [*([grouped[key] for key in sorted(grouped)]), *ungrouped]:
+        first = rows[0]
+        versions = [f.installed_version for f in rows if f.installed_version]
+        candidates = []
+        for f in rows:
+            for item in (f.apt_candidate or "").split("; "):
+                if ": " in item:
+                    version = item.rsplit(": ", 1)[1]
+                    if debversion.is_valid_version(version):
+                        candidates.append(version)
+        status = cve_resolver.rollup_status([f.status for f in rows])
+        highest = max(rows, key=lambda f: f.cvss_score if f.cvss_score is not None else -1)
+        detail = next((f.detail for f in rows if f.status == status and f.detail), None)
+        if status == cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS:
+            detail = "The configured repositories do not offer the fixed version."
+        result.append(
+            RemediationGroup(
+                source=first.source_package,
+                cves=sorted({f.cve for f in rows}),
+                cve_count=len({f.cve for f in rows}),
+                severity=min((normalize_severity(f.severity) for f in rows), key=SEVERITIES.index),
+                cvss_score=highest.cvss_score,
+                cvss_label=highest.cvss_label,
+                ubuntu_priority=next((f.priority for f in rows if f.priority), None),
+                installed_version=min(versions, key=debversion.version_key) if versions else None,
+                fixed_version=first.fixed_version,
+                candidate_version=(
+                    max(candidates, key=debversion.version_key) if candidates else None
+                ),
+                status=status,
+                detail=detail,
+                binary_packages=sorted({b for f in rows for b in f.binary_packages}),
+                pockets=sorted({f.pocket for f in rows if f.pocket}),
+                rows=rows,
+            )
+        )
+    return result
 
 
 @dataclass

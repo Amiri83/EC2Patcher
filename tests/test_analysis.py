@@ -445,9 +445,14 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "libssl3t64_3.0.13-0ubuntu3.6_amd64.deb" in report
         assert "linux-image-6.8.0-1024-aws_6.8.0-1024.26_amd64.deb" in report
         assert "Reboot expected (new kernel)" in report
-        # Kernel flavours that are not installed are collapsed, not dropped.
-        assert "3 other source packages" in report
-        assert "<code>linux-gcp</code>" in report
+        # Sources without an installed package remain visible as individual rows.
+        assert "linux-gcp" in report
+        assert "Package not installed" in report
+        assert "Repository Candidate" in report
+        analysis_id = c.app.state.db.get_latest_analysis_run().servers[0].id
+        for finding in c.app.state.db.get_server_analysis(analysis_id).findings:
+            if finding.apt_candidate and "; " in finding.apt_candidate:
+                assert finding.apt_candidate not in report
         assert "Technical details" in report and "--print-uris" in report
         assert "http://security.ubuntu.com/ubuntu/pool/main/o/openssl/" in report
         # Failed server report is explicit.

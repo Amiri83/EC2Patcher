@@ -403,6 +403,7 @@ def create_app(
             request, "server_report.html", "reports", run=run, analysis=analysis,
             summary=analysis_service.summarize(analysis),
             finding_groups=analysis_service.group_findings(analysis),
+            remediation_groups=analysis_service.remediation_groups(analysis.findings),
             is_latest=latest is not None and latest.id == run_id,
         )  # fmt: skip
 
