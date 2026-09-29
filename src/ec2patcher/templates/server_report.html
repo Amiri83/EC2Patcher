@@ -109,6 +109,12 @@
   <p class="muted small severity-breakdown">Severity (NVD CVSS, per reported CVE):
     {% for sev in severities %}<span class="badge {{ severity_classes[sev] }}">{{ sev }}: {{ summary.by_severity[sev] }}</span>{% endfor %}
   </p>
+  <p class="muted small bucket-summary">By action (per reported CVE):
+    {% for key, title, n in summary.buckets %}<span class="badge {{ bucket_classes[key] if n else 'badge-neutral' }}">{{ title }}: {{ n }} CVE{{ "s" if n != 1 else "" }}</span>{% endfor %}
+  </p>
+  {% if summary.stale_apt %}
+    <div class="alert alert-warning stale-apt-hint">{{ summary.stale_apt }} CVE(s) could not be concluded: {{ summary.stale_apt_hint }}</div>
+  {% endif %}
   {% if summary.by_status %}
     <p class="muted small status-breakdown">By status:
       {% for status, count in summary.by_status|dictsort %}
