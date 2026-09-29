@@ -225,76 +225,31 @@ def test_no_candidate_at_all():
     assert "no installation candidate" in findings[0].detail
 
 
-def test_candidate_unavailable_mentions_stale_apt_lists():
-    f = facts(apt_stamp=1790460000 - 30 * 86400)
-    findings = cr.resolve_all(["CVE-2026-10008"], RECORDS.get, f)
-    names = cr.candidate_query_packages(findings, f)
-    cr.apply_candidates(findings, apt_planner.parse_candidates(candidates_output(names), names), f)
-    assert "30.0 days ago" in findings[0].detail
-    # A stale cache alone must never produce FIX_NOT_IN_CONFIGURED_REPOS.
-    assert findings[0].status == cr.ANALYSIS_ERROR
-    assert cr.STALE_APT_DETAIL in findings[0].detail
+def test_candidate_older_than_fix_is_a_genuine_missing_fix():
+    """Candidates come from freshly updated private lists: no 'run apt-get update' hint."""
+    _, findings, _, _, requests = analyzed(("CVE-2026-10008",))
+    f = findings[0]
+    assert f.status == cr.FIX_NOT_IN_CONFIGURED_REPOS and requests == []
+    assert "noble, noble-updates, noble-security" in f.detail and "amd64" in f.detail
+    assert "apt-get update" not in f.detail and "sudo" not in f.detail
 
 
-def _older_candidate(f):
-    findings = cr.resolve_all(["CVE-2026-10008"], RECORDS.get, f)
-    names = cr.candidate_query_packages(findings, f)
-    requests = cr.apply_candidates(
-        findings, apt_planner.parse_candidates(candidates_output(names), names), f
-    )
-    return findings[0], requests
-
-
-def test_fresh_apt_lists_keep_fix_not_in_configured_repos():
-    finding, requests = _older_candidate(facts())
-    assert finding.status == cr.FIX_NOT_IN_CONFIGURED_REPOS and requests == []
-    assert "APT package lists are current" in finding.detail
-    assert cr.STALE_APT_DETAIL not in finding.detail
-
-
-def test_unknown_apt_list_age_is_inconclusive_not_missing_from_repos():
+def test_missing_kernel_meta_package_is_not_in_repos():
     f = facts()
-    f.apt_age_hours = None  # e.g. the 'now' section could not be read
-    finding, requests = _older_candidate(f)
-    assert finding.status == cr.ANALYSIS_ERROR and requests == []
-    assert "age of the APT package lists is unknown" in finding.detail
-
-
-def test_stale_apt_lists_do_not_block_a_satisfying_candidate():
-    f = facts(apt_stamp=1790460000 - 30 * 86400)
-    findings = cr.resolve_all(["CVE-2026-63076"], RECORDS.get, f)
-    names = cr.candidate_query_packages(findings, f)
-    candidates = apt_planner.parse_candidates(candidates_output(names), names)
-    assert cr.apply_candidates(findings, candidates, f)
-    assert {x.status for x in findings} == {cr.PATCH_AVAILABLE}
-
-
-def test_stale_apt_lists_no_candidate_and_no_kernel_meta():
-    stale = facts(apt_stamp=1790460000 - 30 * 86400)
-    findings = cr.resolve_all(["CVE-2026-63076"], RECORDS.get, stale)
-    assert cr.apply_candidates(findings, {}, stale) == []
-    assert findings[0].status == cr.ANALYSIS_ERROR
-    # Missing kernel meta package is a configuration fact, not a cache-freshness question.
     kernel = cr.Finding("CVE-1", "linux-aws", cr.FIX_NOT_IN_CONFIGURED_REPOS,
                         fixed_version="6.8.0-1024.26", is_kernel=True)  # fmt: skip
-    stale.packages = [p for p in stale.packages if not p.source.startswith("linux-meta")]
-    cr.apply_candidates([kernel], {}, stale)
+    f.packages = [p for p in f.packages if not p.source.startswith("linux-meta")]
+    assert cr.apply_candidates([kernel], {}, f) == []
     assert kernel.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
-
-
-def test_stale_apt_lists_leave_pro_findings_as_pro():
-    f = facts(apt_stamp=1790460000 - 30 * 86400)
-    findings = cr.resolve_all(["CVE-2026-10003"], RECORDS.get, f)
-    cr.apply_candidates(findings, {}, f)
-    assert findings[0].status == cr.PRO_OR_ESM_REQUIRED
 
 
 def test_pro_fix_without_pro_candidate_stays_pro():
     _, findings, _, _, requests = analyzed(("CVE-2026-10003",))
     assert findings[0].status == cr.PRO_OR_ESM_REQUIRED and requests == []
+    assert "Ubuntu archive has no suitable candidate" in findings[0].detail
 
 
-def test_pro_fix_with_pro_enabled_is_patchable():
+def test_pro_fix_also_offered_by_the_archive_is_patchable():
     f = facts()
     findings = cr.resolve_all(["CVE-2026-10003"], RECORDS.get, f)
     cand = apt_planner.Candidate(
@@ -302,7 +257,7 @@ def test_pro_fix_with_pro_enabled_is_patchable():
         "7:6.1.1-3ubuntu5+esm2",
     )  # fmt: skip
     requests = cr.apply_candidates(findings, {"libavcodec60:amd64": cand}, f)
-    assert findings[0].status == cr.PATCH_AVAILABLE and "Ubuntu Pro" in findings[0].detail
+    assert findings[0].status == cr.PATCH_AVAILABLE and "Ubuntu archive" in findings[0].detail
     assert requests == [("libavcodec60:amd64", "7:6.1.1-3ubuntu5+esm2")]
 
 
@@ -361,7 +316,20 @@ def test_cve_only_tracked_for_unsupported_releases_is_not_reported_safe():
     assert [(f.source, f.status) for f in findings] == [(None, cr.UNKNOWN)]
 
 
-def test_cve_tracked_for_other_supported_release_only_is_unknown():
+def test_cve_tracked_for_other_supported_release_only_is_not_installed():
+    """Regression (perl report): Canonical tracks the source for jammy only (e.g. DNE for
+    noble) and it is not installed here. The PACKAGE_NOT_INSTALLED fallback used to be
+    unreachable, so this became UNKNOWN and the CVE landed in the Investigate bucket."""
     doc = vex_doc("CVE-2026-8", statement("CVE-2026-8", "fixed", [("foo", "1.0-1", "jammy")]))
     findings = cr.resolve_cve("CVE-2026-8", parse_fixture_document(doc), facts())
-    assert [(f.source, f.status) for f in findings] == [(None, cr.UNKNOWN)]
+    assert [(f.source, f.status) for f in findings] == [(None, cr.PACKAGE_NOT_INSTALLED)]
+    assert "(foo)" in findings[0].detail
+
+
+def test_installed_source_tracked_for_other_release_only_stays_unknown():
+    doc = vex_doc(
+        "CVE-2026-9",
+        statement("CVE-2026-9", "fixed", [("sudo", "1.0-1", "jammy"), ("foo", "1.0-1", "jammy")]),
+    )
+    findings = cr.resolve_cve("CVE-2026-9", parse_fixture_document(doc), facts())
+    assert [(f.source, f.status) for f in findings] == [("sudo", cr.UNKNOWN)]  # sudo installed

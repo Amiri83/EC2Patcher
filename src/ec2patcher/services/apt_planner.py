@@ -1,20 +1,21 @@
 """Read-only APT queries: candidate versions and the exact .deb download plan.
 
-Nothing here installs, downloads or changes anything on the server:
+The queries run on the workstation against a private APT state (see local_apt); nothing
+here installs, downloads or changes anything:
 
-* ``apt-cache policy`` / ``apt-cache show`` only read the local package lists.
+* ``apt-cache policy`` / ``apt-cache show`` only read the package lists.
 * ``apt-get -s`` is a simulation (no root needed, no lock, no changes).
 * ``apt-get --print-uris`` prints the URI, file name, size and checksum of every .deb the
   install *would* fetch, and exits without downloading. ``Dir::Cache::archives`` points at a
   non-existent directory so already-cached .debs are listed too (apt otherwise omits them),
   and ``Acquire::ForceHash=SHA256`` makes apt print SHA256 instead of MD5.
 
-All commands run as the unprivileged ``ubuntu`` user without sudo. Package names and versions
-are validated against strict patterns and shell-quoted before they reach the remote shell.
+Package names and versions are validated against strict patterns and passed as separate
+arguments (never through a shell). The outputs are combined into one marked transcript
+(``transcript``) that the parsers below understand.
 """
 
 import re
-import shlex
 from dataclasses import dataclass, field
 from urllib.parse import unquote, urlsplit
 
@@ -50,8 +51,14 @@ def _check_version(version: str) -> str:
     return version
 
 
-def _quoted(items: list[str]) -> str:
-    return " ".join(shlex.quote(i) for i in items)
+def transcript(sections: list[tuple[str, str]]) -> str:
+    """Join command outputs into the marked format parsed here (an ``end`` marker is added)."""
+    lines = []
+    for name, text in sections:
+        lines.append(f"{MARK}{name}")
+        lines.extend(text.splitlines())
+    lines.append(f"{MARK}end")
+    return "\n".join(lines) + "\n"
 
 
 # --- candidate lookup ----------------------------------------------------------------
@@ -68,16 +75,10 @@ class Candidate:
     requests_reboot: bool = False  # installed postinst calls notify-reboot-required
 
 
-def build_candidate_command(packages: list[str]) -> str:
+def candidate_arguments(packages: list[str]) -> tuple[list[str], list[str]]:
+    """``apt-cache`` arguments (after the options) for the policy and show queries."""
     names = [_check_name(p) for p in packages]
-    postinsts = [f"/var/lib/dpkg/info/{n}.postinst" for n in names]
-    return (
-        f"echo '{MARK}policy'; apt-cache policy -- {_quoted(names)} 2>&1; "
-        f"echo '{MARK}show'; apt-cache show --no-all-versions -- {_quoted(names)} 2>/dev/null; "
-        f"echo '{MARK}reboot-hooks'; "
-        f"grep -l -s notify-reboot-required -- {_quoted(postinsts)}; "
-        f"echo '{MARK}end'"
-    )
+    return ["policy", "--", *names], ["show", "--no-all-versions", "--", *names]
 
 
 def parse_policy(lines: list[str]) -> dict[str, dict]:
@@ -208,15 +209,11 @@ def plan_arguments(requests: list[tuple[str, str]]) -> list[str]:
     return [*APT_PLAN_OPTIONS, "--", *specs]
 
 
-def build_plan_command(requests: list[tuple[str, str]]) -> str:
-    args = _quoted(plan_arguments(requests))
-    return (
-        f"echo '{MARK}simulate'; apt-get -s install {args} 2>&1; rc=$?; "
-        f"echo '{MARK}simulate-rc'; echo $rc; "
-        f"echo '{MARK}uris'; apt-get --print-uris install {args} 2>&1; rc=$?; "
-        f"echo '{MARK}uris-rc'; echo $rc; "
-        f"echo '{MARK}end'"
-    )
+def plan_commands(requests: list[tuple[str, str]]) -> tuple[list[str], list[str]]:
+    """``apt-get`` arguments (after the options): simulation, then --print-uris. Neither
+    installs or downloads anything."""
+    args = plan_arguments(requests)
+    return ["-s", "install", *args], ["--print-uris", "install", *args]
 
 
 _INST_RE = re.compile(r"^Inst (\S+) (?:\[(\S+)\] )?\((\S+) (.*?)\s*\[([^\]]+)\]\)")
@@ -259,8 +256,14 @@ def _uri_matches(uri: str, filename: str) -> bool:
     parts = urlsplit(uri)
     if parts.scheme not in ("http", "https", "file", "mirror+http", "mirror+https"):
         return False
-    basename = parts.path.rsplit("/", 1)[-1]
-    return basename == filename or unquote(basename) == unquote(filename)
+    basename = unquote(parts.path.rsplit("/", 1)[-1])
+    name = unquote(filename)
+    # apt's destination name keeps the epoch ("zlib1g_1%3a1.3..."); archive pool files never
+    # carry it ("pool/main/z/zlib/zlib1g_1.3...").
+    package, _, rest = name.partition("_")
+    version = rest.split("_", 1)[0]
+    without_epoch = f"{package}_{rest.split(':', 1)[1]}" if ":" in version else name
+    return basename in (name, without_epoch)
 
 
 def _rc(sections: dict[str, list[str]], key: str) -> int | None:

@@ -1,7 +1,5 @@
 """APT candidate parsing and the exact .deb plan (simulation + --print-uris, no download)."""
 
-import shlex
-
 import pytest
 from phase2_fixtures import FIXTURES, PLAN_OUTPUT
 
@@ -93,6 +91,25 @@ def test_epoch_filename_encoding():
     assert plan.packages[0].deb_filename == "vim_2%3a9.1.0016-1ubuntu7.9_amd64.deb"
 
 
+def test_epoch_is_absent_from_real_pool_uris():
+    """Captured from a real apt 2.7 --print-uris run: the pool file has no epoch."""
+    out = (
+        "@@EC2P simulate\nInst zlib1g [1:1.3.dfsg-3.1ubuntu2] (1:1.3.dfsg-3.1ubuntu2.2 "
+        "Ubuntu:24.04/noble-updates [amd64])\n@@EC2P simulate-rc\n0\n@@EC2P uris\n"
+        "'http://archive.ubuntu.com/ubuntu/pool/main/z/zlib/"
+        "zlib1g_1.3.dfsg-3.1ubuntu2.2_amd64.deb' "
+        "zlib1g_1%3a1.3.dfsg-3.1ubuntu2.2_amd64.deb 64306 SHA256:ab\n@@EC2P uris-rc\n0\n"
+        "@@EC2P end\n"
+    )
+    [deb] = ap.parse_plan(out, [("zlib1g", "1:1.3.dfsg-3.1ubuntu2.2")]).packages
+    assert deb.error is None and deb.deb_filename == "zlib1g_1%3a1.3.dfsg-3.1ubuntu2.2_amd64.deb"
+    assert deb.uri.endswith("/zlib1g_1.3.dfsg-3.1ubuntu2.2_amd64.deb")
+    # A different package's pool file is still rejected.
+    bad = out.replace("pool/main/z/zlib/zlib1g_1.3", "pool/main/z/zlib/evil_1.3")
+    [deb] = ap.parse_plan(bad, [("zlib1g", "1:1.3.dfsg-3.1ubuntu2.2")]).packages
+    assert deb.deb_filename is None and "Unexpected URI" in deb.error
+
+
 def test_missing_uri_is_not_invented():
     out = REAL_PLAN.replace(
         "'http://archive.ubuntu.com/ubuntu/pool/main/b/bluez/bluez-cups_5.85-4ubuntu0.2_amd64.deb' "
@@ -143,19 +160,27 @@ def test_simulation_removals_reported():
     assert ap.parse_plan(out, REAL_REQUESTS).removals == ["bluez-legacy"]
 
 
-def test_plan_command_is_read_only_and_quoted():
-    cmd = ap.build_plan_command(REAL_REQUESTS)
-    assert "apt-get -s install" in cmd and "apt-get --print-uris install" in cmd
-    assert "Dir::Cache::archives=/nonexistent/" in cmd
-    assert "Acquire::ForceHash=SHA256" in cmd and "--only-upgrade" in cmd
-    assert "sudo" not in cmd and "download " not in cmd and "dpkg -i" not in cmd
-    # Every apt-get invocation either simulates or only prints URIs.
-    for part in cmd.split(";"):
-        if "apt-get" in part:
-            assert " -s " in part or "--print-uris" in part
-    # Arguments survive shell parsing unchanged.
-    sim = cmd.split("apt-get -s install ", 1)[1].split(" 2>&1", 1)[0]
-    assert shlex.split(sim) == ap.plan_arguments(REAL_REQUESTS)
+def test_plan_commands_are_read_only_argument_lists():
+    simulate, uris = ap.plan_commands(REAL_REQUESTS)
+    assert simulate[:2] == ["-s", "install"] and uris[:2] == ["--print-uris", "install"]
+    assert simulate[2:] == uris[2:] == ap.plan_arguments(REAL_REQUESTS)
+    args = ap.plan_arguments(REAL_REQUESTS)
+    assert "Dir::Cache::archives=/nonexistent/ec2patcher-no-download/" in args
+    assert "Acquire::ForceHash=SHA256" in args and "--only-upgrade" in args
+    assert args[-3:] == ["--", "bluez=5.85-4ubuntu0.2", "libbluetooth3:amd64=5.85-4ubuntu0.2"]
+    for forbidden in ("sudo", "download", "dpkg", "-y", "--yes"):
+        assert forbidden not in simulate + uris
+
+
+def test_transcript_round_trips_through_the_parsers():
+    text = ap.transcript([
+        ("simulate", REAL_PLAN.split("@@EC2P simulate\n", 1)[1].split("@@EC2P simulate-rc")[0]),
+        ("simulate-rc", "0"),
+        ("uris", REAL_PLAN.split("@@EC2P uris\n", 1)[1].split("@@EC2P uris-rc")[0]),
+        ("uris-rc", "0"),
+    ])  # fmt: skip
+    assert text.endswith("@@EC2P end\n")
+    assert ap.parse_plan(text, REAL_REQUESTS) == ap.parse_plan(REAL_PLAN, REAL_REQUESTS)
 
 
 @pytest.mark.parametrize(
@@ -170,12 +195,14 @@ def test_plan_command_is_read_only_and_quoted():
 )
 def test_unsafe_arguments_refused(requests):
     with pytest.raises(ap.UnsafeArgumentError):
-        ap.build_plan_command(requests)
+        ap.plan_commands(requests)
 
 
-def test_candidate_command_refuses_unsafe_names():
+def test_candidate_arguments_refuse_unsafe_names():
     with pytest.raises(ap.UnsafeArgumentError):
-        ap.build_candidate_command(["ok", "bad name"])
-    cmd = ap.build_candidate_command(["libssl3t64:amd64"])
-    assert "apt-cache policy -- libssl3t64:amd64" in cmd
-    assert "/var/lib/dpkg/info/libssl3t64:amd64.postinst" in cmd
+        ap.candidate_arguments(["ok", "bad name"])
+    with pytest.raises(ap.UnsafeArgumentError):
+        ap.candidate_arguments(["-o"])
+    policy, show = ap.candidate_arguments(["libssl3t64:amd64"])
+    assert policy == ["policy", "--", "libssl3t64:amd64"]
+    assert show == ["show", "--no-all-versions", "--", "libssl3t64:amd64"]

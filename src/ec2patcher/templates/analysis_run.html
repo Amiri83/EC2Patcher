@@ -48,7 +48,6 @@
               {% for key, title, n in sm.buckets %}
                 <span class="bucket-count bucket-{{ key }}{% if n and key == 'action' %} text-danger{% elif n and key == 'investigate' %} text-warning{% endif %}">{{ title }}: {{ n }}</span>
               {% endfor %}
-              {% if sm.stale_apt %}<span class="text-warning stale-apt-hint" title="{{ sm.stale_apt_hint }}">{{ sm.stale_apt }} inconclusive (APT lists not current): run 'sudo apt-get update' and re-analyze</span>{% endif %}
               <span>{{ sm.packages }} package{{ "" if sm.packages == 1 else "s" }} to update</span>
               <span>Reboot: {% if s.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}no expected reboot{% endif %}</span>
             </div>
