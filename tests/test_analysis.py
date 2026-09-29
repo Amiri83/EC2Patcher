@@ -340,6 +340,71 @@ def test_analyze_button_only_after_valid_report(web, pem_file):
         assert 'action="/reports/analyze"' in page and "Analyze Report" in page
 
 
+def test_upload_does_not_start_analysis_or_contact_remote_services(web, pem_file, db_path):
+    ssh = ScriptedSSH()
+    c = web(ssh=ssh)
+    metadata = c.app.state.analyzer.metadata
+    fetch = metadata.fetcher
+    fetch_calls = []
+
+    def tracked_fetch(*args):
+        fetch_calls.append(args)
+        return fetch(*args)
+
+    metadata.fetcher = tracked_fetch
+    add_servers(c, pem_file)
+    assert upload(c, {GOOD: ["CVE-2026-63076"]}).status_code == 200
+    db = Database(db_path)
+    assert db.get_latest_report() is not None
+    assert db.list_analysis_runs() == []
+    assert fetch_calls == [] and ssh.calls == []
+    assert c.post("/reports/analyze", follow_redirects=False).status_code == 303
+    assert len(db.list_analysis_runs()) == 1
+    assert fetch_calls and ssh.calls
+
+
+@pytest.mark.parametrize("included", [(GOOD,), (GOOD, BAD)])
+def test_report_subset_only_analyzes_named_inventory_servers(web, pem_file, db_path, included):
+    omitted = "inventory-only"
+    c = web(ssh=ScriptedSSH())
+    add_servers(c, pem_file)
+    save(c, omitted, "10.143.76.216", pem_file)
+    report = {name: ["CVE-2026-63076"] for name in included}
+    assert upload(c, report).status_code == 200
+    db = Database(db_path)
+    assert db.get_latest_report().servers == report
+    assert db.list_analysis_runs() == []
+    assert c.post("/reports/analyze", follow_redirects=False).status_code == 303
+    run = db.get_latest_analysis_run()
+    assert [server.server_name for server in run.servers] == list(included)
+    assert db.get_server_by_name(omitted) is not None
+
+
+def test_settings_cache_and_database_controls_are_independent(web, pem_file, db_path):
+    c = web()
+    add_servers(c, pem_file)
+    assert upload(c, {GOOD: ["CVE-2026-63076"]}).status_code == 200
+    db = Database(db_path)
+    page = c.get("/settings").text
+    assert 'action="/settings/clear-cache"' in page
+    assert 'action="/settings/reset-database"' in page
+    assert c.post("/settings/clear-cache", follow_redirects=True).status_code == 200
+    assert db.get_latest_report() is not None and db.count_servers() == 2
+
+    denied = c.post("/settings/reset-database", data={"confirm_text": "wrong"})
+    assert denied.status_code == 400 and db.count_servers() == 2
+    c.app.state.analyzer._running = True
+    try:
+        busy = c.post("/settings/reset-database", data={"confirm_text": "RESET"})
+        assert busy.status_code == 409 and db.count_servers() == 2
+    finally:
+        c.app.state.analyzer._running = False
+    done = c.post("/settings/reset-database", data={"confirm_text": "RESET"}, follow_redirects=True)
+    assert done.status_code == 200 and "Database reset" in done.text
+    assert str(db_path) in done.text
+    assert db.count_servers() == 0 and db.get_latest_report() is None
+
+
 def test_analyze_without_report(web):
     with web() as c:
         r = c.post("/reports/analyze")

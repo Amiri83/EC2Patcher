@@ -45,6 +45,9 @@ NOTICES = {
     "deleted": "Server '{name}' was deleted.",
     "cleared": "All configured servers were removed ({count} deleted).",
     "not_found": "That server no longer exists.",
+    "cache_cleared": "Security cache cleared. The next analysis will download fresh data.",
+    "cache_clean": "Security cache is already clear.",
+    "database_reset": "Database reset. All stored data was removed.",
 }
 
 
@@ -422,7 +425,31 @@ def create_app(
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings(request: Request):
-        return render(request, "settings.html", "settings", db_path=db.path)
+        return render(
+            request, "settings.html", "settings", db_path=db.path,
+            metadata_status=metadata.status(), notice=notice_from_query(request),
+        )  # fmt: skip
+
+    @app.post("/settings/clear-cache")
+    def clear_security_cache():
+        removed = metadata.clear()
+        return redirect("/settings", notice="cache_cleared" if removed else "cache_clean")
+
+    @app.post("/settings/reset-database", response_class=HTMLResponse)
+    def reset_database(request: Request, confirm_text: str = Form("")):
+        if analyzer.is_running:
+            return render(
+                request, "settings.html", "settings", status_code=409, db_path=db.path,
+                metadata_status=metadata.status(),
+                error="Database cannot be reset during analysis.",
+            )  # fmt: skip
+        if confirm_text != "RESET":
+            return render(
+                request, "settings.html", "settings", status_code=400, db_path=db.path,
+                metadata_status=metadata.status(), error="Type RESET exactly to confirm.",
+            )  # fmt: skip
+        db.reset()
+        return redirect("/settings", notice="database_reset")
 
     # --- shutdown ------------------------------------------------------------
 

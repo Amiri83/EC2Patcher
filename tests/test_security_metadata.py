@@ -164,6 +164,25 @@ def test_cache_reused_without_download(tmp_path):
     assert again.lookup("CVE-2026-63076") is not None
 
 
+def test_clear_removes_cache_and_next_lookup_refreshes(tmp_path):
+    archive = make_vex_archive(tmp_path / "fixture.tar.xz")
+    calls = []
+    meta = SecurityMetadata(tmp_path / "cache", fetcher=archive_fetcher(archive, calls))
+    assert meta.ensure_fresh().available
+    part = meta.archive_path.with_suffix(".part")
+    part.write_bytes(b"partial")
+    meta._last_error = "old error"
+
+    assert meta.clear()
+    assert not any(path.exists() for path in (meta.index_path, meta.archive_path, part))
+    assert meta._last_error is None
+    assert not meta.status().available and meta.needs_refresh()
+    assert not meta.clear()
+    assert meta.ensure_fresh().available
+    assert len(calls) == 2
+    assert meta.lookup("CVE-2026-63076") is not None
+
+
 def test_refresh_uses_conditional_request_and_handles_not_modified(tmp_path):
     archive = make_vex_archive(tmp_path / "a.tar.xz")
     calls = []
