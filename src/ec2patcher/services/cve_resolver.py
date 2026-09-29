@@ -17,7 +17,7 @@ from ec2patcher.services import debversion
 from ec2patcher.services.apt_planner import Candidate, DownloadPlan
 from ec2patcher.services.nvd import CvssResult
 from ec2patcher.services.security_metadata import CveRecord, VexEntry
-from ec2patcher.services.server_state import InstalledPackage, ServerFacts
+from ec2patcher.services.server_state import InstalledPackage, ServerFacts, apt_lists_fresh
 from ec2patcher.services.severity import normalize_severity
 
 PATCH_AVAILABLE = "PATCH_AVAILABLE"
@@ -83,6 +83,10 @@ KERNEL_BINARY_RE = re.compile(
     r"-\d+\.\d+\.\d+-\d+"
 )
 KERNEL_REBOOT_RE = re.compile(r"^linux-(?:image|modules|modules-extra)-(?:unsigned-)?\d+\.\d+")
+STALE_APT_DETAIL = (
+    "APT candidate check inconclusive: the local APT package lists are not current, so the fix "
+    "may simply not be visible yet. Run 'sudo apt-get update' on the server and re-analyze."
+)
 REBOOT_HELP = (
     "Expected based on the planned package set. Final reboot requirement will be verified "
     "after installation in Phase 3."
@@ -93,6 +97,10 @@ REBOOT_HELP = (
 class Finding:
     cve: str
     source: str | None
+    # Contract for the patcher: act ONLY when status == PATCH_AVAILABLE, and only through an
+    # analysis plan deduplicated by (package, target_version) - never by iterating raw CVE IDs.
+    # Every other status (including FIX_NOT_IN_CONFIGURED_REPOS and PRO_OR_ESM_REQUIRED) is
+    # informational; one package upgrade typically fixes many CVEs and must be applied once.
     status: str
     detail: str = ""
     installed_version: str | None = None
@@ -396,6 +404,7 @@ def apply_candidates(
 ) -> list[tuple[str, str]]:
     """Check APT candidates; update statuses; return the (package, version) upgrade requests."""
     requests: dict[str, str] = {}
+    fresh = apt_lists_fresh(facts.apt_age_hours)
     stale = next((w for w in facts.warnings if "APT package lists" in w), None)
     for f in findings:
         if not needs_candidate_check(f):
@@ -436,11 +445,21 @@ def apply_candidates(
             if f.status == PRO_OR_ESM_REQUIRED:
                 f.detail = f"{f.detail} APT has no suitable candidate: {reasons}."
                 continue
+            if not fresh:
+                # A stale (or unknown-age) local cache cannot prove the fix is missing from the
+                # configured repositories; the analyzer is read-only and never runs apt-get update.
+                f.status = ANALYSIS_ERROR
+                f.detail = (
+                    f"Fixed version {f.fixed_version} is known but {reasons}. "
+                    f"{STALE_APT_DETAIL} {stale or 'The age of the APT package lists is unknown.'}"
+                )
+                continue
             f.status = FIX_NOT_IN_CONFIGURED_REPOS
-            hint = f" {stale}" if stale else " Possible causes: APT lists not updated, repository"
-            if not stale:
-                hint += " missing from the APT configuration, or architecture mismatch."
-            f.detail = f"Fixed version {f.fixed_version} is known but {reasons}.{hint}"
+            f.detail = (
+                f"Fixed version {f.fixed_version} is known but {reasons}. The APT package lists "
+                "are current; possible causes: repository missing from the APT configuration, "
+                "or architecture mismatch."
+            )
             continue
         if f.status == PRO_OR_ESM_REQUIRED:
             f.status = PATCH_AVAILABLE
