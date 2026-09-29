@@ -173,6 +173,7 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         ("Reboot Note", cve_resolver.REBOOT_HELP),
         ("Reported CVEs", summary.reported),
         *((f"Severity {s} (NVD CVSS)", summary.by_severity[s]) for s in SEVERITIES),
+        *((f"{title} (CVEs)", n) for _, title, n in summary.buckets),
         ("Patch available", summary.count(cve_resolver.PATCH_AVAILABLE)),
         ("Already fixed", summary.count(cve_resolver.ALREADY_FIXED)),
         ("Not affected", summary.count(cve_resolver.NOT_AFFECTED)),
@@ -203,6 +204,8 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         ("Estimated download size", format_size(summary.download_bytes)),
         ("Estimated download size (bytes)", summary.download_bytes),
     ]
+    if summary.stale_apt:
+        rows.append(("Inconclusive (APT lists not current)", summary.stale_apt_hint))
     if analysis.warnings:
         rows.append(("Warnings", "\n".join(analysis.warnings)))
     return rows

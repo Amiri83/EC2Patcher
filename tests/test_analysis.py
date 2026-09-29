@@ -439,7 +439,10 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "Permission denied (publickey)" in page
         assert "Billing API" in page
         assert '<meta http-equiv="refresh"' not in page  # finished runs do not auto-refresh
-        assert "3 patch available" in page and "Reboot: <strong>YES EXPECTED</strong>" in page
+        counters = re.findall(r'class="bucket-count[^"]*">([^<]+)</span>', page)
+        assert counters == ["Action required: 3", "Investigate: 0", "No action: 0"], counters
+        assert "unresolved / no fix" not in page
+        assert "Reboot: <strong>YES EXPECTED</strong>" in page
 
         links = re.findall(r'href="(/analysis/\d+/servers/\d+)"', page)
         assert len(links) == 2
