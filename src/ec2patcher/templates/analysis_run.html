@@ -14,7 +14,7 @@
     <dt>Started</dt><dd>{{ run.started_at|timestamp }}</dd>
     {% if run.completed_at %}<dt>Finished</dt><dd>{{ run.completed_at|timestamp }}</dd>{% endif %}
     <dt>Canonical security metadata</dt>
-    <dd>{% if run.metadata_updated_at %}Published {{ run.metadata_updated_at }}{% if run.metadata_checked_at %} &middot; cached {{ run.metadata_checked_at|timestamp }}{% endif %}{% else %}<span class="muted">not available</span>{% endif %}
+    <dd>{% if run.metadata_updated_at %}Online per-CVE lookup &middot; checked {{ run.metadata_checked_at|timestamp }}{% else %}<span class="muted">not available</span>{% endif %}
         {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}</dd>
   </dl>
   {% if run.is_running and run.progress_message %}

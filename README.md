@@ -98,19 +98,12 @@ after installation in Phase 3.
 
 ### Canonical security metadata
 
-Source: Canonical's official Ubuntu OpenVEX data,
-<https://security-metadata.canonical.com/vex/vex-all.tar.xz> (NVD, ubuntu.com web pages and
-the Ubuntu Security API are not used). The ~70 MB archive (~26 GB uncompressed) is streamed
-once and reduced to a small local index; analyses then query it locally.
-
-- Cache: `~/.cache/ec2patcher/security-metadata/` (override with `$EC2PATCHER_CACHE_DIR`),
-  about 160 MB (archive + index).
-- The first analysis downloads and indexes the data; this takes several minutes. Later
-  analyses refresh it at most once a day, using a conditional request (no download if
-  unchanged).
-- If a refresh fails but a cache exists, the cached data is used and the report shows a
-  **STALE DATA** warning with the cache time. With no usable data, the analysis fails; nothing
-  is guessed.
+Source: Canonical's Security JSON API at
+`https://ubuntu.com/security/cves/<CVE>.json`. During analysis, EC2Patcher queries
+Canonical once per reported CVE and maps source-package release statuses to its findings.
+Repeated CVEs are memoized in process memory; the Settings button clears that memo.
+There is no persistent Canonical metadata cache or bulk dataset download. If an online
+lookup fails, that CVE is marked **Canonical metadata unavailable** and analysis continues.
 
 ### Results
 
@@ -165,9 +158,8 @@ Case doesn't matter on input. IDs are normalized to uppercase and de-duplicated.
 
 - Python 3.10+
 - OpenSSH client (`ssh`) on `PATH` (for SSH tests and analysis)
-- Internet access to `security-metadata.canonical.com` for the security metadata (the cached
-  copy is used when offline) and to `services.nvd.nist.gov` for CVSS severity (optional:
-  without it severities are Unknown)
+- Internet access to `ubuntu.com` for per-CVE Canonical security metadata and to
+  `services.nvd.nist.gov` for CVSS severity (optional: without it severities are Unknown)
 
 ## Install
 
@@ -202,7 +194,6 @@ Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
 |---|---|
 | SQLite database | `~/.local/share/ec2patcher/ec2patcher.db` |
 | Log file | `~/.local/share/ec2patcher/ec2patcher.log` |
-| Canonical metadata cache | `~/.cache/ec2patcher/security-metadata/` |
 | NVD CVSS cache | `~/.cache/ec2patcher/nvd/` |
 
 Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
@@ -234,7 +225,7 @@ src/ec2patcher/
   services/
     ssh_service.py        SSH connectivity test + read-only remote commands (no shell)
     report_service.py     CVE report structural validation
-    security_metadata.py  Canonical VEX download, local index, stale-data handling
+    security_metadata.py  Canonical Security JSON API lookups and in-process memo
     server_state.py       remote facts + dpkg inventory (binary -> source mapping)
     debversion.py         Debian version comparison (dpkg semantics)
     cve_resolver.py       CVE status, APT candidate check, package plan, reboot expectation

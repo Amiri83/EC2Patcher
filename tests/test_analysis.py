@@ -4,7 +4,6 @@ import json
 import re
 import sqlite3
 import subprocess
-from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,11 +11,10 @@ from phase2_fixtures import (
     ALL_CVES,
     REAL_REPORT,
     ScriptedSSH,
-    archive_fetcher,
     facts_output,
     failing_fetcher,
     make_metadata,
-    make_vex_archive,
+    online_fetcher,
 )
 from test_tags import save
 from test_web import upload
@@ -63,7 +61,10 @@ def test_real_report_shape_end_to_end(setup, metadata):
     ssh = ScriptedSSH(failures=AUTH_FAILURE)
     run = run_analysis(setup, metadata, ssh)
     assert run.status == "completed_with_errors"
-    assert run.metadata_updated_at == "Fri, 25 Sep 2026 18:09:55 GMT" and not run.metadata_stale
+    assert (
+        run.metadata_source == "Canonical Security API (online per-CVE lookup)"
+        and not run.metadata_stale
+    )
     good, bad = run.servers
     assert (good.server_name, good.status, good.display_name) == (GOOD, "complete", "Billing API")
     assert (good.os_codename, good.architecture, good.running_kernel) == (
@@ -152,25 +153,14 @@ def test_malformed_remote_output(setup, metadata):
     assert good.status == "failed" and "Malformed remote output" in good.error
 
 
-def test_metadata_unavailable_reports_unknown_and_continues_discovery(setup, tmp_path):
-    meta = SecurityMetadata(tmp_path / "empty", fetcher=failing_fetcher())
+def test_lookup_failure_reports_unknown_and_continues_discovery(setup, tmp_path):
+    meta = SecurityMetadata(fetcher=failing_fetcher())
     ssh = ScriptedSSH()
     run = run_analysis(setup, meta, ssh)
     assert run.status == "completed"
-    assert "Canonical security metadata is unavailable" in run.metadata_warning
     assert all(s.status == "complete" for s in run.servers)
     assert all(f.status == cr.METADATA_UNAVAILABLE for s in run.servers for f in s.findings)
     assert len(ssh.calls) == 2  # facts only; no candidate check or package plan
-
-
-def test_stale_metadata_is_used_and_flagged(setup, tmp_path):
-    archive = make_vex_archive(tmp_path / "a.tar.xz")
-    meta = SecurityMetadata(tmp_path / "c", fetcher=archive_fetcher(archive), max_age=timedelta(0))
-    meta.refresh()
-    meta.fetcher = failing_fetcher()
-    run = run_analysis(setup, meta, ScriptedSSH())
-    assert run.metadata_stale and "STALE DATA" in run.metadata_warning
-    assert run.servers[0].status == "complete"
 
 
 def test_plan_failure_keeps_required_updates_visible(setup, metadata):
@@ -310,10 +300,8 @@ def test_phase2_migration_keeps_existing_data(db_path):
 
 @pytest.fixture
 def web(db_path, tmp_path):
-    archive = make_vex_archive(tmp_path / "fixture.tar.xz")
-
     def factory(ssh=None, fetcher=None):
-        meta = SecurityMetadata(tmp_path / "web-cache", fetcher=fetcher or archive_fetcher(archive))
+        meta = SecurityMetadata(tmp_path / "web-cache", fetcher=fetcher or online_fetcher())
         app = create_app(
             db_path=db_path, ssh_runner=ssh or ScriptedSSH(failures=AUTH_FAILURE),
             metadata=meta, analysis_starter=sync, shutdown_handler=lambda: None,
@@ -333,7 +321,9 @@ def test_analyze_button_only_after_valid_report(web, pem_file):
         page = c.get("/reports").text
         assert "Pre-Patch Analysis" in page and "Upload a valid report to enable analysis." in page
         assert 'action="/reports/analyze"' not in page
-        assert "Not downloaded yet" in page
+        assert "Canonical security data is queried online per CVE" in page
+        assert "Upload Report" in page and "Upload &amp; Validate" not in page
+        assert ">Validate</button>" not in page
         add_servers(c, pem_file)
         upload(c, REAL_REPORT)
         page = c.get("/reports").text
@@ -361,6 +351,7 @@ def test_upload_does_not_start_analysis_or_contact_remote_services(web, pem_file
     assert c.post("/reports/analyze", follow_redirects=False).status_code == 303
     assert len(db.list_analysis_runs()) == 1
     assert fetch_calls and ssh.calls
+    assert all(call[0].startswith("https://ubuntu.com/security/cves/CVE-") for call in fetch_calls)
 
 
 @pytest.mark.parametrize("included", [(GOOD,), (GOOD, BAD)])
@@ -438,7 +429,7 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "<dt>Ubuntu</dt><dd>Ubuntu 24.04.3 LTS</dd>" in report
         assert "<dt>Codename</dt><dd>noble</dd>" in report
         assert "<dt>Running Kernel</dt><dd>6.8.0-1021-aws</dd>" in report
-        assert "Fri, 25 Sep 2026 18:09:55 GMT" in report
+        assert "Online per-CVE lookup" in report
         assert "Final reboot requirement will be verified after installation in Phase 3." in report
         assert "YES EXPECTED" in report
         # Summary + tables
