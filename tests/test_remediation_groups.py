@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from markupsafe import escape
 
 from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.models import CveFindingRow, ServerAnalysis
@@ -189,8 +190,8 @@ def test_only_installed_binaries_appear_in_group():
     assert "uninstalled-bin" not in remediation_groups(rows)[0].binary_packages
 
 
-def render_report(rows, **context):
-    analysis = ServerAnalysis(
+def server_analysis(rows):
+    return ServerAnalysis(
         id=1,
         run_id=1,
         position=1,
@@ -198,17 +199,13 @@ def render_report(rows, **context):
         server_name="host",
         ip_address="127.0.0.1",
         display_name=None,
-        reported_cves=[row.cve for row in rows],
+        reported_cves=list(dict.fromkeys(row.cve for row in rows)),
         status="complete",
         findings=rows,
     )
-    run = SimpleNamespace(
-        id=1,
-        started_at="2026-01-01T00:00:00+00:00",
-        metadata_updated_at=None,
-        metadata_stale=False,
-        metadata_source=None,
-    )
+
+
+def template_env():
     template_dir = Path(__file__).resolve().parents[1] / "src/ec2patcher/templates"
     env = Environment(loader=FileSystemLoader(template_dir), autoescape=select_autoescape())
     env.filters.update(timestamp=format_timestamp, filesize=format_size)
@@ -221,7 +218,20 @@ def render_report(rows, **context):
         severities=SEVERITIES,
         nvd_status_labels=nvd.STATUS_LABELS,
     )
-    return env.get_template("server_report.html").render(
+    return env
+
+
+def render_report(rows, **context):
+    run = SimpleNamespace(
+        id=1,
+        started_at="2026-01-01T00:00:00+00:00",
+        metadata_updated_at=None,
+        metadata_stale=False,
+        metadata_source=None,
+    )
+    analysis = server_analysis(rows)
+    template = template_env().get_template("server_report.html")
+    return template.render(
         analysis=analysis,
         run=run,
         summary=summarize(analysis),
@@ -263,6 +273,66 @@ def test_group_row_shows_highest_cve_severity_not_first_row():
     assert f">{group.cvss_label}</span>" in main_cells
     assert "Medium" not in main_cells
     assert rows[0].cvss_label not in main_cells
+
+
+def perl_server_findings(open_status, detail):
+    """Perl fixture: one CVE needing action or investigation, five needing none (each spread
+    over several source packages, as Canonical reports perl and its split-out modules)."""
+    rows = [
+        finding(1, source_package="perl", status=open_status, detail=detail),
+        finding(101, cve="CVE-2026-00001", source_package="libperl-x", fixed=None,
+                status=cr.PACKAGE_NOT_INSTALLED),
+    ]  # fmt: skip
+    closed = [cr.ALREADY_FIXED, cr.NOT_AFFECTED, cr.PACKAGE_NOT_INSTALLED, cr.ALREADY_FIXED,
+              cr.NOT_AFFECTED]  # fmt: skip
+    for i, status in enumerate(closed, start=2):
+        rows.append(finding(i, source_package="perl", status=status))
+        rows.append(finding(100 + i, cve=f"CVE-2026-{i:05d}", source_package="perl-modules",
+                            fixed=None, status=cr.PACKAGE_NOT_INSTALLED))  # fmt: skip
+    return rows
+
+
+def render_run_page(rows):
+    analysis = server_analysis(rows)
+    run = SimpleNamespace(
+        id=1, is_running=False, status="complete", report_filename="perl.json",
+        report_uploaded_at=None, started_at=None, completed_at=None, metadata_updated_at=None,
+        metadata_stale=False, progress_message=None, metadata_warning=None, error=None,
+        servers=[analysis],
+    )  # fmt: skip
+    template = template_env().get_template("analysis_run.html")
+    return template.render(
+        run=run, summaries={analysis.id: summarize(analysis)}, version="test", active="reports"
+    )
+
+
+def test_perl_summary_counters_use_report_buckets():
+    for status, bucket in ((cr.PATCH_AVAILABLE, ACTION_REQUIRED), (cr.UNKNOWN, INVESTIGATE)):
+        summary = summarize(server_analysis(perl_server_findings(status, "")))
+        assert summary.by_bucket == {bucket: 1, NO_ACTION: 5} | {
+            k: 0 for k in (ACTION_REQUIRED, INVESTIGATE) if k != bucket
+        }
+        assert [t for _, t, _ in summary.buckets] == ["Action required", "Investigate", "No action"]
+        assert sum(summary.by_bucket.values()) == summary.reported == 6
+        assert summary.stale_apt == 0 and summary.stale_apt_hint == ""
+
+    rows = perl_server_findings(cr.ANALYSIS_ERROR, f"{cr.STALE_APT_DETAIL} Updated 30 days ago.")
+    summary = summarize(server_analysis(rows))
+    assert summary.by_bucket == {ACTION_REQUIRED: 0, INVESTIGATE: 1, NO_ACTION: 5}
+    assert summary.stale_apt == 1 and summary.stale_apt_hint == cr.STALE_APT_DETAIL
+
+    page = render_run_page(rows)
+    meta = page[page.index('<div class="server-meta">') :]
+    assert "Action required: 0</span>" in meta
+    assert "Investigate: 1</span>" in meta
+    assert "No action: 5</span>" in meta
+    assert "unresolved" not in meta
+    assert "1 inconclusive (APT lists not current)" in meta and "apt-get update" in meta
+
+    report = render_report(rows)
+    assert "Investigate: 1 CVE</span>" in report and "No action: 5 CVEs</span>" in report
+    assert "1 CVE(s) could not be concluded" in report
+    assert str(escape(cr.STALE_APT_DETAIL)) in report
 
 
 def test_report_flags_apt_lists_that_are_not_current():

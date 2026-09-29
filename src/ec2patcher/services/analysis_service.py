@@ -500,9 +500,20 @@ class ServerSummary:
     unresolved: int
     download_bytes: int
     by_severity: dict[str, int]  # per reported CVE; independent of the patch status
+    by_bucket: dict[str, int]  # reported CVEs per report bucket (bucket_for_status of cve_status)
+    stale_apt: int  # CVEs with an ANALYSIS_ERROR finding caused by stale APT package lists
 
     def count(self, *statuses: str) -> int:
         return sum(self.by_status.get(s, 0) for s in statuses)
+
+    @property
+    def buckets(self) -> list[tuple[str, str, int]]:
+        """(key, title, CVE count) for every report bucket, in report order."""
+        return [(key, title, self.by_bucket[key]) for key, title, _ in BUCKETS]
+
+    @property
+    def stale_apt_hint(self) -> str:
+        return cve_resolver.STALE_APT_DETAIL if self.stale_apt else ""
 
 
 @dataclass
@@ -547,6 +558,15 @@ def summarize(analysis: ServerAnalysis) -> ServerSummary:
     by_severity = dict.fromkeys(SEVERITIES, 0)
     for cve in cve_status:
         by_severity[severity.get(cve, UNKNOWN)] += 1
+    by_bucket = {key: 0 for key, _, _ in BUCKETS}
+    for status in cve_status.values():
+        by_bucket[bucket_for_status(status)] += 1
+    stale = {
+        f.cve
+        for f in analysis.findings
+        if f.status == cve_resolver.ANALYSIS_ERROR
+        and cve_resolver.STALE_APT_DETAIL in (f.detail or "")
+    }
     return ServerSummary(
         reported=len(analysis.reported_cves),
         by_status=dict(Counter(cve_status.values())),
@@ -556,4 +576,6 @@ def summarize(analysis: ServerAnalysis) -> ServerSummary:
         unresolved=sum(1 for p in analysis.plan if p.status != "planned"),
         download_bytes=sum(p.size or 0 for p in analysis.plan if p.deb_filename),
         by_severity=by_severity,
+        by_bucket=by_bucket,
+        stale_apt=len(stale & cve_status.keys()),
     )
