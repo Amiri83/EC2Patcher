@@ -45,6 +45,11 @@ NOTICES = {
     "deleted": "Server '{name}' was deleted.",
     "cleared": "All configured servers were removed ({count} deleted).",
     "not_found": "That server no longer exists.",
+    "cache_cleared": (
+        "Security lookup memory cleared. The next analysis will query Canonical again."
+    ),
+    "cache_clean": "Security lookup memory is already clear.",
+    "database_reset": "Database reset. All stored data was removed.",
 }
 
 
@@ -55,13 +60,14 @@ def _default_shutdown() -> None:
 
 
 STATUS_CLASSES = {
-    cve_resolver.PATCH_REQUIRED: "badge-danger",
+    cve_resolver.PATCH_AVAILABLE: "badge-danger",
     cve_resolver.ANALYSIS_ERROR: "badge-danger",
-    cve_resolver.CANDIDATE_UNAVAILABLE: "badge-warning",
-    cve_resolver.FIX_REQUIRES_PRO: "badge-warning",
-    cve_resolver.FIX_NOT_AVAILABLE: "badge-warning",
-    cve_resolver.NEEDS_EVALUATION: "badge-warning",
-    cve_resolver.IGNORED: "badge-neutral",
+    cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS: "badge-warning",
+    cve_resolver.PRO_OR_ESM_REQUIRED: "badge-warning",
+    cve_resolver.NO_FIX_PUBLISHED: "badge-warning",
+    cve_resolver.PENDING_OR_DEFERRED: "badge-warning",
+    cve_resolver.UNKNOWN: "badge-warning",
+    cve_resolver.METADATA_UNAVAILABLE: "badge-warning",
     cve_resolver.ALREADY_FIXED: "badge-success",
     cve_resolver.NOT_AFFECTED: "badge-success",
     cve_resolver.PACKAGE_NOT_INSTALLED: "badge-success",
@@ -397,6 +403,7 @@ def create_app(
             request, "server_report.html", "reports", run=run, analysis=analysis,
             summary=analysis_service.summarize(analysis),
             finding_groups=analysis_service.group_findings(analysis),
+            remediation_groups=analysis_service.remediation_groups(analysis.findings),
             is_latest=latest is not None and latest.id == run_id,
         )  # fmt: skip
 
@@ -421,7 +428,31 @@ def create_app(
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings(request: Request):
-        return render(request, "settings.html", "settings", db_path=db.path)
+        return render(
+            request, "settings.html", "settings", db_path=db.path,
+            metadata_status=metadata.status(), notice=notice_from_query(request),
+        )  # fmt: skip
+
+    @app.post("/settings/clear-cache")
+    def clear_security_cache():
+        removed = metadata.clear()
+        return redirect("/settings", notice="cache_cleared" if removed else "cache_clean")
+
+    @app.post("/settings/reset-database", response_class=HTMLResponse)
+    def reset_database(request: Request, confirm_text: str = Form("")):
+        if analyzer.is_running:
+            return render(
+                request, "settings.html", "settings", status_code=409, db_path=db.path,
+                metadata_status=metadata.status(),
+                error="Database cannot be reset during analysis.",
+            )  # fmt: skip
+        if confirm_text != "RESET":
+            return render(
+                request, "settings.html", "settings", status_code=400, db_path=db.path,
+                metadata_status=metadata.status(), error="Type RESET exactly to confirm.",
+            )  # fmt: skip
+        db.reset()
+        return redirect("/settings", notice="database_reset")
 
     # --- shutdown ------------------------------------------------------------
 

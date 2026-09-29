@@ -21,7 +21,7 @@ from ec2patcher.models import (
     Tag,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 _MIGRATIONS = {
     1: """
@@ -158,6 +158,91 @@ _MIGRATIONS = {
         ALTER TABLE cve_findings ADD COLUMN nvd_status TEXT;
         ALTER TABLE cve_findings ADD COLUMN nvd_note TEXT;
     """,
+    # Phase 3: settings and patch decisions/executions. An execution is a separate record
+    # linked to (never modifying) the analysis snapshot; at most one decision per analysis.
+    # Analysis ids are plain columns (no FK) so history is never lost with other data.
+    5: """
+        CREATE TABLE settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            updated_at  TEXT NOT NULL
+        );
+        CREATE TABLE patch_executions (
+            id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_run_id           INTEGER NOT NULL,
+            server_analysis_id        INTEGER NOT NULL UNIQUE,
+            server_id                 INTEGER REFERENCES servers(id) ON DELETE SET NULL,
+            server_name               TEXT NOT NULL,
+            display_name              TEXT,
+            ip_address                TEXT,
+            decision                  TEXT NOT NULL,
+            decided_at                TEXT NOT NULL,
+            state                     TEXT NOT NULL,
+            failure_stage             TEXT,
+            started_at                TEXT,
+            finished_at               TEXT,
+            updated_at                TEXT NOT NULL,
+            local_staging_path        TEXT,
+            remote_staging_path       TEXT,
+            local_staging_created     INTEGER NOT NULL DEFAULT 0,
+            remote_staging_created    INTEGER NOT NULL DEFAULT 0,
+            expected_reboot           INTEGER,
+            expected_reboot_reason    TEXT,
+            reboot_required_after     INTEGER,
+            reboot_required_packages  TEXT NOT NULL DEFAULT '[]',
+            error_title               TEXT,
+            error_summary             TEXT,
+            error_package             TEXT,
+            partial_state_possible    INTEGER NOT NULL DEFAULT 0,
+            cleanup_status            TEXT,
+            cleanup_detail            TEXT,
+            install_started_at        TEXT,
+            install_finished_at       TEXT,
+            install_exit_status       INTEGER,
+            install_output            TEXT,
+            simulation_output         TEXT,
+            audit_ok                  INTEGER,
+            audit_output              TEXT,
+            notes                     TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX idx_patch_executions_state ON patch_executions(state);
+        CREATE TABLE patch_execution_packages (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            execution_id         INTEGER NOT NULL
+                                 REFERENCES patch_executions(id) ON DELETE CASCADE,
+            binary_package       TEXT NOT NULL,
+            architecture         TEXT NOT NULL,
+            before_version       TEXT,
+            target_version       TEXT NOT NULL,
+            after_version        TEXT,
+            deb_filename         TEXT NOT NULL,
+            size                 INTEGER,
+            checksum             TEXT,
+            is_dependency        INTEGER NOT NULL DEFAULT 0,
+            download_result      TEXT,
+            checksum_result      TEXT,
+            transfer_result      TEXT,
+            install_result       TEXT,
+            verification_result  TEXT,
+            detail               TEXT
+        );
+        CREATE INDEX idx_patch_packages_execution ON patch_execution_packages(execution_id);
+        CREATE TABLE patch_execution_cves (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            execution_id       INTEGER NOT NULL REFERENCES patch_executions(id) ON DELETE CASCADE,
+            cve                TEXT NOT NULL,
+            source_package     TEXT,
+            fixed_version      TEXT,
+            resulting_version  TEXT,
+            result             TEXT NOT NULL,
+            detail             TEXT
+        );
+        CREATE INDEX idx_patch_cves_execution ON patch_execution_cves(execution_id);
+    """,
+    6: """
+        ALTER TABLE cve_findings ADD COLUMN apt_candidate TEXT;
+        ALTER TABLE cve_findings ADD COLUMN canonical_status TEXT;
+    """,
 }
 
 
@@ -256,17 +341,21 @@ def _row_to_server_analysis(row: sqlite3.Row) -> ServerAnalysis:
 
 
 def _row_to_finding(row: sqlite3.Row) -> CveFindingRow:
+    from ec2patcher.services.cve_resolver import current_status
+
     return CveFindingRow(
         id=row["id"],
         cve=row["cve"],
         source_package=row["source_package"],
         installed_version=row["installed_version"],
         fixed_version=row["fixed_version"],
-        status=row["status"],
+        status=current_status(row["status"]),
         detail=row["detail"],
         binary_packages=json.loads(row["binary_packages"] or "[]"),
         pocket=row["pocket"],
         priority=row["priority"],
+        apt_candidate=row["apt_candidate"],
+        canonical_status=row["canonical_status"],
         cvss_severity=row["cvss_severity"],
         cvss_score=row["cvss_score"],
         cvss_version=row["cvss_version"],
@@ -331,6 +420,26 @@ class Database:
             for target in range(version + 1, SCHEMA_VERSION + 1):
                 conn.executescript(_MIGRATIONS[target])
                 conn.execute(f"PRAGMA user_version = {int(target)}")
+
+    def reset(self) -> bool:
+        """Remove all stored data and recreate the current schema."""
+        for path in (
+            self.path,
+            *(
+                self.path.with_name(self.path.name + suffix)
+                for suffix in ("-journal", "-wal", "-shm")
+            ),
+        ):
+            path.unlink(missing_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migrate()
+        with self.connect() as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database reset failed: schema version {version}, expected {SCHEMA_VERSION}"
+            )
+        return True
 
     # --- servers -----------------------------------------------------------
 
@@ -562,12 +671,14 @@ class Database:
                 conn.execute(
                     "INSERT INTO cve_findings (server_analysis_id, cve, source_package, "
                     "installed_version, fixed_version, status, detail, binary_packages, pocket, "
-                    "priority, cvss_severity, cvss_score, cvss_version, cvss_vector, cvss_source, "
-                    "cvss_source_type, nvd_last_modified, nvd_status, nvd_note) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "priority, apt_candidate, canonical_status, cvss_severity, cvss_score, "
+                    "cvss_version, cvss_vector, cvss_source, cvss_source_type, "
+                    "nvd_last_modified, nvd_status, nvd_note) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         analysis_id, f.cve, f.source, f.installed_version, f.fixed_version,
                         f.status, f.detail, json.dumps(f.binaries), f.pocket, f.priority,
+                        f.apt_candidate, f.canonical_status,
                         *(
                             (c.severity, c.score, c.version, c.vector, c.source, c.source_type,
                              c.last_modified, c.status, c.note)

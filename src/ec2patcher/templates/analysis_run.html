@@ -14,7 +14,7 @@
     <dt>Started</dt><dd>{{ run.started_at|timestamp }}</dd>
     {% if run.completed_at %}<dt>Finished</dt><dd>{{ run.completed_at|timestamp }}</dd>{% endif %}
     <dt>Canonical security metadata</dt>
-    <dd>{% if run.metadata_updated_at %}Published {{ run.metadata_updated_at }}{% if run.metadata_checked_at %} &middot; cached {{ run.metadata_checked_at|timestamp }}{% endif %}{% else %}<span class="muted">not available</span>{% endif %}
+    <dd>{% if run.metadata_updated_at %}Online per-CVE lookup &middot; checked {{ run.metadata_checked_at|timestamp }}{% else %}<span class="muted">not available</span>{% endif %}
         {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}</dd>
   </dl>
   {% if run.is_running and run.progress_message %}
@@ -45,9 +45,9 @@
           {% elif s.status == "complete" %}
             <div class="server-meta">
               <span>{{ sm.reported }} CVE{{ "" if sm.reported == 1 else "s" }}</span>
-              <span class="{% if sm.count('PATCH_REQUIRED') %}text-danger{% endif %}">{{ sm.count("PATCH_REQUIRED") }} patch required</span>
+              <span class="{% if sm.count('PATCH_AVAILABLE') %}text-danger{% endif %}">{{ sm.count("PATCH_AVAILABLE") }} patch available</span>
               <span>{{ sm.count("ALREADY_FIXED", "NOT_AFFECTED", "PACKAGE_NOT_INSTALLED") }} no action</span>
-              {% set open = sm.count("CANDIDATE_UNAVAILABLE", "FIX_REQUIRES_PRO", "FIX_NOT_AVAILABLE", "NEEDS_EVALUATION", "IGNORED", "ANALYSIS_ERROR") %}
+              {% set open = sm.count("FIX_NOT_IN_CONFIGURED_REPOS", "PRO_OR_ESM_REQUIRED", "NO_FIX_PUBLISHED", "PENDING_OR_DEFERRED", "UNKNOWN", "METADATA_UNAVAILABLE", "ANALYSIS_ERROR") %}
               {% if open %}<span class="text-warning">{{ open }} unresolved / no fix</span>{% endif %}
               <span>{{ sm.packages }} package{{ "" if sm.packages == 1 else "s" }} to update</span>
               <span>Reboot: {% if s.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}no expected reboot{% endif %}</span>

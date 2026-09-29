@@ -104,4 +104,37 @@ def test_only_latest_report_kept(db):
 
 def test_schema_version_set(db):
     with sqlite3.connect(db.path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+
+
+def test_reset_recreates_current_schema_and_instance_remains_usable(db):
+    db.create_server("old", "10.0.0.1", "/k.pem")
+    db.save_report("old.json", {"old": ["CVE-2026-12345"]}, "VALID")
+    sidecars = [db.path.with_name(db.path.name + suffix) for suffix in ("-journal", "-wal", "-shm")]
+    for path in sidecars:
+        path.write_bytes(b"old")
+
+    assert db.reset()
+    assert all(not path.exists() for path in sidecars)
+    assert db.count_servers() == 0 and db.get_latest_report() is None
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert {
+            "servers",
+            "reports",
+            "server_tags",
+            "analysis_runs",
+            "server_analyses",
+            "cve_findings",
+            "package_plans",
+            "package_plan_cves",
+            "settings",
+        } <= tables
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(cve_findings)")}
+        assert "canonical_status" in columns
+        assert "apt_candidate" in columns
+    db.create_server("new", "10.0.0.2", "/k.pem")
+    assert db.get_server_by_name("new") is not None
