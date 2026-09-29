@@ -225,6 +225,12 @@ def parse_facts(stdout: str) -> ServerFacts:
     return facts
 
 
+def apt_lists_fresh(age_hours: float | None) -> bool:
+    """True only when the APT package lists are known to be recent enough to trust a
+    "fixed version not offered by APT" verdict. An unknown age is never assumed fresh."""
+    return age_hours is not None and age_hours <= APT_STALE_AFTER_HOURS
+
+
 def check_supported(facts: ServerFacts) -> str | None:
     """Return an error message if the server's OS is not a supported Ubuntu release."""
     if facts.os_id != "ubuntu":

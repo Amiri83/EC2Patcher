@@ -27,6 +27,7 @@ from ec2patcher.services import (
     excel_export,
     nvd,
     report_service,
+    server_state,
     ssh_service,
 )
 from ec2patcher.services.security_metadata import SecurityMetadata
@@ -399,11 +400,14 @@ def create_app(
     def server_report(request: Request, run_id: int, analysis_id: int):
         run, analysis = stored_server_report(run_id, analysis_id)
         latest = db.get_latest_analysis_run()
+        groups = analysis_service.remediation_groups(analysis.findings)
         return render(
             request, "server_report.html", "reports", run=run, analysis=analysis,
             summary=analysis_service.summarize(analysis),
             finding_groups=analysis_service.group_findings(analysis),
-            remediation_groups=analysis_service.remediation_groups(analysis.findings),
+            remediation_groups=groups,
+            finding_buckets=analysis_service.bucket_groups(groups),
+            apt_fresh=server_state.apt_lists_fresh(analysis.apt_age_hours),
             is_latest=latest is not None and latest.id == run_id,
         )  # fmt: skip
 

@@ -194,6 +194,29 @@ def test_all_status_types_reconcile(setup, metadata):
         assert summary.by_status.get(status), status
 
 
+def test_stale_apt_lists_never_yield_fix_not_in_repos(setup, metadata):
+    stale = facts_output(apt_stamp=1790460000 - 30 * 86400)
+    report = {GOOD: ALL_CVES, BAD: ["CVE-2026-63076"]}
+    ssh = ScriptedSSH(facts=stale)
+    good = run_analysis(setup, metadata, ssh, report=report).servers[0]
+    statuses = {f.status for f in good.findings}
+    assert cr.FIX_NOT_IN_CONFIGURED_REPOS not in statuses
+    assert cr.PATCH_AVAILABLE in statuses  # satisfying candidates are still trusted
+    inconclusive = [f for f in good.findings if cr.STALE_APT_DETAIL in (f.detail or "")]
+    assert inconclusive and all(f.status == cr.ANALYSIS_ERROR for f in inconclusive)
+    assert any("30.0 days ago" in w for w in good.warnings)
+    assert any("could not be confirmed as missing" in w for w in good.warnings)
+    # Freshness is enforced read-only: nothing refreshes the lists on the server.
+    assert not any("apt-get update" in args[-1] or "sudo" in args[-1] for args in ssh.calls)
+
+
+def test_fresh_apt_lists_add_no_inconclusive_warning(setup, metadata):
+    report = {GOOD: ALL_CVES, BAD: ["CVE-2026-63076"]}
+    good = run_analysis(setup, metadata, ScriptedSSH(), report=report).servers[0]
+    assert cr.FIX_NOT_IN_CONFIGURED_REPOS in {f.status for f in good.findings}
+    assert not any("could not be confirmed as missing" in w for w in good.warnings)
+
+
 def test_display_name_never_matches_report(db, pem_file, metadata):
     db.create_server("app-01", GOOD_IP, str(pem_file), tags=[("display_name", "ip-10-0-0-245")])
     db.save_report("r.json", {"app-01": ["CVE-2026-63076"]}, "VALID")
@@ -448,6 +471,12 @@ def test_analysis_progress_and_reports(web, pem_file):
         # Sources without an installed package remain visible as individual rows.
         assert "linux-gcp" in report
         assert "Package not installed" in report
+        assert "Repository Candidate" in report
+        # Findings are bucketed by status via the view helper; no-action rows are collapsed.
+        assert re.search(r"Action required: [1-9]\d*</span>", report)
+        assert '<details class="report-details bucket bucket-no_action">' in report
+        assert report.index("linux-gcp") > report.index("bucket-no_action")
+        assert "NOT CURRENT" not in report  # fixture APT lists are ~17h old
         assert "Repository Candidate" in report
         analysis_id = c.app.state.db.get_latest_analysis_run().servers[0].id
         for finding in c.app.state.db.get_server_analysis(analysis_id).findings:
