@@ -351,6 +351,7 @@ class RemediationGroup:
     binary_packages: list[str]
     pockets: list[str]
     rows: list
+    highest_row: object
 
 
 def remediation_groups(findings: list) -> list[RemediationGroup]:
@@ -398,6 +399,7 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
                 binary_packages=sorted({b for f in rows for b in f.binary_packages}),
                 pockets=sorted({f.pocket for f in rows if f.pocket}),
                 rows=rows,
+                highest_row=highest,
             )
         )
     return result

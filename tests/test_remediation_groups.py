@@ -88,8 +88,7 @@ def test_only_installed_binaries_appear_in_group():
     assert "uninstalled-bin" not in remediation_groups(rows)[0].binary_packages
 
 
-def test_report_html_shows_single_candidate_without_raw_apt_dump():
-    rows = [finding(1), finding(2)]
+def render_report(rows):
     analysis = ServerAnalysis(
         id=1,
         run_id=1,
@@ -121,7 +120,7 @@ def test_report_html_shows_single_candidate_without_raw_apt_dump():
         severities=SEVERITIES,
         nvd_status_labels=nvd.STATUS_LABELS,
     )
-    html = env.get_template("server_report.html").render(
+    return env.get_template("server_report.html").render(
         analysis=analysis,
         run=run,
         summary=summarize(analysis),
@@ -130,7 +129,34 @@ def test_report_html_shows_single_candidate_without_raw_apt_dump():
         version="test",
         active="reports",
     )
+
+
+def test_report_html_shows_single_candidate_without_raw_apt_dump():
+    rows = [finding(1), finding(2)]
+    html = render_report(rows)
     assert html.count("<strong>sample-source</strong>") == 1
     assert "2 CVEs" in html and "Affected CVEs" in html
     assert "<code>1:5.10-0ubuntu1.10</code>" in html
     assert rows[0].apt_candidate not in html
+
+
+def test_group_row_shows_highest_cve_severity_not_first_row():
+    rows = [
+        finding(1, cvss_severity="Medium", cvss_score=5.3),
+        finding(2, cvss_severity="Critical", cvss_score=9.8),
+        finding(3, cvss_severity="High", cvss_score=7.5),
+        finding(4, cvss_severity="Critical", cvss_score=9.8),
+    ]
+    group = remediation_groups(rows)[0]
+    assert group.highest_row is rows[1]
+    assert (group.severity, group.cvss_score) == ("Critical", 9.8)
+    assert group.cvss_label == rows[1].cvss_label != rows[0].cvss_label
+    assert group.highest_row.severity == group.severity
+
+    html = render_report(rows)
+    main_cells = html.split("</details>", 1)[1].split("<strong>sample-source</strong>", 1)[0]
+    assert f">{group.severity}</span>" in main_cells
+    assert '<td class="cvss">' in main_cells
+    assert f">{group.cvss_label}</span>" in main_cells
+    assert "Medium" not in main_cells
+    assert rows[0].cvss_label not in main_cells

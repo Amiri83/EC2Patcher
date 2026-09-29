@@ -95,8 +95,8 @@
                 </details>
               {% else %}<div><code>{{ g.cves[0] }}</code></div>{% endif %}
             </td>
-            <td>{{ severity_cell(g.rows[0]) }}</td>
-            <td>{{ cvss_cell(g.rows[0]) }}</td>
+            <td>{{ severity_cell(g.highest_row) }}</td>
+            <td class="cvss">{{ cvss_cell(g.highest_row) }}</td>
             <td><strong>{{ g.source or '-' }}</strong></td>
             <td><code>{{ g.installed_version or "-" }}</code></td>
             <td>{% if g.fixed_version %}<code>{{ g.fixed_version }}</code>{% for pocket in g.pockets %} <span class="muted small">({{ pocket }})</span>{% endfor %}{% else %}-{% endif %}</td>
