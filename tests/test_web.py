@@ -271,6 +271,17 @@ def test_upload_unknown_server(client, pem_file):
     assert "Unknown server: app-prod-99. This server is not configured in EC2Patcher." in r.text
 
 
+def test_unknown_server_error_is_specific_and_known_servers_can_still_upload(make_client, pem_file):
+    c = make_client()
+    add(c, "app-prod-01", "10.0.0.1", pem_file)
+    add(c, "app-prod-02", "10.0.0.2", pem_file)
+    bad = upload(c, {"app-prod-01": ["CVE-2026-12345"], "missing": ["CVE-2026-11111"]})
+    assert bad.status_code == 422
+    assert "Unknown server: missing" in bad.text
+    assert "Unknown server: app-prod-01" not in bad.text
+    assert upload(c, {"app-prod-01": ["CVE-2026-12345"]}).status_code == 200
+
+
 def test_failed_upload_keeps_previous_report(client, pem_file):
     add(client, "app-prod-01", "10.0.0.1", pem_file)
     upload(client, {"app-prod-01": ["CVE-2026-12345"]}, filename="good.json")

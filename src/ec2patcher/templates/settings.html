@@ -17,4 +17,20 @@
     <dt>SSH user</dt><dd><code>ubuntu</code> (fixed)</dd>
   </dl>
 </div>
+<div class="card">
+  <h2>Security Data</h2>
+  <p class="muted">{% if metadata_status.available %}Last checked: {{ (metadata_status.checked_at or metadata_status.downloaded_at) | timestamp }}{% else %}No security data cached.{% endif %}</p>
+  <form method="post" action="/settings/clear-cache">
+    <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Reset Database</h2>
+  <p class="muted">Permanently removes servers, reports, analyses, and settings.</p>
+  <form method="post" action="/settings/reset-database">
+    <label for="reset_confirm_text">Type <strong>RESET</strong> to confirm</label>
+    <input type="text" id="reset_confirm_text" name="confirm_text" autocomplete="off" data-required-text="RESET" placeholder="RESET">
+    <button type="submit" class="btn btn-danger" data-enable-when-confirmed>Reset Database</button>
+  </form>
+</div>
 {% endblock %}

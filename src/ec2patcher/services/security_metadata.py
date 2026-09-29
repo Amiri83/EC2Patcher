@@ -346,6 +346,21 @@ class SecurityMetadata:
     def archive_path(self) -> Path:
         return self.cache_dir / ARCHIVE_NAME
 
+    def clear(self) -> bool:
+        """Remove the persistent security metadata cache."""
+        with self._lock:
+            removed = False
+            for path in (
+                self.index_path,
+                self.archive_path,
+                self.archive_path.with_suffix(".part"),
+            ):
+                if path.exists():
+                    path.unlink()
+                    removed = True
+            self._last_error = None
+            return removed
+
     # --- index access ------------------------------------------------------------
 
     def _meta(self) -> dict[str, str]:

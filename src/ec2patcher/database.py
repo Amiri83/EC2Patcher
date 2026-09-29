@@ -421,6 +421,26 @@ class Database:
                 conn.executescript(_MIGRATIONS[target])
                 conn.execute(f"PRAGMA user_version = {int(target)}")
 
+    def reset(self) -> bool:
+        """Remove all stored data and recreate the current schema."""
+        for path in (
+            self.path,
+            *(
+                self.path.with_name(self.path.name + suffix)
+                for suffix in ("-journal", "-wal", "-shm")
+            ),
+        ):
+            path.unlink(missing_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migrate()
+        with self.connect() as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database reset failed: schema version {version}, expected {SCHEMA_VERSION}"
+            )
+        return True
+
     # --- servers -----------------------------------------------------------
 
     def list_servers(self) -> list[Server]:
