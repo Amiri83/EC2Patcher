@@ -294,6 +294,24 @@ def test_analysis_error_finding_blocks(h):
     assert not check.allowed and any("package mapping failed" in r for r in check.reasons)
 
 
+def test_metadata_unavailable_finding_blocks(h):
+    findings = [
+        *plan_findings(),
+        cr.Finding("CVE-2026-7", None, cr.METADATA_UNAVAILABLE, "Canonical unreachable"),
+    ]
+    analysis = h.analysis(finding_list=findings)
+    check = h.service.eligibility(analysis)
+    assert not check.allowed
+    assert any(
+        "1 CVE(s) not checked / Canonical metadata unavailable: CVE-2026-7" in r
+        for r in check.reasons
+    ), check.reasons
+    assert check.not_checked_warning.startswith("1 CVE not checked")
+    with pytest.raises(PatchNotAllowedError, match="metadata unavailable"):
+        h.service.approve(analysis.id)
+    assert h.fake.calls == [] and h.fetcher.calls == []
+
+
 def plan_findings():
     from phase3_fixtures import findings
 

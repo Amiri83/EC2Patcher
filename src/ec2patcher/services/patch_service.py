@@ -125,6 +125,15 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
         reasons.append(
             "Analysis errors (required package mapping failed) for: " + ", ".join(errors) + "."
         )
+    unavailable = sorted(
+        {f.cve for f in analysis.findings if f.status == cve_resolver.METADATA_UNAVAILABLE}
+    )
+    if unavailable:
+        reasons.append(
+            f"{len(unavailable)} CVE(s) not checked / Canonical metadata unavailable: "
+            + ", ".join(unavailable)
+            + ". Run a new analysis once the metadata is reachable."
+        )
     if not analysis.plan:
         reasons.append("There are no package updates to install.")
     for p in analysis.plan:
@@ -179,6 +188,30 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
+NOT_CHECKED_STATUSES = frozenset(
+    {cve_resolver.UNKNOWN, cve_resolver.METADATA_UNAVAILABLE, cve_resolver.ANALYSIS_ERROR}
+)
+
+
+def not_checked_cves(analysis: ServerAnalysis) -> list[str]:
+    """Reported CVEs whose fix status was not evaluated; the plan says nothing about them."""
+    cves = {f.cve for f in analysis.findings if f.status in NOT_CHECKED_STATUSES}
+    evaluated = {f.cve for f in analysis.findings}
+    cves.update(cve for cve in analysis.reported_cves if cve not in evaluated)
+    return sorted(cves)
+
+
+def not_checked_warning(analysis: ServerAnalysis) -> str | None:
+    """Keeps an empty or reduced package plan from reading as 'all clean'."""
+    count = len(not_checked_cves(analysis))
+    if not count:
+        return None
+    return (
+        f"{count} CVE{'' if count == 1 else 's'} not checked (metadata/key status unavailable). "
+        "The package plan does not cover them; this report does not mean the server is clean."
+    )
+
+
 @dataclass
 class Eligibility:
     allowed: bool
@@ -190,6 +223,7 @@ class Eligibility:
     debs: int = 0
     download_bytes: int = 0
     unpatched_notes: list[str] = field(default_factory=list)
+    not_checked_warning: str | None = None
 
 
 # --- execution context --------------------------------------------------------------
@@ -256,6 +290,7 @@ class PatchService:
             for f in analysis.findings
             if f.status in not_patchable
         ]
+        result.not_checked_warning = not_checked_warning(analysis)
         reasons = result.reasons
         try:
             result.remote_path = staging.remote_dir(analysis.server_name)
