@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from ec2patcher.database import _MIGRATIONS, Database, DuplicateTagKeyError
+from ec2patcher.database import _MIGRATIONS, SCHEMA_VERSION, Database, DuplicateTagKeyError
 from ec2patcher.validation import check_tags, tag_rows, validate_server_input
 
 
@@ -157,7 +157,18 @@ def test_phase1_database_migrates_in_place(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        finding_columns = {row[1] for row in conn.execute("PRAGMA table_info(cve_findings)")}
+        assert {"apt_candidate", "canonical_status"} <= finding_columns
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert {
+            "settings",
+            "patch_executions",
+            "patch_execution_packages",
+            "patch_execution_cves",
+        } <= tables
     conn.close()
     server = db.get_server_by_name("app-prod-01")
     assert (server.ip_address, server.pem_path, server.tags) == ("10.10.20.15", "/k.pem", [])

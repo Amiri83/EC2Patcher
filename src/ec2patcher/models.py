@@ -58,6 +58,8 @@ class CveFindingRow:
     binary_packages: list[str]
     pocket: str | None
     priority: str | None  # raw Canonical priority captured at analysis time
+    apt_candidate: str | None = None
+    canonical_status: str | None = None
     # NVD CVSS snapshot captured at analysis time (Phase 2.2); all None for older findings.
     cvss_severity: str | None = None
     cvss_score: float | None = None

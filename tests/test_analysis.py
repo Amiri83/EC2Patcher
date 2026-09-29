@@ -4,7 +4,6 @@ import json
 import re
 import sqlite3
 import subprocess
-from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,11 +11,10 @@ from phase2_fixtures import (
     ALL_CVES,
     REAL_REPORT,
     ScriptedSSH,
-    archive_fetcher,
     facts_output,
     failing_fetcher,
     make_metadata,
-    make_vex_archive,
+    online_fetcher,
 )
 from test_tags import save
 from test_web import upload
@@ -63,7 +61,10 @@ def test_real_report_shape_end_to_end(setup, metadata):
     ssh = ScriptedSSH(failures=AUTH_FAILURE)
     run = run_analysis(setup, metadata, ssh)
     assert run.status == "completed_with_errors"
-    assert run.metadata_updated_at == "Fri, 25 Sep 2026 18:09:55 GMT" and not run.metadata_stale
+    assert (
+        run.metadata_source == "Canonical Security API (online per-CVE lookup)"
+        and not run.metadata_stale
+    )
     good, bad = run.servers
     assert (good.server_name, good.status, good.display_name) == (GOOD, "complete", "Billing API")
     assert (good.os_codename, good.architecture, good.running_kernel) == (
@@ -78,9 +79,9 @@ def test_real_report_shape_end_to_end(setup, metadata):
     summary = summarize(good)
     assert summary.reported == 3
     assert summary.cve_status == {
-        "CVE-2026-63076": cr.PATCH_REQUIRED,
-        "CVE-2026-54874": cr.PATCH_REQUIRED,
-        "CVE-2026-63075": cr.PATCH_REQUIRED,
+        "CVE-2026-63076": cr.PATCH_AVAILABLE,
+        "CVE-2026-54874": cr.PATCH_AVAILABLE,
+        "CVE-2026-63075": cr.PATCH_AVAILABLE,
     }
     assert summary.packages == 6 and summary.debs == 6 and summary.unresolved == 0
     assert summary.download_bytes == 1940000 + 1003000 + 30500000 + 14600000 + 2400 + 1700
@@ -152,23 +153,14 @@ def test_malformed_remote_output(setup, metadata):
     assert good.status == "failed" and "Malformed remote output" in good.error
 
 
-def test_metadata_unavailable_fails_without_guessing(setup, tmp_path):
-    meta = SecurityMetadata(tmp_path / "empty", fetcher=failing_fetcher())
+def test_lookup_failure_reports_unknown_and_continues_discovery(setup, tmp_path):
+    meta = SecurityMetadata(fetcher=failing_fetcher())
     ssh = ScriptedSSH()
     run = run_analysis(setup, meta, ssh)
-    assert run.status == "failed" and "Canonical security metadata is unavailable" in run.error
-    assert all(s.status == "failed" and not s.findings for s in run.servers)
-    assert ssh.calls == []  # no server was touched without metadata
-
-
-def test_stale_metadata_is_used_and_flagged(setup, tmp_path):
-    archive = make_vex_archive(tmp_path / "a.tar.xz")
-    meta = SecurityMetadata(tmp_path / "c", fetcher=archive_fetcher(archive), max_age=timedelta(0))
-    meta.refresh()
-    meta.fetcher = failing_fetcher()
-    run = run_analysis(setup, meta, ScriptedSSH())
-    assert run.metadata_stale and "STALE DATA" in run.metadata_warning
-    assert run.servers[0].status == "complete"
+    assert run.status == "completed"
+    assert all(s.status == "complete" for s in run.servers)
+    assert all(f.status == cr.METADATA_UNAVAILABLE for s in run.servers for f in s.findings)
+    assert len(ssh.calls) == 2  # facts only; no candidate check or package plan
 
 
 def test_plan_failure_keeps_required_updates_visible(setup, metadata):
@@ -177,7 +169,7 @@ def test_plan_failure_keeps_required_updates_visible(setup, metadata):
     assert good.status == "complete"
     assert good.plan and all(p.status == "unresolved" and p.deb_filename is None for p in good.plan)
     assert all("Unable to resolve package download plan" in p.reason for p in good.plan)
-    assert summarize(good).cve_status["CVE-2026-63076"] == cr.PATCH_REQUIRED
+    assert summarize(good).cve_status["CVE-2026-63076"] == cr.PATCH_AVAILABLE
 
 
 def test_candidate_query_failure_marks_errors(setup, metadata):
@@ -196,8 +188,8 @@ def test_all_status_types_reconcile(setup, metadata):
     summary = summarize(good)
     assert summary.reported == len(ALL_CVES) + 1 == sum(summary.by_status.values())
     for status in (
-        cr.PATCH_REQUIRED, cr.ALREADY_FIXED, cr.PACKAGE_NOT_INSTALLED, cr.FIX_NOT_AVAILABLE,
-        cr.FIX_REQUIRES_PRO, cr.CANDIDATE_UNAVAILABLE, cr.NEEDS_EVALUATION, cr.IGNORED,
+        cr.PATCH_AVAILABLE, cr.ALREADY_FIXED, cr.PACKAGE_NOT_INSTALLED, cr.NO_FIX_PUBLISHED,
+        cr.PRO_OR_ESM_REQUIRED, cr.FIX_NOT_IN_CONFIGURED_REPOS, cr.UNKNOWN, cr.PENDING_OR_DEFERRED,
     ):  # fmt: skip
         assert summary.by_status.get(status), status
 
@@ -308,10 +300,8 @@ def test_phase2_migration_keeps_existing_data(db_path):
 
 @pytest.fixture
 def web(db_path, tmp_path):
-    archive = make_vex_archive(tmp_path / "fixture.tar.xz")
-
     def factory(ssh=None, fetcher=None):
-        meta = SecurityMetadata(tmp_path / "web-cache", fetcher=fetcher or archive_fetcher(archive))
+        meta = SecurityMetadata(tmp_path / "web-cache", fetcher=fetcher or online_fetcher())
         app = create_app(
             db_path=db_path, ssh_runner=ssh or ScriptedSSH(failures=AUTH_FAILURE),
             metadata=meta, analysis_starter=sync, shutdown_handler=lambda: None,
@@ -331,11 +321,79 @@ def test_analyze_button_only_after_valid_report(web, pem_file):
         page = c.get("/reports").text
         assert "Pre-Patch Analysis" in page and "Upload a valid report to enable analysis." in page
         assert 'action="/reports/analyze"' not in page
-        assert "Not downloaded yet" in page
+        assert "Canonical security data is queried online per CVE" in page
+        assert "Upload Report" in page and "Upload &amp; Validate" not in page
+        assert ">Validate</button>" not in page
         add_servers(c, pem_file)
         upload(c, REAL_REPORT)
         page = c.get("/reports").text
         assert 'action="/reports/analyze"' in page and "Analyze Report" in page
+
+
+def test_upload_does_not_start_analysis_or_contact_remote_services(web, pem_file, db_path):
+    ssh = ScriptedSSH()
+    c = web(ssh=ssh)
+    metadata = c.app.state.analyzer.metadata
+    fetch = metadata.fetcher
+    fetch_calls = []
+
+    def tracked_fetch(*args):
+        fetch_calls.append(args)
+        return fetch(*args)
+
+    metadata.fetcher = tracked_fetch
+    add_servers(c, pem_file)
+    assert upload(c, {GOOD: ["CVE-2026-63076"]}).status_code == 200
+    db = Database(db_path)
+    assert db.get_latest_report() is not None
+    assert db.list_analysis_runs() == []
+    assert fetch_calls == [] and ssh.calls == []
+    assert c.post("/reports/analyze", follow_redirects=False).status_code == 303
+    assert len(db.list_analysis_runs()) == 1
+    assert fetch_calls and ssh.calls
+    assert all(call[0].startswith("https://ubuntu.com/security/cves/CVE-") for call in fetch_calls)
+
+
+@pytest.mark.parametrize("included", [(GOOD,), (GOOD, BAD)])
+def test_report_subset_only_analyzes_named_inventory_servers(web, pem_file, db_path, included):
+    omitted = "inventory-only"
+    c = web(ssh=ScriptedSSH())
+    add_servers(c, pem_file)
+    save(c, omitted, "192.0.2.216", pem_file)
+    report = {name: ["CVE-2026-63076"] for name in included}
+    assert upload(c, report).status_code == 200
+    db = Database(db_path)
+    assert db.get_latest_report().servers == report
+    assert db.list_analysis_runs() == []
+    assert c.post("/reports/analyze", follow_redirects=False).status_code == 303
+    run = db.get_latest_analysis_run()
+    assert [server.server_name for server in run.servers] == list(included)
+    assert db.get_server_by_name(omitted) is not None
+
+
+def test_settings_cache_and_database_controls_are_independent(web, pem_file, db_path):
+    c = web()
+    add_servers(c, pem_file)
+    assert upload(c, {GOOD: ["CVE-2026-63076"]}).status_code == 200
+    db = Database(db_path)
+    page = c.get("/settings").text
+    assert 'action="/settings/clear-cache"' in page
+    assert 'action="/settings/reset-database"' in page
+    assert c.post("/settings/clear-cache", follow_redirects=True).status_code == 200
+    assert db.get_latest_report() is not None and db.count_servers() == 2
+
+    denied = c.post("/settings/reset-database", data={"confirm_text": "wrong"})
+    assert denied.status_code == 400 and db.count_servers() == 2
+    c.app.state.analyzer._running = True
+    try:
+        busy = c.post("/settings/reset-database", data={"confirm_text": "RESET"})
+        assert busy.status_code == 409 and db.count_servers() == 2
+    finally:
+        c.app.state.analyzer._running = False
+    done = c.post("/settings/reset-database", data={"confirm_text": "RESET"}, follow_redirects=True)
+    assert done.status_code == 200 and "Database reset" in done.text
+    assert str(db_path) in done.text
+    assert db.count_servers() == 0 and db.get_latest_report() is None
 
 
 def test_analyze_without_report(web):
@@ -358,7 +416,7 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "Permission denied (publickey)" in page
         assert "Billing API" in page
         assert '<meta http-equiv="refresh"' not in page  # finished runs do not auto-refresh
-        assert "3 patch required" in page and "Reboot: <strong>YES EXPECTED</strong>" in page
+        assert "3 patch available" in page and "Reboot: <strong>YES EXPECTED</strong>" in page
 
         links = re.findall(r'href="(/analysis/\d+/servers/\d+)"', page)
         assert len(links) == 2
@@ -371,7 +429,7 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "<dt>Ubuntu</dt><dd>Ubuntu 24.04.3 LTS</dd>" in report
         assert "<dt>Codename</dt><dd>noble</dd>" in report
         assert "<dt>Running Kernel</dt><dd>6.8.0-1021-aws</dd>" in report
-        assert "Fri, 25 Sep 2026 18:09:55 GMT" in report
+        assert "Online per-CVE lookup" in report
         assert "Final reboot requirement will be verified after installation in Phase 3." in report
         assert "YES EXPECTED" in report
         # Summary + tables
@@ -387,9 +445,14 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "libssl3t64_3.0.13-0ubuntu3.6_amd64.deb" in report
         assert "linux-image-6.8.0-1024-aws_6.8.0-1024.26_amd64.deb" in report
         assert "Reboot expected (new kernel)" in report
-        # Kernel flavours that are not installed are collapsed, not dropped.
-        assert "3 other source packages" in report
-        assert "<code>linux-gcp</code>" in report
+        # Sources without an installed package remain visible as individual rows.
+        assert "linux-gcp" in report
+        assert "Package not installed" in report
+        assert "Repository Candidate" in report
+        analysis_id = c.app.state.db.get_latest_analysis_run().servers[0].id
+        for finding in c.app.state.db.get_server_analysis(analysis_id).findings:
+            if finding.apt_candidate and "; " in finding.apt_candidate:
+                assert finding.apt_candidate not in report
         assert "Technical details" in report and "--print-uris" in report
         assert "http://security.ubuntu.com/ubuntu/pool/main/o/openssl/" in report
         # Failed server report is explicit.
@@ -489,7 +552,7 @@ def test_group_findings_collapses_not_installed_rows(setup, metadata):
     groups = {g.cve: g for g in group_findings(good)}
     assert list(groups) == REAL_REPORT[GOOD]  # report order
     kernel = groups["CVE-2026-54874"]
-    assert kernel.status == cr.PATCH_REQUIRED
+    assert kernel.status == cr.PATCH_AVAILABLE
     assert [f.source_package for f in kernel.rows] == ["linux-aws", "linux-signed-aws"]
     assert sorted(f.source_package for f in kernel.not_installed) == [
         "linux", "linux-azure", "linux-gcp",

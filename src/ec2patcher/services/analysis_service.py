@@ -23,9 +23,16 @@ from datetime import datetime, timezone
 
 from ec2patcher.database import Database
 from ec2patcher.models import ServerAnalysis, StoredReport
-from ec2patcher.services import apt_planner, cve_resolver, nvd, server_state, ssh_service
+from ec2patcher.services import (
+    apt_planner,
+    cve_resolver,
+    debversion,
+    nvd,
+    server_state,
+    ssh_service,
+)
 from ec2patcher.services.security_metadata import SecurityMetadata
-from ec2patcher.services.severity import SEVERITIES, UNKNOWN
+from ec2patcher.services.severity import SEVERITIES, UNKNOWN, normalize_severity
 
 logger = logging.getLogger(__name__)
 
@@ -122,26 +129,19 @@ class AnalysisService:
             self.db.update_analysis_run(run_id, progress_message=message)
 
         progress("Checking Canonical security metadata")
+        self.metadata.start_run()
         meta = self.metadata.ensure_fresh(progress)
+        metadata_warning = meta.warning
+        if not meta.available:
+            metadata_warning = f"Canonical security metadata is unavailable: {meta.error}"
         self.db.update_analysis_run(
             run_id,
             metadata_source=meta.source,
             metadata_updated_at=meta.updated_label if meta.available else None,
             metadata_checked_at=meta.checked_at or meta.downloaded_at,
             metadata_stale=meta.stale,
-            metadata_warning=meta.warning,
+            metadata_warning=metadata_warning,
         )
-        if not meta.available:
-            message = f"Canonical security metadata is unavailable: {meta.error}"
-            for analysis in run.servers:
-                self.db.update_server_analysis(
-                    analysis.id, status="failed", completed_at=_now(), error=message
-                )
-            self.db.update_analysis_run(
-                run_id, status="failed", completed_at=_now(), progress_message=None, error=message
-            )
-            logger.warning("Analysis run %s failed: %s", run_id, message)
-            return
 
         self.nvd.start_run()
         failures = 0
@@ -214,7 +214,19 @@ class AnalysisService:
             return unsupported
 
         warnings = list(facts.warnings)
-        findings = cve_resolver.resolve_all(analysis.reported_cves, self.metadata.lookup, facts)
+        metadata_status = self.metadata.status()
+        lookup = self.metadata.lookup if metadata_status.available else (lambda _cve: None)
+        findings = cve_resolver.resolve_all(analysis.reported_cves, lookup, facts)
+        if not metadata_status.available:
+            warning = f"Canonical security metadata is unavailable: {metadata_status.error}"
+            warnings.append(warning)
+            for finding in findings:
+                finding.status = cve_resolver.METADATA_UNAVAILABLE
+                finding.detail = warning
+        elif any(f.status == cve_resolver.METADATA_UNAVAILABLE for f in findings):
+            warnings.append("Some Canonical metadata lookups failed; those CVEs remain unresolved.")
+        elif any(f.status == cve_resolver.UNKNOWN for f in findings):
+            warnings.append("Some CVEs have no usable Canonical statement for this Ubuntu release.")
         candidates: dict[str, apt_planner.Candidate] = {}
         requests: list[tuple[str, str]] = []
         query = cve_resolver.candidate_query_packages(findings, facts)
@@ -295,7 +307,7 @@ class AnalysisService:
         installed = facts.by_name()
         cves_by_source: dict[str, set[str]] = {}
         for f in findings:
-            if f.status == cve_resolver.PATCH_REQUIRED and f.source:
+            if f.status == cve_resolver.PATCH_AVAILABLE and f.source:
                 cves_by_source.setdefault(f.source, set()).add(f.cve)
         entries = []
         for name, version in requests:
@@ -321,6 +333,77 @@ class AnalysisService:
 
 
 # --- presentation helpers -------------------------------------------------------------
+
+
+@dataclass
+class RemediationGroup:
+    source: str | None
+    cves: list[str]
+    cve_count: int
+    severity: str
+    cvss_score: float | None
+    cvss_label: str
+    ubuntu_priority: str | None
+    installed_version: str | None
+    fixed_version: str | None
+    candidate_version: str | None
+    status: str
+    detail: str | None
+    binary_packages: list[str]
+    pockets: list[str]
+    rows: list
+    highest_row: object
+
+
+def remediation_groups(findings: list) -> list[RemediationGroup]:
+    """Collapse findings with the same source and fix for report presentation only."""
+    grouped: dict[tuple[str, str], list] = {}
+    ungrouped = []
+    for finding in findings:
+        if finding.source_package and finding.fixed_version:
+            grouped.setdefault((finding.source_package, finding.fixed_version), []).append(finding)
+        else:
+            ungrouped.append([finding])
+
+    result = []
+    for rows in [*([grouped[key] for key in sorted(grouped)]), *ungrouped]:
+        first = rows[0]
+        versions = [f.installed_version for f in rows if f.installed_version]
+        candidates = []
+        for f in rows:
+            for item in (f.apt_candidate or "").split("; "):
+                if ": " in item:
+                    version = item.rsplit(": ", 1)[1]
+                    if debversion.is_valid_version(version):
+                        candidates.append(version)
+        status = cve_resolver.rollup_status([f.status for f in rows])
+        highest = max(rows, key=lambda f: f.cvss_score if f.cvss_score is not None else -1)
+        detail = next((f.detail for f in rows if f.status == status and f.detail), None)
+        if status == cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS:
+            detail = "The configured repositories do not offer the fixed version."
+        result.append(
+            RemediationGroup(
+                source=first.source_package,
+                cves=sorted({f.cve for f in rows}),
+                cve_count=len({f.cve for f in rows}),
+                severity=min((normalize_severity(f.severity) for f in rows), key=SEVERITIES.index),
+                cvss_score=highest.cvss_score,
+                cvss_label=highest.cvss_label,
+                ubuntu_priority=next((f.priority for f in rows if f.priority), None),
+                installed_version=min(versions, key=debversion.version_key) if versions else None,
+                fixed_version=first.fixed_version,
+                candidate_version=(
+                    max(candidates, key=debversion.version_key) if candidates else None
+                ),
+                status=status,
+                detail=detail,
+                binary_packages=sorted({b for f in rows for b in f.binary_packages}),
+                pockets=sorted({f.pocket for f in rows if f.pocket}),
+                rows=rows,
+                highest_row=highest,
+            )
+        )
+    return result
 
 
 @dataclass
