@@ -21,10 +21,10 @@ from phase2_fixtures import (
     FIXED_NOTE,
     REAL_REPORT,
     ScriptedSSH,
-    archive_fetcher,
     facts_output,
     failing_fetcher,
-    make_vex_archive,
+    online_fetcher,
+    parse_fixture_document,
     statement,
     vex_doc,
 )
@@ -41,7 +41,6 @@ from ec2patcher.services import excel_export as xl
 from ec2patcher.services.security_metadata import (
     SecurityMetadata,
     VexEntry,
-    parse_vex_document,
 )
 from ec2patcher.services.server_state import parse_facts
 from ec2patcher.services.severity import normalize_severity
@@ -112,7 +111,7 @@ def test_priority_from_real_canonical_note_no_longer_drives_severity(word, expec
 
 
 def test_missing_priority_is_unknown():
-    record = parse_vex_document(DOCS[0])  # openssl statements carry no priority note
+    record = parse_fixture_document(DOCS[0])  # openssl statements carry no priority note
     facts = parse_facts(facts_output())
     (finding,) = cr.resolve_cve("CVE-2026-63076", record, facts)
     assert finding.priority is None and finding.severity == "Unknown"
@@ -138,10 +137,10 @@ def severity_docs():
 
 @pytest.fixture
 def web(db_path, tmp_path):
-    archive = make_vex_archive(tmp_path / "sev.tar.xz", severity_docs())
-
     def factory(ssh=None, fetcher=None, nvd_transport=None):
-        meta = SecurityMetadata(tmp_path / "web-cache", fetcher=fetcher or archive_fetcher(archive))
+        meta = SecurityMetadata(
+            tmp_path / "web-cache", fetcher=fetcher or online_fetcher(severity_docs())
+        )
         nvd_client = make_nvd_client(tmp_path, nvd_transport or FakeNvd(REPORT_CVES))
         app = create_app(
             db_path=db_path, ssh_runner=ssh or ScriptedSSH(failures=AUTH_FAILURE),
@@ -203,9 +202,8 @@ def test_severity_column_rendered(web, analyzed):
 
 def test_severity_survives_restart_and_metadata_change(web, analyzed, tmp_path):
     good = analyzed.servers[0]
-    other = make_vex_archive(tmp_path / "plain.tar.xz")  # no priorities at all
     changed = FakeNvd({})  # NVD now knows none of the CVEs
-    with web(fetcher=archive_fetcher(other), nvd_transport=changed) as c:
+    with web(fetcher=online_fetcher(), nvd_transport=changed) as c:
         page = c.get(f"/analysis/{analyzed.id}/servers/{good.id}").text
     assert ">Critical</span>" in page and ">High</span>" in page
     assert "Ubuntu Priority: Critical" in page
@@ -272,7 +270,7 @@ def test_export_summary_matches_stored_snapshot(web, analyzed):
     assert s["Codename"] == "noble"
     assert s["Architecture"] == "amd64"
     assert s["Running Kernel"] == "6.8.0-1021-aws"
-    assert s["Canonical Security Metadata"].startswith("Published Fri, 25 Sep 2026 18:09:55 GMT")
+    assert s["Canonical Security Metadata"].startswith("Online per-CVE lookup")
     assert s["Canonical Metadata Stale"] == "NO"
     assert s["APT Metadata"].startswith("Updated ") and "hours before analysis" in s["APT Metadata"]
     assert s["Current Reboot Required"] == "NO"
@@ -555,4 +553,4 @@ def test_vex_statement_helper_still_builds_priority_notes():
         statement("CVE-2026-9", "affected", [("bash", "5.2", "noble")],
                   status_notes=priority_note("critical")),
     )  # fmt: skip
-    assert parse_vex_document(doc).entries[0].priority == "Critical"
+    assert parse_fixture_document(doc).entries[0].priority == "Critical"

@@ -19,7 +19,7 @@
 </div>
 <div class="card">
   <h2>Security Data</h2>
-  <p class="muted">{% if metadata_status.available %}Last checked: {{ (metadata_status.checked_at or metadata_status.downloaded_at) | timestamp }}{% else %}No security data cached.{% endif %}</p>
+  <p class="muted">Canonical security data is queried online per CVE during analysis. Repeated lookups are kept in memory until cleared or restart.</p>
   <form method="post" action="/settings/clear-cache">
     <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
   </form>

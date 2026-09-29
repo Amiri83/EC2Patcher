@@ -7,16 +7,16 @@ from phase2_fixtures import (
     PLAN_OUTPUT,
     candidates_output,
     facts_output,
+    parse_fixture_document,
     statement,
     vex_doc,
 )
 
 from ec2patcher.services import apt_planner
 from ec2patcher.services import cve_resolver as cr
-from ec2patcher.services.security_metadata import parse_vex_document
 from ec2patcher.services.server_state import parse_facts
 
-RECORDS = {r.cve: r for r in (parse_vex_document(d) for d in DOCS)}
+RECORDS = {r.cve: r for r in (parse_fixture_document(d) for d in DOCS)}
 
 
 def facts(**kwargs):
@@ -73,7 +73,7 @@ def test_under_investigation():
 
 def test_ignored_no_fix_planned():
     f = single("CVE-2026-10002")
-    assert f.status == cr.PENDING_OR_DEFERRED and "decided to not fix" in f.detail
+    assert f.status == cr.PENDING_OR_DEFERRED and "ignored" in f.detail
 
 
 def test_fix_requires_pro():
@@ -294,18 +294,18 @@ def test_multiple_binaries_one_source_share_versions():
     doc = vex_doc(
         "CVE-2026-7", statement("CVE-2026-7", "fixed", [("curl", "8.5.0-2ubuntu10.7", "noble")])
     )
-    findings = cr.resolve_cve("CVE-2026-7", parse_vex_document(doc), facts())
+    findings = cr.resolve_cve("CVE-2026-7", parse_fixture_document(doc), facts())
     assert findings[0].binaries == ["curl", "libcurl4t64:amd64"]
     assert findings[0].status == cr.FIX_NOT_IN_CONFIGURED_REPOS
 
 
 def test_cve_only_tracked_for_unsupported_releases_is_not_reported_safe():
     doc = vex_doc("CVE-2016-1", statement("CVE-2016-1", "fixed", [("foo", "1.0-1", "xenial")]))
-    findings = cr.resolve_cve("CVE-2016-1", parse_vex_document(doc), facts())
+    findings = cr.resolve_cve("CVE-2016-1", parse_fixture_document(doc), facts())
     assert [(f.source, f.status) for f in findings] == [(None, cr.UNKNOWN)]
 
 
 def test_cve_tracked_for_other_supported_release_only_is_unknown():
     doc = vex_doc("CVE-2026-8", statement("CVE-2026-8", "fixed", [("foo", "1.0-1", "jammy")]))
-    findings = cr.resolve_cve("CVE-2026-8", parse_vex_document(doc), facts())
+    findings = cr.resolve_cve("CVE-2026-8", parse_fixture_document(doc), facts())
     assert [(f.source, f.status) for f in findings] == [(None, cr.UNKNOWN)]

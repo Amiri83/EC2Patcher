@@ -137,9 +137,9 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
     ]
 
     if run.metadata_updated_at:
-        metadata = f"Published {run.metadata_updated_at}"
+        metadata = "Online per-CVE lookup"
         if run.metadata_checked_at:
-            metadata += f" · cached {format_timestamp(run.metadata_checked_at)}"
+            metadata += f" · checked {format_timestamp(run.metadata_checked_at)}"
     else:
         metadata = "not available"
     rows += [

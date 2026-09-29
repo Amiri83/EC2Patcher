@@ -45,8 +45,10 @@ NOTICES = {
     "deleted": "Server '{name}' was deleted.",
     "cleared": "All configured servers were removed ({count} deleted).",
     "not_found": "That server no longer exists.",
-    "cache_cleared": "Security cache cleared. The next analysis will download fresh data.",
-    "cache_clean": "Security cache is already clear.",
+    "cache_cleared": (
+        "Security lookup memory cleared. The next analysis will query Canonical again."
+    ),
+    "cache_clean": "Security lookup memory is already clear.",
     "database_reset": "Database reset. All stored data was removed.",
 }
 
