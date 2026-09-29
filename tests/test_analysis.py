@@ -11,6 +11,7 @@ from phase2_fixtures import (
     ALL_CVES,
     REAL_REPORT,
     ScriptedSSH,
+    apt_operands,
     facts_output,
     failing_fetcher,
     make_metadata,
@@ -22,6 +23,7 @@ from test_web import upload
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
 from ec2patcher.services import cve_resolver as cr
+from ec2patcher.services import server_state
 from ec2patcher.services.analysis_service import AnalysisService, summarize
 from ec2patcher.services.security_metadata import SecurityMetadata
 
@@ -90,18 +92,19 @@ def test_real_report_shape_end_to_end(setup, metadata):
     assert summarize(bad).cve_status == {"CVE-2026-63076": "NOT_ANALYZED"}
 
 
-def test_ssh_is_fixed_user_argument_list_without_shell(setup, metadata, pem_file):
+def test_ssh_is_fixed_user_argument_list_without_shell(setup, metadata, pem_file, fake_apt):
     ssh = ScriptedSSH()
     run_analysis(setup, metadata, ssh)
-    assert len(ssh.calls) == 6  # facts + APT candidates + APT plan, for each of the 2 servers
+    assert len(ssh.calls) == 2  # only the read-only facts command, once per server
     for args in ssh.calls:
         assert args[0] == "ssh" and args[1:3] == ["-i", str(pem_file)]
         assert args[-2] in (f"ubuntu@{GOOD_IP}", f"ubuntu@{BAD_IP}")
         remote = args[-1]
-        assert "sudo" not in remote
-        for cmd in re.findall(r"apt-get[^;]*", remote):
-            assert " -s " in cmd or "--print-uris" in cmd, cmd  # never a real install
+        assert remote == server_state.FACTS_COMMAND
+        assert "sudo" not in remote and "apt-get" not in remote and "apt-cache" not in remote
         assert "dpkg -i" not in remote and "scp" not in remote and "reboot " not in remote
+    # Candidates and the plan were resolved locally instead.
+    assert fake_apt.updates and any("--print-uris" in c for c in fake_apt.calls)
 
 
 def test_no_install_download_or_reboot_anywhere(setup, metadata, monkeypatch):
@@ -163,22 +166,22 @@ def test_lookup_failure_reports_unknown_and_continues_discovery(setup, tmp_path)
     assert len(ssh.calls) == 2  # facts only; no candidate check or package plan
 
 
-def test_plan_failure_keeps_required_updates_visible(setup, metadata):
-    plan = "@@EC2P simulate\nE: Unable to correct problems\n@@EC2P simulate-rc\n100\n@@EC2P uris\n@@EC2P uris-rc\n100\n@@EC2P end\n"  # noqa: E501
-    good = run_analysis(setup, metadata, ScriptedSSH(plan=plan)).servers[0]
+def test_plan_failure_keeps_required_updates_visible(setup, metadata, fake_apt):
+    fake_apt.plan = "@@EC2P simulate\nE: Unable to correct problems\n@@EC2P simulate-rc\n100\n@@EC2P uris\n@@EC2P uris-rc\n100\n@@EC2P end\n"  # noqa: E501
+    good = run_analysis(setup, metadata, ScriptedSSH()).servers[0]
     assert good.status == "complete"
     assert good.plan and all(p.status == "unresolved" and p.deb_filename is None for p in good.plan)
     assert all("Unable to resolve package download plan" in p.reason for p in good.plan)
     assert summarize(good).cve_status["CVE-2026-63076"] == cr.PATCH_AVAILABLE
 
 
-def test_candidate_query_failure_marks_errors(setup, metadata):
-    def boom(names):
-        return "no markers"
-
-    good = run_analysis(setup, metadata, ScriptedSSH(candidates=boom)).servers[0]
+def test_candidate_query_failure_marks_errors(setup, metadata, fake_apt):
+    fake_apt.policy_error = "E: The package cache file is corrupted"
+    good = run_analysis(setup, metadata, ScriptedSSH()).servers[0]
     statuses = {f.status for f in good.findings if f.source_package == "openssl"}
     assert statuses == {cr.ANALYSIS_ERROR}
+    assert all("package cache file is corrupted" in f.detail for f in good.findings
+               if f.source_package == "openssl")  # fmt: skip
     assert good.plan == []
 
 
@@ -194,27 +197,32 @@ def test_all_status_types_reconcile(setup, metadata):
         assert summary.by_status.get(status), status
 
 
-def test_stale_apt_lists_never_yield_fix_not_in_repos(setup, metadata):
-    stale = facts_output(apt_stamp=1790460000 - 30 * 86400)
-    report = {GOOD: ALL_CVES, BAD: ["CVE-2026-63076"]}
-    ssh = ScriptedSSH(facts=stale)
-    good = run_analysis(setup, metadata, ssh, report=report).servers[0]
-    statuses = {f.status for f in good.findings}
-    assert cr.FIX_NOT_IN_CONFIGURED_REPOS not in statuses
-    assert cr.PATCH_AVAILABLE in statuses  # satisfying candidates are still trusted
-    inconclusive = [f for f in good.findings if cr.STALE_APT_DETAIL in (f.detail or "")]
-    assert inconclusive and all(f.status == cr.ANALYSIS_ERROR for f in inconclusive)
-    assert any("30.0 days ago" in w for w in good.warnings)
-    assert any("could not be confirmed as missing" in w for w in good.warnings)
-    # Freshness is enforced read-only: nothing refreshes the lists on the server.
-    assert not any("apt-get update" in args[-1] or "sudo" in args[-1] for args in ssh.calls)
-
-
-def test_fresh_apt_lists_add_no_inconclusive_warning(setup, metadata):
+def test_candidate_below_fix_is_fix_not_in_repos_without_update_hint(setup, metadata):
     report = {GOOD: ALL_CVES, BAD: ["CVE-2026-63076"]}
     good = run_analysis(setup, metadata, ScriptedSSH(), report=report).servers[0]
-    assert cr.FIX_NOT_IN_CONFIGURED_REPOS in {f.status for f in good.findings}
-    assert not any("could not be confirmed as missing" in w for w in good.warnings)
+    libxml2 = next(f for f in good.findings if f.source_package == "libxml2")
+    assert libxml2.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
+    assert "apt-get update" not in libxml2.detail
+    assert not any("apt-get update" in w or "sudo" in w for w in good.warnings)
+    # The report shows the age of the workstation's private lists.
+    assert good.apt_updated_at and good.apt_age_hours is not None and good.apt_age_hours < 1
+
+
+def test_private_apt_update_failure_is_reported_not_faked(setup, metadata, fake_apt):
+    fake_apt.update_error = (
+        "E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/noble/InRelease"
+    )
+    good = run_analysis(setup, metadata, ScriptedSSH()).servers[0]
+    assert good.status == "complete"
+    openssl = [f for f in good.findings if f.source_package == "openssl"]
+    assert openssl and {f.status for f in openssl} == {cr.ANALYSIS_ERROR}
+    assert all("apt-get update of the private noble/amd64 APT lists failed" in f.detail
+               for f in openssl)  # fmt: skip
+    assert all(f.apt_candidate is None for f in good.findings) and good.plan == []
+    assert any(w.startswith("Local APT resolution failed:") for w in good.warnings)
+    # No candidate query ran against the missing lists; the next server reuses the failure.
+    assert all(apt_operands(c)[-1] == "update" for c in fake_apt.calls)
+    assert len(fake_apt.updates) == 1
 
 
 def test_display_name_never_matches_report(db, pem_file, metadata):

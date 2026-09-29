@@ -3,16 +3,30 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from phase2_fixtures import FakeApt
 
+from ec2patcher import config
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
-from ec2patcher.services import nvd
+from ec2patcher.services import local_apt, nvd
 
 
 @pytest.fixture(autouse=True)
 def isolated_metadata_cache(tmp_path: Path, monkeypatch):
-    """Never read or write the user's real Canonical metadata cache during tests."""
+    """Never read or write the user's real Canonical metadata cache or data directory."""
     monkeypatch.setenv("EC2PATCHER_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv(config.DATA_DIR_ENV, str(tmp_path / "appdata"))
+    monkeypatch.delenv(config.APT_STATE_DIR_ENV, raising=False)
+    monkeypatch.delenv(config.APT_MAX_AGE_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def fake_apt(monkeypatch) -> FakeApt:
+    """Tests never run the workstation's real apt-get / apt-cache: every LocalApt created
+    without an explicit runner talks to this fake backend (configure it per test)."""
+    fake = FakeApt()
+    monkeypatch.setattr(local_apt, "default_runner", fake)
+    return fake
 
 
 @pytest.fixture(autouse=True)

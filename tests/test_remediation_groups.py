@@ -4,7 +4,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from markupsafe import escape
 
 from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.models import CveFindingRow, ServerAnalysis
@@ -314,12 +313,10 @@ def test_perl_summary_counters_use_report_buckets():
         }
         assert [t for _, t, _ in summary.buckets] == ["Action required", "Investigate", "No action"]
         assert sum(summary.by_bucket.values()) == summary.reported == 6
-        assert summary.stale_apt == 0 and summary.stale_apt_hint == ""
 
-    rows = perl_server_findings(cr.ANALYSIS_ERROR, f"{cr.STALE_APT_DETAIL} Updated 30 days ago.")
+    rows = perl_server_findings(cr.ANALYSIS_ERROR, "APT candidate check failed: boom")
     summary = summarize(server_analysis(rows))
     assert summary.by_bucket == {ACTION_REQUIRED: 0, INVESTIGATE: 1, NO_ACTION: 5}
-    assert summary.stale_apt == 1 and summary.stale_apt_hint == cr.STALE_APT_DETAIL
 
     page = render_run_page(rows)
     meta = page[page.index('<div class="server-meta">') :]
@@ -327,15 +324,14 @@ def test_perl_summary_counters_use_report_buckets():
     assert "Investigate: 1</span>" in meta
     assert "No action: 5</span>" in meta
     assert "unresolved" not in meta
-    assert "1 inconclusive (APT lists not current)" in meta and "apt-get update" in meta
 
     report = render_report(rows)
     assert "Investigate: 1 CVE</span>" in report and "No action: 5 CVEs</span>" in report
-    assert "1 CVE(s) could not be concluded" in report
-    assert str(escape(cr.STALE_APT_DETAIL)) in report
 
 
-def test_report_flags_apt_lists_that_are_not_current():
-    rows = [finding(1)]
-    assert "NOT CURRENT" in render_report(rows, apt_fresh=False)
-    assert "NOT CURRENT" not in render_report(rows, apt_fresh=True)
+def test_reports_never_suggest_updating_apt_on_the_server():
+    """APT is resolved on the workstation with fresh private lists: no server-side hint."""
+    rows = perl_server_findings(cr.FIX_NOT_IN_CONFIGURED_REPOS, "")
+    for html in (render_report(rows), render_run_page(rows)):
+        assert "apt-get update" not in html and "sudo" not in html
+        assert "NOT CURRENT" not in html and "stale-apt-hint" not in html

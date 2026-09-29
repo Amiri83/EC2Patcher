@@ -1,8 +1,9 @@
 """Phase 2 orchestration: analyze the latest report, server by server, and persist results.
 
-Read-only by design. For each server the analyzer runs three fixed ssh commands as the
-unprivileged ``ubuntu`` user (no sudo): collect facts (dpkg-query, os-release, uname, ...),
-query APT candidates (apt-cache), and plan the upgrade (apt-get -s / --print-uris). Nothing
+Read-only by design. Each server receives exactly one fixed ssh command as the unprivileged
+``ubuntu`` user (no sudo) that collects facts (dpkg-query, os-release, uname, ...). APT
+candidates and the upgrade plan (apt-get -s / --print-uris) are resolved on the workstation
+against a private APT state for the server's release and architecture (local_apt). Nothing
 is downloaded, copied, installed or restarted.
 
 Canonical's metadata alone decides applicability, fixed versions and statuses. NVD is only
@@ -21,12 +22,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from ec2patcher import config
 from ec2patcher.database import Database
 from ec2patcher.models import ServerAnalysis, StoredReport
 from ec2patcher.services import (
     apt_planner,
     cve_resolver,
     debversion,
+    local_apt,
     nvd,
     server_state,
     ssh_service,
@@ -37,8 +40,6 @@ from ec2patcher.services.severity import SEVERITIES, UNKNOWN, normalize_severity
 logger = logging.getLogger(__name__)
 
 FACTS_TIMEOUT_SECONDS = 90
-CANDIDATE_TIMEOUT_SECONDS = 90
-PLAN_TIMEOUT_SECONDS = 180
 DISPLAY_NAME_TAG = "display_name"
 
 Starter = Callable[[Callable[[], None]], None]
@@ -48,8 +49,12 @@ def thread_starter(target: Callable[[], None]) -> None:
     threading.Thread(target=target, name="ec2patcher-analysis", daemon=True).start()
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
 def _now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return _utcnow().isoformat()
 
 
 class AnalysisService:
@@ -60,10 +65,14 @@ class AnalysisService:
         runner: ssh_service.Runner = subprocess.run,
         starter: Starter = thread_starter,
         nvd_client: nvd.NvdClient | None = None,
+        apt: local_apt.LocalApt | None = None,
     ):
         self.db = db
         self.metadata = metadata
         self.nvd = nvd_client or nvd.NvdClient()
+        self.apt = apt or local_apt.LocalApt(
+            config.get_apt_state_dir(config.get_data_dir()), config.get_apt_max_age()
+        )
         self.runner = runner
         self.starter = starter
         self._lock = threading.Lock()
@@ -144,6 +153,7 @@ class AnalysisService:
         )
 
         self.nvd.start_run()
+        self.apt.start_run()
         failures = 0
         for index, analysis in enumerate(run.servers, start=1):
             label = f"{analysis.server_name} ({index} of {len(run.servers)})"
@@ -206,8 +216,6 @@ class AnalysisService:
             running_kernel=facts.kernel,
             current_reboot_required=facts.reboot_required,
             reboot_required_packages=facts.reboot_required_pkgs,
-            apt_updated_at=facts.apt_updated_at,
-            apt_age_hours=facts.apt_age_hours,
         )
         unsupported = server_state.check_supported(facts)
         if unsupported:
@@ -229,37 +237,31 @@ class AnalysisService:
             warnings.append("Some CVEs have no usable Canonical statement for this Ubuntu release.")
         candidates: dict[str, apt_planner.Candidate] = {}
         requests: list[tuple[str, str]] = []
+        state: local_apt.AptState | None = None
         query = cve_resolver.candidate_query_packages(findings, facts)
         if query:
-            result = self._remote(
-                server, apt_planner.build_candidate_command(query), CANDIDATE_TIMEOUT_SECONDS
-            )
+            progress(f"Resolving APT candidates locally ({facts.codename}/{facts.architecture})")
             try:
-                if not result.ok:
-                    raise ValueError(result.error)
-                candidates = apt_planner.parse_candidates(result.stdout, query)
-            except ValueError as exc:
+                state = self.apt.prepare(facts.codename, facts.architecture)
+                self.db.update_server_analysis(
+                    analysis.id,
+                    apt_updated_at=state.updated_at.isoformat(),
+                    apt_age_hours=max(0.0, (_utcnow() - state.updated_at).total_seconds() / 3600),
+                )
+                candidates = self.apt.candidates(state, facts, query)
+            except (local_apt.AptResolutionError, ValueError) as exc:
+                warnings.append(f"Local APT resolution failed: {exc}")
                 for f in findings:
                     if cve_resolver.needs_candidate_check(f):
                         f.status = cve_resolver.ANALYSIS_ERROR
                         f.detail = f"APT candidate check failed: {exc}"
             else:
                 requests = cve_resolver.apply_candidates(findings, candidates, facts)
-                inconclusive = sum(
-                    1 for f in findings if cve_resolver.STALE_APT_DETAIL in (f.detail or "")
-                )
-                if inconclusive:
-                    warnings.append(
-                        f"{inconclusive} finding(s) could not be confirmed as missing from the "
-                        "configured repositories because the APT package lists are not current "
-                        "(or their age is unknown). Run 'sudo apt-get update' on the server and "
-                        "re-analyze."
-                    )
 
         plan: list[cve_resolver.PlanEntry] = []
         apt_arguments: list[str] = []
-        if requests:
-            download = self._plan(server, requests)
+        if requests and state is not None:
+            download = self.apt.plan(state, facts, requests)
             apt_arguments = download.apt_arguments
             if download.removals:
                 warnings.append(
@@ -296,20 +298,6 @@ class AnalysisService:
             for f in findings:
                 if f.cve == cve:
                     f.cvss = result
-
-    def _plan(self, server, requests) -> apt_planner.DownloadPlan:
-        try:
-            command = apt_planner.build_plan_command(requests)
-        except apt_planner.UnsafeArgumentError as exc:
-            return apt_planner.DownloadPlan(ok=False, error=str(exc))
-        result = self._remote(server, command, PLAN_TIMEOUT_SECONDS)
-        if not result.ok:
-            return apt_planner.DownloadPlan(
-                ok=False,
-                apt_arguments=["install", *apt_planner.plan_arguments(requests)],
-                error=result.error,
-            )
-        return apt_planner.parse_plan(result.stdout, requests)
 
     @staticmethod
     def _unresolved_plan(findings, requests, candidates, facts, error) -> list:
@@ -501,7 +489,6 @@ class ServerSummary:
     download_bytes: int
     by_severity: dict[str, int]  # per reported CVE; independent of the patch status
     by_bucket: dict[str, int]  # reported CVEs per report bucket (bucket_for_status of cve_status)
-    stale_apt: int  # CVEs with an ANALYSIS_ERROR finding caused by stale APT package lists
 
     def count(self, *statuses: str) -> int:
         return sum(self.by_status.get(s, 0) for s in statuses)
@@ -510,10 +497,6 @@ class ServerSummary:
     def buckets(self) -> list[tuple[str, str, int]]:
         """(key, title, CVE count) for every report bucket, in report order."""
         return [(key, title, self.by_bucket[key]) for key, title, _ in BUCKETS]
-
-    @property
-    def stale_apt_hint(self) -> str:
-        return cve_resolver.STALE_APT_DETAIL if self.stale_apt else ""
 
 
 @dataclass
@@ -561,12 +544,6 @@ def summarize(analysis: ServerAnalysis) -> ServerSummary:
     by_bucket = {key: 0 for key, _, _ in BUCKETS}
     for status in cve_status.values():
         by_bucket[bucket_for_status(status)] += 1
-    stale = {
-        f.cve
-        for f in analysis.findings
-        if f.status == cve_resolver.ANALYSIS_ERROR
-        and cve_resolver.STALE_APT_DETAIL in (f.detail or "")
-    }
     return ServerSummary(
         reported=len(analysis.reported_cves),
         by_status=dict(Counter(cve_status.values())),
@@ -577,5 +554,4 @@ def summarize(analysis: ServerAnalysis) -> ServerSummary:
         download_bytes=sum(p.size or 0 for p in analysis.plan if p.deb_filename),
         by_severity=by_severity,
         by_bucket=by_bucket,
-        stale_apt=len(stale & cve_status.keys()),
     )

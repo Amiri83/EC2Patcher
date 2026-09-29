@@ -25,6 +25,14 @@
   </form>
 </div>
 <div class="card">
+  <h2>APT Resolution</h2>
+  <p class="muted">APT candidates and the .deb plan are resolved on this workstation against private package lists per Ubuntu release and architecture (release, -updates and -security pockets). Servers are only read (dpkg-query); the system APT configuration is never used or changed.</p>
+  <dl class="kv">
+    <dt>Private APT state</dt><dd><code>{{ apt_state_dir }}</code></dd>
+    <dt>Refresh when older than</dt><dd>{{ "%g"|format(apt_max_age_hours) }} hours{% if not apt_max_age_hours %} (every analysis run){% endif %}</dd>
+  </dl>
+</div>
+<div class="card">
   <h2>Reset Database</h2>
   <p class="muted">Permanently removes servers, reports, analyses, and settings.</p>
   <form method="post" action="/settings/reset-database">

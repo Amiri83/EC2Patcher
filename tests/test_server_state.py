@@ -14,8 +14,7 @@ def test_parse_noble_facts():
     assert facts.architecture == "amd64"
     assert facts.kernel == "6.8.0-1021-aws"
     assert facts.reboot_required is False and facts.reboot_required_pkgs == []
-    assert facts.apt_updated_at == "2026-09-26T05:20:00+00:00"
-    assert facts.apt_age_hours == pytest.approx(16.67, abs=0.01)
+    assert facts.reboot_hooks == {"libssl3t64:amd64"}
     assert facts.warnings == []
     assert st.check_supported(facts) is None
 
@@ -95,14 +94,23 @@ def test_malformed_inventory_rows_counted():
     assert "1 package inventory row(s) could not be parsed." in facts.warnings
 
 
-def test_stale_apt_lists_warning():
-    facts = st.parse_facts(facts_output(apt_stamp=1790460000 - 10 * 86400))
-    assert any("10.0 days ago" in w for w in facts.warnings)
+def test_relationship_columns_are_kept_for_local_apt_resolution():
+    depends = "perl-base (= 5.38.2-3.2ubuntu0.3), libperl5.38t64 (= 5.38.2-3.2ubuntu0.3)"
+    row = "\t".join([
+        "perl", "5.38.2-3.2ubuntu0.3", "perl", "5.38.2-3.2ubuntu0.3", "amd64", "ii ",
+        "allowed", "", "", depends, "", "", "",
+    ])  # fmt: skip
+    packages, malformed = st.parse_dpkg_inventory([row])
+    assert malformed == 0
+    assert packages[0].relations == {"Multi-Arch": "allowed", "Depends": depends}
+    assert st.parse_dpkg_inventory(["\t".join(["x"] * 9)]) == ([], 1)  # partial columns
 
 
-def test_apt_age_falls_back_to_lists_directory():
-    facts = st.parse_facts(facts_output(apt_stamp=None))
-    assert facts.apt_updated_source == "APT package list directory modification time"
+def test_no_server_side_apt_state_is_collected():
+    """The server's own APT lists are irrelevant: resolution happens on the workstation."""
+    cmd = st.FACTS_COMMAND
+    assert "/var/lib/apt" not in cmd and "apt-cache" not in cmd and "apt-get" not in cmd
+    assert "${Depends}" in cmd and "notify-reboot-required" in cmd
 
 
 @pytest.mark.parametrize(

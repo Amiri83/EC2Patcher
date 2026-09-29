@@ -1,0 +1,89 @@
+{
+  "CVE-2026-40001": {
+    "id": "CVE-2026-40001",
+    "description": "perl: heap buffer overflow in the regex engine.",
+    "priority": "medium",
+    "packages": [
+      {
+        "name": "perl",
+        "statuses": [
+          {"release_codename": "noble", "status": "released", "pocket": "security", "description": "5.38.2-3.2ubuntu0.4"},
+          {"release_codename": "jammy", "status": "released", "pocket": "security", "description": "5.34.0-3ubuntu1.6"},
+          {"release_codename": "xenial", "status": "released", "pocket": "esm-infra", "description": "5.22.1-9ubuntu0.9+esm5"}
+        ]
+      }
+    ]
+  },
+  "CVE-2026-40002": {
+    "id": "CVE-2026-40002",
+    "description": "Cpanel::JSON::XS: out-of-bounds read.",
+    "priority": "low",
+    "packages": [
+      {
+        "name": "libcpanel-json-xs-perl",
+        "statuses": [
+          {"release_codename": "noble", "status": "DNE", "pocket": null, "description": ""},
+          {"release_codename": "jammy", "status": "needed", "pocket": null, "description": ""},
+          {"release_codename": "focal", "status": "needed", "pocket": null, "description": ""}
+        ]
+      }
+    ]
+  },
+  "CVE-2026-40003": {
+    "id": "CVE-2026-40003",
+    "description": "Spreadsheet::ParseExcel: code execution via crafted file.",
+    "priority": "medium",
+    "packages": [
+      {
+        "name": "libspreadsheet-parseexcel-perl",
+        "statuses": [
+          {"release_codename": "noble", "status": "released", "pocket": "security", "description": "0.6500-4ubuntu0.1"},
+          {"release_codename": "jammy", "status": "released", "pocket": "security", "description": "0.6500-1.1ubuntu0.1"}
+        ]
+      }
+    ]
+  },
+  "CVE-2026-40004": {
+    "id": "CVE-2026-40004",
+    "description": "HTTP::Tiny: TLS certificates not verified by default.",
+    "priority": "medium",
+    "packages": [
+      {
+        "name": "libhttp-tiny-perl",
+        "statuses": [
+          {"release_codename": "noble", "status": "DNE", "pocket": null, "description": ""},
+          {"release_codename": "jammy", "status": "DNE", "pocket": null, "description": ""},
+          {"release_codename": "focal", "status": "released", "pocket": "security", "description": "0.076-1ubuntu0.1"}
+        ]
+      }
+    ]
+  },
+  "CVE-2026-40005": {
+    "id": "CVE-2026-40005",
+    "description": "Crypt::CBC: weak key derivation.",
+    "priority": "low",
+    "packages": [
+      {
+        "name": "libcrypt-cbc-perl",
+        "statuses": [
+          {"release_codename": "noble", "status": "DNE", "pocket": null, "description": ""},
+          {"release_codename": "jammy", "status": "needed", "pocket": null, "description": ""}
+        ]
+      }
+    ]
+  },
+  "CVE-2026-40006": {
+    "id": "CVE-2026-40006",
+    "description": "Archive::Zip: directory traversal.",
+    "priority": "medium",
+    "packages": [
+      {
+        "name": "libarchive-zip-perl",
+        "statuses": [
+          {"release_codename": "noble", "status": "DNE", "pocket": null, "description": ""},
+          {"release_codename": "jammy", "status": "released", "pocket": "security", "description": "1.68-1ubuntu0.1"}
+        ]
+      }
+    ]
+  }
+}

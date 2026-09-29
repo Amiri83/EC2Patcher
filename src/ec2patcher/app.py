@@ -18,16 +18,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ec2patcher import __version__
-from ec2patcher.config import DB_FILENAME, get_data_dir
+from ec2patcher.config import DB_FILENAME, get_apt_max_age, get_apt_state_dir, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
 from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.services import (
     analysis_service,
     cve_resolver,
     excel_export,
+    local_apt,
     nvd,
     report_service,
-    server_state,
     ssh_service,
 )
 from ec2patcher.services.security_metadata import SecurityMetadata
@@ -83,18 +83,25 @@ def create_app(
     metadata: SecurityMetadata | None = None,
     analysis_starter: analysis_service.Starter | None = None,
     nvd_client: nvd.NvdClient | None = None,
+    apt: local_apt.LocalApt | None = None,
+    apt_state_dir: str | None = None,
+    apt_max_age_hours: float | None = None,
 ) -> FastAPI:
     db = Database(db_path or get_data_dir() / DB_FILENAME)
     interrupted = db.mark_interrupted_runs()
     if interrupted:
         logger.warning("Marked %d unfinished analysis run(s) as interrupted", interrupted)
     metadata = metadata or SecurityMetadata()
+    apt = apt or local_apt.LocalApt(
+        get_apt_state_dir(db.path.parent, apt_state_dir), get_apt_max_age(apt_max_age_hours)
+    )
     analyzer = analysis_service.AnalysisService(
         db,
         metadata,
         runner=ssh_runner or subprocess.run,
         starter=analysis_starter or analysis_service.thread_starter,
         nvd_client=nvd_client,
+        apt=apt,
     )
 
     @asynccontextmanager
@@ -118,6 +125,8 @@ def create_app(
     templates.env.globals["reboot_help"] = cve_resolver.REBOOT_HELP
     templates.env.globals["severity_classes"] = SEVERITY_CLASSES
     templates.env.globals["severities"] = SEVERITIES
+    templates.env.globals["apt_state_dir"] = apt.root
+    templates.env.globals["apt_max_age_hours"] = apt.max_age.total_seconds() / 3600
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
     app.state.analyzer = analyzer
 
@@ -407,7 +416,6 @@ def create_app(
             finding_groups=analysis_service.group_findings(analysis),
             remediation_groups=groups,
             finding_buckets=analysis_service.bucket_groups(groups),
-            apt_fresh=server_state.apt_lists_fresh(analysis.apt_age_hours),
             is_latest=latest is not None and latest.id == run_id,
         )  # fmt: skip
 
