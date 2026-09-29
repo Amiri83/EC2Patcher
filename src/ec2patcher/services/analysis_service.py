@@ -129,6 +129,7 @@ class AnalysisService:
             self.db.update_analysis_run(run_id, progress_message=message)
 
         progress("Checking Canonical security metadata")
+        self.metadata.start_run()
         meta = self.metadata.ensure_fresh(progress)
         metadata_warning = meta.warning
         if not meta.available:

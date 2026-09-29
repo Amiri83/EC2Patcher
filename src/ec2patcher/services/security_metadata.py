@@ -18,6 +18,9 @@ REQUEST_TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 PRIORITY_RE = re.compile(r"classified this CVE as of (\w+) priority", re.IGNORECASE)
 PRO_PREFIXES = ("esm-infra", "esm-apps", "esm-infra-legacy", "esm-apps-legacy")
+# Non-Pro archive pockets. Canonical reports fixes that shipped in the original
+# release (e.g. openssl 3.0.2-0ubuntu1 for jammy in CVE-2022-0778) as "security".
+STANDARD_POCKETS = (None, "security", "updates")
 STATUSES = {
     "released": "fixed",
     "not-affected": "not_affected",
@@ -110,7 +113,7 @@ def parse_cve_document(doc: dict, cve: str) -> CveRecord:
             if codename not in SUPPORTED_RELEASES.values():
                 continue
             pocket = release.get("pocket")
-            if pocket in (None, "security", "updates"):
+            if pocket in STANDARD_POCKETS:
                 distro = codename
             elif pocket in PRO_PREFIXES:
                 distro = f"{pocket}/{codename}"
@@ -168,8 +171,15 @@ def http_get(url: str) -> dict:
 Fetcher = Callable[[str], dict]
 
 
+class MetadataUnreachable(OSError):
+    """Lookup skipped because ubuntu.com already failed at the network level."""
+
+
 class SecurityMetadata:
-    """Online lookups with a process-local memo for repeated CVEs."""
+    """Online lookups with a process-local memo for repeated CVEs.
+
+    After the first network failure, further lookups fail fast without HTTP until
+    :meth:`start_run` (next analysis run) or :meth:`clear` resets the breaker."""
 
     def __init__(
         self,
@@ -182,23 +192,42 @@ class SecurityMetadata:
         self.fetcher = fetcher
         self._memo: dict[str, CveRecord | None] = {}
         self._lock = threading.Lock()
+        self._unreachable: str | None = None
+
+    def start_run(self) -> None:
+        """Reset the 'ubuntu.com unreachable' circuit breaker for a new analysis run."""
+        with self._lock:
+            self._unreachable = None
 
     def lookup(self, cve: str) -> CveRecord | None:
         cve = cve.upper()
         with self._lock:
             if cve in self._memo:
                 return self._memo[cve]
+            if self._unreachable is not None:
+                raise MetadataUnreachable(
+                    f"skipped after earlier network error: {self._unreachable}"
+                )
         try:
             doc = self.fetcher(API_URL.format(cve=cve))
         except urllib.error.HTTPError as exc:
             if exc.code != 404:
+                self._trip(exc)
                 raise
             record = None
+        except OSError as exc:  # URLError, timeouts, connection errors
+            self._trip(exc)
+            raise
         else:
             record = parse_cve_document(doc, cve)
         with self._lock:
             self._memo[cve] = record
         return record
+
+    def _trip(self, exc: Exception) -> None:
+        with self._lock:
+            if self._unreachable is None:
+                self._unreachable = str(exc) or type(exc).__name__
 
     def status(self) -> MetadataStatus:
         return MetadataStatus(available=True, checked_at=_now().isoformat())
@@ -208,6 +237,7 @@ class SecurityMetadata:
 
     def clear(self) -> bool:
         with self._lock:
-            had_entries = bool(self._memo)
+            had_entries = bool(self._memo) or self._unreachable is not None
             self._memo.clear()
+            self._unreachable = None
             return had_entries
