@@ -27,7 +27,15 @@ from test_web import upload
 
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
-from ec2patcher.services import downloader, nvd, patch_remote, patch_service, ssh_service, staging
+from ec2patcher.services import (
+    cve_resolver,
+    downloader,
+    nvd,
+    patch_remote,
+    patch_service,
+    ssh_service,
+    staging,
+)
 from ec2patcher.services import patch_state as ps
 
 
@@ -353,6 +361,26 @@ def test_failed_analysis_cannot_be_approved(web, pem_file, tmp_path, db_path):
         assert c.post(f"{url}/approve", data={"confirm": "yes"}).status_code == 409
 
 
+def test_metadata_unavailable_report_is_not_clean(web, pem_file, tmp_path, db_path):
+    with web() as c:
+        save(c, SERVER, IP, pem_file)
+        db = Database(db_path)
+        finding = cve_resolver.Finding(
+            "CVE-2026-63076", None, cve_resolver.METADATA_UNAVAILABLE, "Canonical unreachable"
+        )
+        analysis = make_analysis(db, db.get_server_by_name(SERVER), plan=[], finding_list=[finding])
+        url = f"/analysis/{analysis.run_id}/servers/{analysis.id}"
+        page = c.get(url).text
+        assert "1 CVE not checked (metadata/key status unavailable)" in page
+        assert "this report does not mean the server is clean" in page
+        assert "No package updates are planned for this server for the CVEs that were checked" in (
+            page
+        )
+        assert "1 CVE(s) not checked / Canonical metadata unavailable: CVE-2026-63076" in page
+        assert f'href="{url}/approve"' not in page
+        assert c.post(f"{url}/approve", data={"confirm": "yes"}).status_code == 409
+
+
 def test_failure_page_shows_preserved_paths(web, pem_file, tmp_path):
     web.state["fake"].install_mode = "fail"
     with web() as c:
@@ -386,6 +414,24 @@ def test_running_execution_page_refreshes(web, pem_file, tmp_path, db_path):
         assert "Preflight revalidation" in page and "APPROVED" in page
         other = c.post(f"{report_url}/approve", data={"confirm": "yes"})
         assert other.status_code == 409
+
+
+def test_reset_database_refused_while_patch_running(web, pem_file, tmp_path, db_path):
+    with web() as c:
+        report_url = analyze(c, pem_file, tmp_path)
+        c.app.state.patcher.starter = lambda fn: None  # approved, not yet started
+        r = c.post(f"{report_url}/approve", data={"confirm": "yes"}, follow_redirects=False)
+        assert r.status_code == 303
+        db = Database(db_path)
+        execution_id = db.active_execution_id()
+        assert execution_id is not None and c.app.state.patcher.is_running
+        assert not c.app.state.analyzer.is_running
+        busy = c.post("/settings/reset-database", data={"confirm_text": "RESET"})
+        assert busy.status_code == 409
+        assert "Database cannot be reset during patching." in busy.text
+        assert db.count_servers() == 1 and db.get_latest_report() is not None
+        assert db.active_execution_id() == execution_id
+        assert db.get_execution(execution_id).state == ps.APPROVED
 
 
 def test_approve_rejects_cross_site_post(web, pem_file, tmp_path):
