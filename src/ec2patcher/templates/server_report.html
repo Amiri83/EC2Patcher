@@ -76,9 +76,7 @@
         {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}
         <div class="muted small">{{ run.metadata_source or "" }}</div></dd>
     <dt>APT Metadata</dt>
-    <dd>{% if analysis.apt_updated_at %}Updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">unknown</span>{% endif %}
-        {% if apt_fresh is defined and not apt_fresh %}<span class="badge badge-warning">NOT CURRENT</span>
-        <div class="muted small">A missing APT candidate is reported as an analysis error, not as "fix not in configured repositories", until the package lists are updated.</div>{% endif %}</dd>
+    <dd>{% if analysis.apt_updated_at %}Workstation private lists{% if analysis.os_codename %} ({{ analysis.os_codename }}, {{ analysis.os_codename }}-updates, {{ analysis.os_codename }}-security{% if analysis.architecture %}; {{ analysis.architecture }}{% endif %}){% endif %} updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">not used</span>{% endif %}</dd>
     <dt>Current Reboot Required</dt>
     <dd>{% if analysis.current_reboot_required is none %}<span class="muted">unknown</span>{% elif analysis.current_reboot_required %}<strong>YES</strong>{% if analysis.reboot_required_packages %} <span class="muted small">({{ analysis.reboot_required_packages|join(", ") }})</span>{% endif %}{% else %}NO{% endif %}</dd>
     <dt>Expected Reboot After Planned Patch</dt>
@@ -112,9 +110,6 @@
   <p class="muted small bucket-summary">By action (per reported CVE):
     {% for key, title, n in summary.buckets %}<span class="badge {{ bucket_classes[key] if n else 'badge-neutral' }}">{{ title }}: {{ n }} CVE{{ "s" if n != 1 else "" }}</span>{% endfor %}
   </p>
-  {% if summary.stale_apt %}
-    <div class="alert alert-warning stale-apt-hint">{{ summary.stale_apt }} CVE(s) could not be concluded: {{ summary.stale_apt_hint }}</div>
-  {% endif %}
   {% if summary.by_status %}
     <p class="muted small status-breakdown">By status:
       {% for status, count in summary.by_status|dictsort %}
@@ -153,7 +148,7 @@
 <div class="card">
   <h2>Package / .deb Plan</h2>
   {% if analysis.plan %}
-    <p class="muted small">Planned only &mdash; nothing has been downloaded. Target versions are the current APT candidates on the server.</p>
+    <p class="muted small">Planned only &mdash; nothing has been downloaded. Target versions are the current APT candidates of the Ubuntu archive for this server's release and architecture, resolved on this workstation.</p>
     <div class="table-scroll">
     <table class="table plan-table">
       <thead><tr><th>Binary Package</th><th>Current Version</th><th>Target Version</th><th>.deb Filename</th><th class="num">Size</th><th>Related CVEs</th><th>Reboot Impact</th></tr></thead>
@@ -183,7 +178,7 @@
   <details class="report-details">
     <summary><strong>Technical details</strong> <span class="muted small">(download URIs, checksums, APT invocation)</span></summary>
     {% if analysis.apt_arguments %}
-      <p class="small">APT invocation used for planning (simulation / <code>--print-uris</code> only):</p>
+      <p class="small">APT invocation used for planning on the workstation (simulation / <code>--print-uris</code> only, against the private APT state):</p>
       <pre>apt-get {{ analysis.apt_arguments|join(" ") }}</pre>
     {% endif %}
     <div class="table-scroll">

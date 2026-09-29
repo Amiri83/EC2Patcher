@@ -151,11 +151,11 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         rows.append(("Canonical Metadata Warning", run.metadata_warning))
 
     if analysis.apt_updated_at:
-        apt = f"Updated {format_timestamp(analysis.apt_updated_at)}"
+        apt = f"Workstation private lists updated {format_timestamp(analysis.apt_updated_at)}"
         if analysis.apt_age_hours is not None:
             apt += f" ({analysis.apt_age_hours:.1f} hours before analysis)"
     else:
-        apt = "unknown"
+        apt = "not used"
     current_reboot = _yes_no_unknown(analysis.current_reboot_required, "YES", "NO")
     if analysis.current_reboot_required and analysis.reboot_required_packages:
         current_reboot += f" ({', '.join(analysis.reboot_required_packages)})"
@@ -204,8 +204,6 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         ("Estimated download size", format_size(summary.download_bytes)),
         ("Estimated download size (bytes)", summary.download_bytes),
     ]
-    if summary.stale_apt:
-        rows.append(("Inconclusive (APT lists not current)", summary.stale_apt_hint))
     if analysis.warnings:
         rows.append(("Warnings", "\n".join(analysis.warnings)))
     return rows

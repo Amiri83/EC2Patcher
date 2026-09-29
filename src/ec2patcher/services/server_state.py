@@ -1,12 +1,13 @@
 """Read-only collection of a server's Ubuntu release, kernel and installed package state.
 
 One constant remote command (no user input) prints clearly marked sections that are parsed
-here. Nothing on the server is modified and no privilege escalation (sudo) is used.
+here. Nothing on the server is modified and no privilege escalation (sudo) is used. This is
+the only information taken from the server: APT candidates and the .deb plan are resolved on
+the workstation (see local_apt).
 """
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 from ec2patcher.services import debversion
 
@@ -14,11 +15,18 @@ MARK = "@@EC2P "
 
 # dpkg-query fields: binary name (arch-qualified for Multi-Arch: same), binary version,
 # source package name and source version (dpkg derives both from the Source: field),
-# architecture and the abbreviated status (e.g. "ii ").
+# architecture and the abbreviated status (e.g. "ii "), followed by the relationship fields
+# the workstation needs to reproduce the server's installed state for APT resolution.
+RELATION_FIELDS = (
+    "Multi-Arch", "Essential", "Pre-Depends", "Depends", "Provides", "Breaks", "Conflicts",
+)  # fmt: skip
 DPKG_FORMAT = (
     r"${binary:Package}\t${Version}\t${source:Package}\t${source:Version}"
-    r"\t${Architecture}\t${db:Status-Abbrev}\n"
+    r"\t${Architecture}\t${db:Status-Abbrev}"
+    + "".join(rf"\t${{{name}}}" for name in RELATION_FIELDS)
+    + r"\n"
 )
+_BASE_COLUMNS = 6
 
 FACTS_COMMAND = (
     f"echo '{MARK}hostname'; hostname; "
@@ -29,10 +37,8 @@ FACTS_COMMAND = (
     "if [ -e /run/reboot-required ] || [ -e /var/run/reboot-required ]; then echo yes; "
     "cat /run/reboot-required.pkgs 2>/dev/null || cat /var/run/reboot-required.pkgs 2>/dev/null; "
     "else echo no; fi; "
-    f"echo '{MARK}apt-update-stamp'; "
-    "stat -c %Y /var/lib/apt/periodic/update-success-stamp 2>/dev/null; "
-    f"echo '{MARK}apt-lists-mtime'; stat -c %Y /var/lib/apt/lists 2>/dev/null; "
-    f"echo '{MARK}now'; date +%s; "
+    f"echo '{MARK}reboot-hooks'; "
+    "grep -l -s notify-reboot-required /var/lib/dpkg/info/*.postinst; "
     f"echo '{MARK}dpkg'; dpkg-query -W -f='{DPKG_FORMAT}'; "
     f"echo '{MARK}end'"
 )
@@ -45,8 +51,6 @@ SUPPORTED_RELEASES = {
     "24.04": "noble",
     "26.04": "resolute",
 }
-
-APT_STALE_AFTER_HOURS = 48
 
 _PKG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9-]+)?$")
 
@@ -62,6 +66,7 @@ class InstalledPackage:
     source: str
     source_version: str
     architecture: str
+    relations: dict[str, str] = field(default_factory=dict)  # non-empty RELATION_FIELDS
 
     @property
     def base_name(self) -> str:
@@ -79,9 +84,7 @@ class ServerFacts:
     kernel: str
     reboot_required: bool
     reboot_required_pkgs: list[str] = field(default_factory=list)
-    apt_updated_at: str | None = None  # ISO UTC
-    apt_updated_source: str | None = None
-    apt_age_hours: float | None = None
+    reboot_hooks: set[str] = field(default_factory=set)  # postinst calls notify-reboot-required
     packages: list[InstalledPackage] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -134,11 +137,13 @@ def parse_dpkg_inventory(lines: list[str]) -> tuple[list[InstalledPackage], int]
     for line in lines:
         if not line.strip():
             continue
-        parts = line.split("\t")
-        if len(parts) != 6:
+        parts = [p.strip() for p in line.split("\t")]
+        if len(parts) not in (_BASE_COLUMNS, _BASE_COLUMNS + len(RELATION_FIELDS)):
             malformed += 1
             continue
-        name, version, source, source_version, arch, status = (p.strip() for p in parts)
+        name, version, source, source_version, arch, status = parts[:_BASE_COLUMNS]
+        extra = parts[_BASE_COLUMNS:]  # empty for the six-column format
+        relations = {k: v for k, v in zip(RELATION_FIELDS, extra, strict=False) if v}
         if not status.startswith("ii"):
             continue  # removed-but-configured ("rc"), half-installed, etc.
         if (
@@ -155,20 +160,10 @@ def parse_dpkg_inventory(lines: list[str]) -> tuple[list[InstalledPackage], int]
                 source=source or name.split(":", 1)[0],
                 source_version=source_version or version,
                 architecture=arch,
+                relations=relations,
             )
         )
     return packages, malformed
-
-
-def _epoch_to_iso(value: int) -> str:
-    return datetime.fromtimestamp(value, timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _first_int(lines: list[str] | None) -> int | None:
-    for line in lines or []:
-        if line.strip().isdigit():
-            return int(line.strip())
-    return None
 
 
 def parse_facts(stdout: str) -> ServerFacts:
@@ -199,36 +194,16 @@ def parse_facts(stdout: str) -> ServerFacts:
         kernel=kernel,
         reboot_required=reboot_lines[0] == "yes",
         reboot_required_pkgs=sorted(set(reboot_lines[1:])),
+        reboot_hooks={
+            line.strip().rsplit("/", 1)[-1].removesuffix(".postinst")
+            for line in sections.get("reboot-hooks", [])
+            if line.strip().endswith(".postinst")
+        },
         packages=packages,
     )
     if malformed:
         facts.warnings.append(f"{malformed} package inventory row(s) could not be parsed.")
-
-    now = _first_int(sections.get("now"))
-    stamp = _first_int(sections.get("apt-update-stamp"))
-    source = "last successful apt update (update-success-stamp)"
-    if stamp is None:
-        stamp = _first_int(sections.get("apt-lists-mtime"))
-        source = "APT package list directory modification time"
-    if stamp is not None:
-        facts.apt_updated_at = _epoch_to_iso(stamp)
-        facts.apt_updated_source = source
-        if now is not None:
-            facts.apt_age_hours = max(0.0, (now - stamp) / 3600)
-            if facts.apt_age_hours > APT_STALE_AFTER_HOURS:
-                facts.warnings.append(
-                    f"APT package lists were last updated {facts.apt_age_hours / 24:.1f} days "
-                    "ago; newer fixes may not be visible to APT on this server."
-                )
-    else:
-        facts.warnings.append("The age of the APT package lists could not be determined.")
     return facts
-
-
-def apt_lists_fresh(age_hours: float | None) -> bool:
-    """True only when the APT package lists are known to be recent enough to trust a
-    "fixed version not offered by APT" verdict. An unknown age is never assumed fresh."""
-    return age_hours is not None and age_hours <= APT_STALE_AFTER_HOURS
 
 
 def check_supported(facts: ServerFacts) -> str | None:
