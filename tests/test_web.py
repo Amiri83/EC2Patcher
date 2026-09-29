@@ -353,6 +353,31 @@ def test_cross_site_post_rejected(client, pem_file, db_path):
     assert Database(db_path).count_servers() == 1
 
 
+def test_cross_site_post_rejected_on_settings_forms(client, pem_file, db_path):
+    add(client, "app-prod-01", "10.0.0.1", pem_file)
+    for path, data in (
+        ("/settings/reset-database", {"confirm_text": "RESET"}),
+        ("/settings/clear-cache", {}),
+    ):
+        for headers in (
+            {"Origin": "http://evil.example"},
+            {"Origin": "http://127.0.0.1:9999"},  # same host, different port
+            {"Sec-Fetch-Site": "cross-site"},
+        ):
+            r = client.post(path, data=data, headers=headers, follow_redirects=False)
+            assert r.status_code == 403, (path, headers)
+            assert "Cross-site request rejected" in r.text
+    assert Database(db_path).count_servers() == 1  # reset never ran
+    same_origin = client.post(
+        "/settings/reset-database",
+        data={"confirm_text": "RESET"},
+        headers={"Origin": "http://127.0.0.1"},
+        follow_redirects=False,
+    )
+    assert same_origin.status_code == 303
+    assert Database(db_path).count_servers() == 0
+
+
 def test_untrusted_host_rejected(make_client):
     with make_client() as c:
         r = c.get("/", headers={"Host": "evil.example"})

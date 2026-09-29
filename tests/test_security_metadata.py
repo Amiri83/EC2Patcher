@@ -4,9 +4,15 @@ from pathlib import Path
 from urllib.error import HTTPError
 
 import pytest
-from phase2_fixtures import online_fetcher
+from phase2_fixtures import facts_output, online_fetcher
 
-from ec2patcher.services.security_metadata import SecurityMetadata, classify_distro
+from ec2patcher.services import cve_resolver as cr
+from ec2patcher.services.security_metadata import (
+    MetadataUnreachable,
+    SecurityMetadata,
+    classify_distro,
+)
+from ec2patcher.services.server_state import parse_facts
 
 
 @pytest.mark.parametrize(
@@ -121,9 +127,14 @@ def test_network_and_parse_failures_raise_without_memo():
     meta = SecurityMetadata(fetcher=fetch)
     with pytest.raises(OSError, match="offline"):
         meta.lookup("CVE-2024-6387")
+    with pytest.raises(MetadataUnreachable, match="offline"):
+        meta.lookup("CVE-2024-6387")
+    assert len(calls) == 1  # circuit breaker: no second HTTP attempt
+    meta.start_run()
     with pytest.raises(OSError, match="offline"):
         meta.lookup("CVE-2024-6387")
     assert len(calls) == 2
+    meta.start_run()
     meta.fetcher = lambda url: {"id": "CVE-2024-6387"}
     with pytest.raises(ValueError, match="packages list"):
         meta.lookup("CVE-2024-6387")
@@ -145,3 +156,72 @@ def test_fixture_lookup_is_online_per_cve():
     record = meta.lookup("CVE-2026-63076")
     assert record.for_release("noble")[0].version == "3.0.13-0ubuntu3.6"
     assert calls == ["https://ubuntu.com/security/cves/CVE-2026-63076.json"]
+
+
+def test_fix_shipped_in_original_release_resolves_as_standard_archive_fix():
+    """Canonical reports a fix present at GA under the "security" pocket; it resolves."""
+    body = {
+        "id": "CVE-2026-50001",
+        "packages": [
+            {
+                "name": "sudo",
+                "statuses": [
+                    {
+                        "release_codename": "noble",
+                        "status": "released",
+                        "pocket": "security",
+                        "description": "1.9.15p5-3ubuntu5",
+                    }
+                ],
+            }
+        ],
+    }
+    meta = SecurityMetadata(fetcher=lambda url: body)
+    record = meta.lookup("CVE-2026-50001")
+    (entry,) = record.for_release("noble")
+    assert (entry.distro, entry.status, entry.is_pro) == ("noble", "fixed", False)
+    findings = cr.resolve_all(["CVE-2026-50001"], meta.lookup, parse_facts(facts_output()))
+    assert [(f.source, f.status) for f in findings] == [("sudo", cr.ALREADY_FIXED)]
+
+
+def test_network_error_trips_breaker_for_rest_of_run_and_clear_resets():
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        raise OSError("connection timed out")
+
+    meta = SecurityMetadata(fetcher=fetch)
+    cves = ["CVE-2026-50001", "CVE-2026-50002", "CVE-2026-50003", "CVE-2026-50004"]
+    findings = cr.resolve_all(cves, meta.lookup, parse_facts(facts_output()))
+    assert calls == ["https://ubuntu.com/security/cves/CVE-2026-50001.json"]
+    assert [f.cve for f in findings] == cves  # every CVE still surfaces
+    assert all(f.status == cr.METADATA_UNAVAILABLE for f in findings)
+    assert all("Canonical metadata lookup failed" in f.detail for f in findings)
+    assert "connection timed out" in findings[0].detail
+    assert all("skipped after earlier network error" in f.detail for f in findings[1:])
+
+    assert meta.clear()  # Clear Security Cache un-blocks the network
+    with pytest.raises(OSError, match="connection timed out"):
+        meta.lookup("CVE-2026-50002")
+    assert len(calls) == 2
+
+
+def test_http_5xx_trips_breaker_but_parse_errors_do_not():
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        raise HTTPError(url, 503, "Service Unavailable", None, None)
+
+    meta = SecurityMetadata(fetcher=fetch)
+    with pytest.raises(HTTPError):
+        meta.lookup("CVE-2026-50001")
+    with pytest.raises(MetadataUnreachable):
+        meta.lookup("CVE-2026-50002")
+    assert len(calls) == 1
+
+    meta = SecurityMetadata(fetcher=lambda url: {"id": "other"})
+    for cve in ("CVE-2026-50001", "CVE-2026-50002"):
+        with pytest.raises(ValueError, match="Invalid Canonical response"):
+            meta.lookup(cve)
