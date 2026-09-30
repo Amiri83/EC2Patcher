@@ -125,6 +125,9 @@ def create_app(
     interrupted = db.mark_interrupted_executions()
     if interrupted:
         logger.warning("Marked %d unfinished patch execution(s) as failed/unknown", interrupted)
+    interrupted = db.mark_interrupted_queues()
+    if interrupted:
+        logger.warning("Marked %d unfinished Patch All queue(s) as stopped", interrupted)
     patcher = patch_service.PatchService(
         db,
         runner=ssh_runner or subprocess.run,
@@ -159,6 +162,9 @@ def create_app(
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
     templates.env.globals["patch_labels"] = ps.LABELS
     templates.env.globals["patch_badges"] = ps.BADGES
+    templates.env.globals["reboot_labels"] = ps.REBOOT_LABELS
+    templates.env.globals["reboot_badges"] = ps.REBOOT_BADGES
+    templates.env.globals["queue_item_badges"] = ps.ITEM_BADGES
     templates.env.globals["default_staging_template"] = staging.DEFAULT_LOCAL_TEMPLATE
     app.state.analyzer = analyzer
     app.state.patcher = patcher
@@ -429,7 +435,8 @@ def create_app(
         summaries = {s.id: analysis_service.summarize(s) for s in run.servers}
         return render(
             request, "analysis_run.html", "reports", run=run, summaries=summaries,
-            notice=notice_from_query(request),
+            notice=notice_from_query(request), patch_running=patcher.is_running,
+            latest_queue_id=db.latest_queue_id(run_id),
         )  # fmt: skip
 
     @app.post("/analysis/{run_id}/retry-lookups", response_class=HTMLResponse)
@@ -513,12 +520,19 @@ def create_app(
         )
 
     @app.post("/analysis/{run_id}/servers/{analysis_id}/approve", response_class=HTMLResponse)
-    def approve_patch(request: Request, run_id: int, analysis_id: int, confirm: str = Form("")):
+    def approve_patch(
+        request: Request,
+        run_id: int,
+        analysis_id: int,
+        confirm: str = Form(""),
+        skip_reboot: str = Form(""),
+    ):
         stored_server_report(run_id, analysis_id)
         if confirm != "yes":
             return redirect(f"/analysis/{run_id}/servers/{analysis_id}/approve")
         try:
-            execution_id = patcher.approve(analysis_id)
+            # An unchecked "Skip reboot" box is absent from the form: reboot if required.
+            execution_id = patcher.approve(analysis_id, skip_reboot=bool(skip_reboot))
         except patch_service.PatchNotAllowedError as exc:
             logger.warning("Patch approval refused for analysis %s: %s", analysis_id, exc)
             return server_report_page(
@@ -546,8 +560,67 @@ def create_app(
         return render(
             request, "patch_execution.html", "history", execution=execution,
             steps=patch_service.progress_steps(execution),
-            is_active=execution.state in ps.ACTIVE,
+            is_active=ps.in_progress(execution.state, execution.reboot_status),
         )  # fmt: skip
+
+    # --- "Patch All": the eligible servers of one run, one at a time --------------------
+
+    def patch_all_run(run_id: int):
+        run = db.get_analysis_run(run_id, details=True)
+        if run is None:
+            raise StarletteHTTPException(404)
+        return run
+
+    def patch_all_page(request: Request, run_id: int, skip_reboot: bool, status_code=200, **ctx):
+        run = patch_all_run(run_id)
+        preview = patcher.queue_preview(run)
+        return render(
+            request, "patch_all_confirm.html", "reports", status_code=status_code, run=run,
+            eligible=[(a, c) for a, c in preview if c.allowed],
+            skipped=[(a, c) for a, c in preview if not c.allowed],
+            skip_reboot=skip_reboot, **ctx,
+        )  # fmt: skip
+
+    @app.get("/analysis/{run_id}/patch-all", response_class=HTMLResponse)
+    def confirm_patch_all(request: Request, run_id: int):
+        skip_reboot = bool(request.query_params.get("skip_reboot"))
+        if patcher.is_running:
+            return patch_all_page(
+                request, run_id, skip_reboot, status_code=409,
+                error="Another patch execution is running. Wait for it to finish.",
+            )  # fmt: skip
+        return patch_all_page(request, run_id, skip_reboot)
+
+    @app.post("/analysis/{run_id}/patch-all", response_class=HTMLResponse)
+    def start_patch_all(
+        request: Request,
+        run_id: int,
+        confirm: str = Form(""),
+        skip_reboot: str = Form(""),
+        analysis_id: list[int] | None = Form(None),  # noqa: B008
+    ):
+        patch_all_run(run_id)
+        if confirm != "yes":
+            return redirect(f"/analysis/{run_id}/patch-all")
+        try:
+            queue_id = patcher.start_queue(run_id, analysis_id or [], bool(skip_reboot))
+        except patch_service.PatchNotAllowedError as exc:
+            logger.warning("Patch All refused for analysis run %s: %s", run_id, exc)
+            return patch_all_page(
+                request, run_id, bool(skip_reboot), status_code=409,
+                error=f"Patch All was not started. {exc}",
+            )  # fmt: skip
+        return redirect(f"/patch-all/{queue_id}")
+
+    @app.get("/patch-all/{queue_id}", response_class=HTMLResponse)
+    def patch_all_queue(request: Request, queue_id: int):
+        queue = db.get_patch_queue(queue_id)
+        if queue is None:
+            raise StarletteHTTPException(404)
+        executions = {
+            i.execution_id: db.get_execution(i.execution_id) for i in queue.items if i.execution_id
+        }
+        return render(request, "patch_all.html", "history", queue=queue, executions=executions)
 
     @app.get("/analysis/{run_id}/servers/{analysis_id}/export.xlsx")
     def export_server_report(run_id: int, analysis_id: int):

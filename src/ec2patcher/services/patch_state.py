@@ -92,12 +92,69 @@ BADGES = {
 }
 
 
+# --- post-patch reboot (recorded separately; the execution state above is unaffected) ----
+# Set at approval: PENDING (reboot allowed) or SKIPPED (operator chose "Skip reboot").
+# After a verified patch PENDING becomes NOT_REQUIRED (no /run/reboot-required on the
+# server) or REQUESTED (sudo reboot issued, waiting for SSH) -> DONE / FAILED. A patch that
+# fails never reboots: PENDING -> NOT_RUN.
+REBOOT_PENDING = "PENDING"
+REBOOT_SKIPPED = "SKIPPED"
+REBOOT_NOT_REQUIRED = "NOT_REQUIRED"
+REBOOT_REQUESTED = "REQUESTED"
+REBOOT_DONE = "DONE"
+REBOOT_FAILED = "FAILED"
+REBOOT_NOT_RUN = "NOT_RUN"
+REBOOT_ACTIVE = frozenset({REBOOT_PENDING, REBOOT_REQUESTED})
+
+REBOOT_LABELS = {
+    REBOOT_PENDING: "Pending (after patch)",
+    REBOOT_SKIPPED: "Skipped (operator choice)",
+    REBOOT_NOT_REQUIRED: "Not required",
+    REBOOT_REQUESTED: "Rebooting (waiting for SSH)",
+    REBOOT_DONE: "Rebooted",
+    REBOOT_FAILED: "REBOOT FAILED",
+    REBOOT_NOT_RUN: "Not run (patch did not succeed)",
+}
+
+REBOOT_BADGES = {
+    REBOOT_DONE: "badge-success",
+    REBOOT_NOT_REQUIRED: "badge-neutral",
+    REBOOT_SKIPPED: "badge-warning",
+    REBOOT_FAILED: "badge-danger",
+    REBOOT_NOT_RUN: "badge-neutral",
+}
+
+# --- "Patch All" queues ------------------------------------------------------------------
+QUEUE_RUNNING = "RUNNING"
+QUEUE_COMPLETED = "COMPLETED"
+QUEUE_STOPPED = "STOPPED"  # a server failed; the remaining servers were not run
+
+ITEM_PENDING = "PENDING"
+ITEM_RUNNING = "RUNNING"
+ITEM_SUCCESS = "SUCCESS"
+ITEM_FAILED = "FAILED"
+ITEM_SKIPPED = "SKIPPED"  # not eligible; never touched
+ITEM_NOT_RUN = "NOT_RUN"  # eligible, but the queue stopped before its turn
+
+ITEM_BADGES = {
+    ITEM_SUCCESS: "badge-success",
+    ITEM_FAILED: "badge-danger",
+    ITEM_SKIPPED: "badge-neutral",
+    ITEM_NOT_RUN: "badge-warning",
+}
+
+
 class InvalidTransitionError(RuntimeError):
     """A state change that the execution state machine does not allow."""
 
 
 def is_allowed(current: str, target: str) -> bool:
     return target in ALLOWED_TRANSITIONS.get(current, frozenset())
+
+
+def in_progress(state: str, reboot_status: str | None) -> bool:
+    """Still in the patch pipeline, or patched and still in the reboot step."""
+    return state in ACTIVE or (state in SUCCESSFUL and reboot_status in REBOOT_ACTIVE)
 
 
 def check_transition(current: str, target: str) -> None:
