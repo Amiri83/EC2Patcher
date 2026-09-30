@@ -17,14 +17,15 @@ from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from ec2patcher import __version__
-from ec2patcher.config import DB_FILENAME, get_data_dir
+from ec2patcher import __version__, config
+from ec2patcher.config import DB_FILENAME, get_apt_max_age, get_apt_state_dir, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
 from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.services import (
     analysis_service,
     cve_resolver,
     excel_export,
+    local_apt,
     nvd,
     report_service,
     ssh_service,
@@ -46,9 +47,14 @@ NOTICES = {
     "cleared": "All configured servers were removed ({count} deleted).",
     "not_found": "That server no longer exists.",
     "cache_cleared": (
-        "Security lookup memory cleared. The next analysis will query Canonical again."
+        "Security lookup memory and cache cleared. The next analysis will query Canonical again."
     ),
-    "cache_clean": "Security lookup memory is already clear.",
+    "cache_clean": "Security lookup memory and cache are already clear.",
+    "lookups_retrying": "Retrying {count} failed Canonical lookup(s).",
+    "no_failed_lookups": "There are no failed Canonical lookups to retry.",
+    "reanalyzing": "Re-analyzing this server; all of its CVEs are fetched from Canonical again.",
+    "cves_retrying": "Retrying {count} CVE(s) from the Investigate bucket.",
+    "nothing_to_investigate": "There are no CVEs in the Investigate bucket to retry.",
     "database_reset": "Database reset. All stored data was removed.",
 }
 
@@ -82,18 +88,30 @@ def create_app(
     metadata: SecurityMetadata | None = None,
     analysis_starter: analysis_service.Starter | None = None,
     nvd_client: nvd.NvdClient | None = None,
+    apt: local_apt.LocalApt | None = None,
+    apt_state_dir: str | None = None,
+    apt_max_age_hours: float | None = None,
 ) -> FastAPI:
     db = Database(db_path or get_data_dir() / DB_FILENAME)
     interrupted = db.mark_interrupted_runs()
     if interrupted:
         logger.warning("Marked %d unfinished analysis run(s) as interrupted", interrupted)
-    metadata = metadata or SecurityMetadata()
+    metadata = metadata or SecurityMetadata(
+        db,
+        timeout=config.get_canonical_timeout(),
+        max_age=config.get_canonical_cache_ttl(),
+        breaker_threshold=config.get_canonical_breaker_threshold(),
+    )
+    apt = apt or local_apt.LocalApt(
+        get_apt_state_dir(db.path.parent, apt_state_dir), get_apt_max_age(apt_max_age_hours)
+    )
     analyzer = analysis_service.AnalysisService(
         db,
         metadata,
         runner=ssh_runner or subprocess.run,
         starter=analysis_starter or analysis_service.thread_starter,
         nvd_client=nvd_client,
+        apt=apt,
     )
 
     @asynccontextmanager
@@ -117,6 +135,8 @@ def create_app(
     templates.env.globals["reboot_help"] = cve_resolver.REBOOT_HELP
     templates.env.globals["severity_classes"] = SEVERITY_CLASSES
     templates.env.globals["severities"] = SEVERITIES
+    templates.env.globals["apt_state_dir"] = apt.root
+    templates.env.globals["apt_max_age_hours"] = apt.max_age.total_seconds() / 3600
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
     app.state.analyzer = analyzer
 
@@ -386,7 +406,20 @@ def create_app(
         summaries = {s.id: analysis_service.summarize(s) for s in run.servers}
         return render(
             request, "analysis_run.html", "reports", run=run, summaries=summaries,
+            notice=notice_from_query(request),
         )  # fmt: skip
+
+    @app.post("/analysis/{run_id}/retry-lookups", response_class=HTMLResponse)
+    def retry_failed_lookups(request: Request, run_id: int):
+        """Re-run only the Canonical lookups that failed in this run."""
+        if db.get_analysis_run(run_id, details=False) is None:
+            raise StarletteHTTPException(404)
+        count = analyzer.retry_failed_lookups(run_id)
+        if count is None:
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        if not count:
+            return redirect(f"/analysis/{run_id}", notice="no_failed_lookups")
+        return redirect(f"/analysis/{run_id}", notice="lookups_retrying", count=count)
 
     def stored_server_report(run_id: int, analysis_id: int):
         run = db.get_analysis_run(run_id, details=False)
@@ -395,16 +428,44 @@ def create_app(
             raise StarletteHTTPException(404)
         return run, analysis
 
+    @app.post("/analysis/{run_id}/servers/{analysis_id}/reanalyze", response_class=HTMLResponse)
+    def reanalyze_server(request: Request, run_id: int, analysis_id: int):
+        """Re-analyze one server, fetching all of its CVEs from ubuntu.com again."""
+        stored_server_report(run_id, analysis_id)
+        if not analyzer.reanalyze_server(run_id, analysis_id):
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        return redirect(f"/analysis/{run_id}/servers/{analysis_id}", notice="reanalyzing")
+
+    @app.post(
+        "/analysis/{run_id}/servers/{analysis_id}/retry-investigate", response_class=HTMLResponse
+    )
+    def retry_investigate_cves(request: Request, run_id: int, analysis_id: int):
+        """Fetch the CVEs of the server's Investigate bucket again and re-analyze it."""
+        _, analysis = stored_server_report(run_id, analysis_id)
+        cves = analysis_service.investigate_cves(analysis)  # from the stored report only
+        count = analyzer.retry_cves(
+            run_id, cves, {analysis_id}, message=f"Retrying CVEs of {analysis.server_name}"
+        )
+        if count is None:
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        page = f"/analysis/{run_id}/servers/{analysis_id}"
+        if not count:
+            return redirect(page, notice="nothing_to_investigate")
+        return redirect(page, notice="cves_retrying", count=count)
+
     @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
     def server_report(request: Request, run_id: int, analysis_id: int):
         run, analysis = stored_server_report(run_id, analysis_id)
         latest = db.get_latest_analysis_run()
+        groups = analysis_service.remediation_groups(analysis.findings)
         return render(
             request, "server_report.html", "reports", run=run, analysis=analysis,
             summary=analysis_service.summarize(analysis),
             finding_groups=analysis_service.group_findings(analysis),
-            remediation_groups=analysis_service.remediation_groups(analysis.findings),
+            remediation_groups=groups,
+            finding_buckets=analysis_service.bucket_groups(groups),
             is_latest=latest is not None and latest.id == run_id,
+            notice=notice_from_query(request),
         )  # fmt: skip
 
     @app.get("/analysis/{run_id}/servers/{analysis_id}/export.xlsx")

@@ -93,6 +93,10 @@ REBOOT_HELP = (
 class Finding:
     cve: str
     source: str | None
+    # Contract for the patcher: act ONLY when status == PATCH_AVAILABLE, and only through an
+    # analysis plan deduplicated by (package, target_version) - never by iterating raw CVE IDs.
+    # Every other status (including FIX_NOT_IN_CONFIGURED_REPOS and PRO_OR_ESM_REQUIRED) is
+    # informational; one package upgrade typically fixes many CVEs and must be applied once.
     status: str
     detail: str = ""
     installed_version: str | None = None
@@ -334,17 +338,22 @@ def resolve_cve(cve: str, record: CveRecord | None, facts: ServerFacts) -> list[
                     ),
                 )
             )
-    if not findings and release_entries:
+    if not findings and record.sources():
+        # Canonical tracks this CVE only for other releases (for this release the sources
+        # are e.g. DNE) and none of those sources is installed here: nothing to act on.
         findings.append(
             Finding(
                 cve=cve,
                 source=None,
                 status=PACKAGE_NOT_INSTALLED,
-                detail="None of the source packages Canonical tracks for this CVE are installed.",
+                detail=(
+                    "None of the source packages Canonical tracks for this CVE are installed "
+                    f"({', '.join(sorted(record.sources()))})."
+                ),
             )
         )
     elif not findings:
-        # Only statements for releases EC2Patcher does not support (e.g. xenial): no evidence
+        # No usable statement for any supported release (e.g. xenial only): no evidence
         # either way for this server, so do not report it as safe.
         findings.append(
             Finding(
@@ -394,9 +403,13 @@ def apply_candidates(
     candidates: dict[str, Candidate],
     facts: ServerFacts,
 ) -> list[tuple[str, str]]:
-    """Check APT candidates; update statuses; return the (package, version) upgrade requests."""
+    """Check APT candidates; update statuses; return the (package, version) upgrade requests.
+
+    Candidates come from the workstation's private, freshly updated APT lists for the server's
+    release and architecture (see local_apt), so a candidate older than Canonical's fix means
+    the fix is genuinely not published in <release>, -updates or -security."""
     requests: dict[str, str] = {}
-    stale = next((w for w in facts.warnings if "APT package lists" in w), None)
+    archive = f"{facts.codename}, {facts.codename}-updates, {facts.codename}-security"
     for f in findings:
         if not needs_candidate_check(f):
             continue
@@ -419,7 +432,7 @@ def apply_candidates(
                     else f"{name}: {cand.candidate}"
                 )
             if cand is None or not cand.candidate:
-                problems.append(f"{name}: no installation candidate in the configured APT sources")
+                problems.append(f"{name}: no installation candidate in the Ubuntu archive")
                 continue
             compare_to = cand.candidate if f.is_kernel else (cand.source_version or cand.candidate)
             try:
@@ -434,19 +447,18 @@ def apply_candidates(
         if problems:
             reasons = "; ".join(problems)
             if f.status == PRO_OR_ESM_REQUIRED:
-                f.detail = f"{f.detail} APT has no suitable candidate: {reasons}."
+                f.detail = f"{f.detail} The Ubuntu archive has no suitable candidate: {reasons}."
                 continue
             f.status = FIX_NOT_IN_CONFIGURED_REPOS
-            hint = f" {stale}" if stale else " Possible causes: APT lists not updated, repository"
-            if not stale:
-                hint += " missing from the APT configuration, or architecture mismatch."
-            f.detail = f"Fixed version {f.fixed_version} is known but {reasons}.{hint}"
+            f.detail = (
+                f"Fixed version {f.fixed_version} is known but {reasons}. The workstation's "
+                f"private APT lists ({archive}, {facts.architecture}) were current for this "
+                "analysis, so the fix is not published in those pockets."
+            )
             continue
         if f.status == PRO_OR_ESM_REQUIRED:
             f.status = PATCH_AVAILABLE
-            f.detail = (
-                f"Fix available from Ubuntu Pro ({f.pocket}), which is enabled on this server."
-            )
+            f.detail = f"The Ubuntu archive ({archive}) already offers a fixed version."
         if not ok:
             f.status = ANALYSIS_ERROR
             f.detail = "APT candidate equals the installed version although a fix is required."
@@ -560,11 +572,17 @@ def resolve_all(
             )
             continue
         try:
-            findings.extend(resolve_cve(cve, record, facts))
+            resolved = resolve_cve(cve, record, facts)
         except Exception as exc:  # noqa: BLE001 - one bad CVE must not break the server report
             findings.append(
                 Finding(
                     cve=cve, source=None, status=ANALYSIS_ERROR, detail=f"Analysis error: {exc}"
                 )
             )
+            continue
+        note = record.cache_note if record is not None else None
+        if note:  # ubuntu.com was unreachable: say which verdicts rest on older data
+            for finding in resolved:
+                finding.detail = f"{finding.detail} ({note})" if finding.detail else note
+        findings.extend(resolved)
     return findings

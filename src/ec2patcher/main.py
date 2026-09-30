@@ -11,7 +11,14 @@ import uvicorn
 
 from ec2patcher import __version__
 from ec2patcher.app import DEFAULT_ALLOWED_HOSTS, create_app
-from ec2patcher.config import DB_FILENAME, DEFAULT_HOST, DEFAULT_PORT, LOG_FILENAME, get_data_dir
+from ec2patcher.config import (
+    DB_FILENAME,
+    DEFAULT_APT_MAX_AGE_HOURS,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    LOG_FILENAME,
+    get_data_dir,
+)
 
 
 def setup_logging(log_path) -> None:
@@ -40,9 +47,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--data-dir", help="data directory (default: per-user data dir, or $EC2PATCHER_DATA_DIR)"
     )
+    parser.add_argument(
+        "--apt-state-dir",
+        help="private APT state for local package resolution (default: <data-dir>/apt, "
+        "or $EC2PATCHER_APT_STATE_DIR)",
+    )
+    parser.add_argument(
+        "--apt-max-age-hours",
+        type=float,
+        help="refresh the private APT lists when older than this (default "
+        f"{DEFAULT_APT_MAX_AGE_HOURS:g}, or $EC2PATCHER_APT_MAX_AGE_HOURS; 0 = every run)",
+    )
     parser.add_argument("--no-browser", action="store_true", help="do not open a web browser")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
+    if args.apt_max_age_hours is not None and not args.apt_max_age_hours >= 0:
+        parser.error("--apt-max-age-hours must be a non-negative number")
 
     data_dir = get_data_dir(args.data_dir)
     setup_logging(data_dir / LOG_FILENAME)
@@ -60,6 +80,8 @@ def main(argv: list[str] | None = None) -> None:
         db_path=data_dir / DB_FILENAME,
         shutdown_handler=request_shutdown,
         allowed_hosts=allowed_hosts,
+        apt_state_dir=args.apt_state_dir,
+        apt_max_age_hours=args.apt_max_age_hours,
     )
     config = uvicorn.Config(
         app, host=args.host, port=args.port, log_config=None, log_level="info", access_log=False
