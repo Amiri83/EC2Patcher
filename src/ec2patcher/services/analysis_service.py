@@ -34,7 +34,8 @@ from ec2patcher.services import (
     server_state,
     ssh_service,
 )
-from ec2patcher.services.security_metadata import SecurityMetadata
+from ec2patcher.services.security_metadata import FAILED as FAILED_LOOKUP
+from ec2patcher.services.security_metadata import MetadataUnreachable, SecurityMetadata
 from ec2patcher.services.severity import SEVERITIES, UNKNOWN, normalize_severity
 
 logger = logging.getLogger(__name__)
@@ -160,6 +161,8 @@ class AnalysisService:
             progress(f"Analyzing {label}")
             if not self.analyze_server(analysis, lambda m, label=label: progress(f"{label}: {m}")):
                 failures += 1
+            # Tallies after every server, so the status panel follows the run.
+            self.db.update_analysis_run(run_id, metadata_lookups=self.metadata.run_outcomes())
         self.db.update_analysis_run(
             run_id,
             status="completed_with_errors" if failures else "completed",
@@ -167,6 +170,94 @@ class AnalysisService:
             progress_message=None,
         )
         logger.info("Analysis run %s finished (%d server failure(s))", run_id, failures)
+
+    # --- retry failed Canonical lookups -------------------------------------------
+
+    def retry_failed_lookups(self, run_id: int) -> int | None:
+        """Re-resolve the CVEs of ``run_id`` whose Canonical lookup failed, in the background.
+
+        Returns the number of CVEs retried (0 = nothing to retry), or None if an analysis
+        is already running. Only the failed CVEs are requested from ubuntu.com again."""
+        with self._lock:
+            if self._running:
+                return None
+            run = self.db.get_analysis_run(run_id, details=False)
+            if run is None or run.is_running or not run.failed_lookups:
+                return 0
+            self._running = True
+        failed = run.failed_lookups
+        try:
+            self.db.update_analysis_run(
+                run_id, status="running", progress_message="Retrying failed Canonical lookups"
+            )
+            self.starter(lambda: self._retry_safely(run_id, run.status, set(failed)))
+        except Exception:
+            self._running = False
+            self.db.update_analysis_run(run_id, status=run.status, progress_message=None)
+            raise
+        logger.info("Retrying %d failed Canonical lookup(s) of run %s", len(failed), run_id)
+        return len(failed)
+
+    def _retry_safely(self, run_id: int, previous_status: str, failed: set[str]) -> None:
+        try:
+            self.retry_lookups(run_id, failed, previous_status)
+        except Exception:
+            logger.exception("Retrying the failed lookups of run %s crashed", run_id)
+            self.db.update_analysis_run(run_id, status=previous_status, progress_message=None)
+        finally:
+            self._running = False
+
+    def retry_lookups(self, run_id: int, failed: set[str], previous_status: str) -> None:
+        """Re-analyze the completed servers that reported a CVE in ``failed``.
+
+        Canonical is queried again for ``failed`` only; every other CVE is resolved from the
+        memo / disk cache (network only if it is missing there, e.g. after Clear Security
+        Cache). A server that cannot be re-analyzed keeps its previous results, and its
+        failed CVEs stay failed."""
+        run = self.db.get_analysis_run(run_id, details=True)
+        self.metadata.start_run()
+        self.nvd.start_run()
+        self.apt.start_run()
+
+        def lookup(cve: str):
+            if cve.strip().upper() in failed:
+                return self.metadata.lookup(cve)
+            try:
+                return self.metadata.lookup(cve, network=False)
+            except MetadataUnreachable:
+                return self.metadata.lookup(cve)
+
+        affected = [
+            s for s in run.servers
+            if s.status == "complete" and failed.intersection(s.reported_cves)
+        ]  # fmt: skip
+        still_failed: set[str] = set()
+        for index, analysis in enumerate(affected, start=1):
+            label = f"{analysis.server_name} ({index} of {len(affected)})"
+            self.db.update_analysis_run(run_id, progress_message=f"Retrying lookups for {label}")
+            try:
+                error = self._analyze(analysis, lambda m: None, lookup)
+            except Exception as exc:
+                logger.exception("Retry for %s failed unexpectedly", analysis.server_name)
+                error = f"Unexpected error: {exc}"
+            if error:  # previous results are still stored and remain valid
+                logger.warning("Retry for %s failed: %s", analysis.server_name, error)
+                still_failed |= failed.intersection(analysis.reported_cves)
+
+        lookups = dict(run.metadata_lookups)
+        lookups.update(self.metadata.run_outcomes())
+        lookups.update(dict.fromkeys(still_failed, FAILED_LOOKUP))
+        self.db.update_analysis_run(
+            run_id,
+            status=previous_status,
+            progress_message=None,
+            metadata_checked_at=_now(),
+            metadata_lookups=lookups,
+        )
+        logger.info(
+            "Retried lookups of run %s: %d of %d still failed", run_id,
+            sum(1 for cve in failed if lookups.get(cve) == FAILED_LOOKUP), len(failed),
+        )  # fmt: skip
 
     # --- one server -----------------------------------------------------------------
 
@@ -193,8 +284,15 @@ class AnalysisService:
             server.ip_address, server.pem_path, command, runner=self.runner, timeout=timeout
         )
 
-    def _analyze(self, analysis: ServerAnalysis, progress: Callable[[str], None]) -> str | None:
-        """Analyze one server; return an error message if the whole server failed."""
+    def _analyze(
+        self,
+        analysis: ServerAnalysis,
+        progress: Callable[[str], None],
+        lookup: Callable[[str], object] | None = None,
+    ) -> str | None:
+        """Analyze one server; return an error message if the whole server failed.
+
+        ``lookup`` replaces the Canonical lookup (used to retry only the failed CVEs)."""
         server = self.db.get_server(analysis.server_id) if analysis.server_id else None
         if server is None:
             return "This server is no longer configured in EC2Patcher."
@@ -223,7 +321,10 @@ class AnalysisService:
 
         warnings = list(facts.warnings)
         metadata_status = self.metadata.status()
-        lookup = self.metadata.lookup if metadata_status.available else (lambda _cve: None)
+        if not metadata_status.available:
+            lookup = lambda _cve: None  # noqa: E731
+        elif lookup is None:
+            lookup = self.metadata.lookup
         findings = cve_resolver.resolve_all(analysis.reported_cves, lookup, facts)
         if not metadata_status.available:
             warning = f"Canonical security metadata is unavailable: {metadata_status.error}"

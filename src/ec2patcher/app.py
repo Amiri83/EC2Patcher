@@ -17,7 +17,7 @@ from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from ec2patcher import __version__
+from ec2patcher import __version__, config
 from ec2patcher.config import DB_FILENAME, get_apt_max_age, get_apt_state_dir, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
 from ec2patcher.formatting import format_size, format_timestamp
@@ -47,9 +47,12 @@ NOTICES = {
     "cleared": "All configured servers were removed ({count} deleted).",
     "not_found": "That server no longer exists.",
     "cache_cleared": (
-        "Security lookup memory cleared. The next analysis will query Canonical again."
+        "Security lookup memory and disk cache cleared. "
+        "The next analysis will query Canonical again."
     ),
-    "cache_clean": "Security lookup memory is already clear.",
+    "cache_clean": "Security lookup memory and disk cache are already clear.",
+    "lookups_retrying": "Retrying {count} failed Canonical lookup(s).",
+    "no_failed_lookups": "There are no failed Canonical lookups to retry.",
     "database_reset": "Database reset. All stored data was removed.",
 }
 
@@ -91,7 +94,11 @@ def create_app(
     interrupted = db.mark_interrupted_runs()
     if interrupted:
         logger.warning("Marked %d unfinished analysis run(s) as interrupted", interrupted)
-    metadata = metadata or SecurityMetadata()
+    metadata = metadata or SecurityMetadata(
+        timeout=config.get_canonical_timeout(),
+        max_age=config.get_canonical_cache_ttl(),
+        breaker_threshold=config.get_canonical_breaker_threshold(),
+    )
     apt = apt or local_apt.LocalApt(
         get_apt_state_dir(db.path.parent, apt_state_dir), get_apt_max_age(apt_max_age_hours)
     )
@@ -396,7 +403,20 @@ def create_app(
         summaries = {s.id: analysis_service.summarize(s) for s in run.servers}
         return render(
             request, "analysis_run.html", "reports", run=run, summaries=summaries,
+            notice=notice_from_query(request),
         )  # fmt: skip
+
+    @app.post("/analysis/{run_id}/retry-lookups", response_class=HTMLResponse)
+    def retry_failed_lookups(request: Request, run_id: int):
+        """Re-run only the Canonical lookups that failed in this run."""
+        if db.get_analysis_run(run_id, details=False) is None:
+            raise StarletteHTTPException(404)
+        count = analyzer.retry_failed_lookups(run_id)
+        if count is None:
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        if not count:
+            return redirect(f"/analysis/{run_id}", notice="no_failed_lookups")
+        return redirect(f"/analysis/{run_id}", notice="lookups_retrying", count=count)
 
     def stored_server_report(run_id: int, analysis_id: int):
         run = db.get_analysis_run(run_id, details=False)

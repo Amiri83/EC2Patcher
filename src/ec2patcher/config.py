@@ -20,6 +20,11 @@ APT_STATE_DIR_ENV = "EC2PATCHER_APT_STATE_DIR"
 APT_MAX_AGE_ENV = "EC2PATCHER_APT_MAX_AGE_HOURS"
 DEFAULT_APT_MAX_AGE_HOURS = 6.0  # 0 = run the private apt-get update on every analysis run
 
+# Canonical per-CVE lookups (unset = the defaults in services.security_metadata).
+CANONICAL_TIMEOUT_ENV = "EC2PATCHER_CANONICAL_TIMEOUT_SECONDS"  # per request, default 30
+CANONICAL_CACHE_TTL_ENV = "EC2PATCHER_CANONICAL_CACHE_TTL_HOURS"  # disk cache, default 24
+CANONICAL_BREAKER_ENV = "EC2PATCHER_CANONICAL_BREAKER_THRESHOLD"  # consecutive, default 3
+
 
 def get_data_dir(override: str | None = None) -> Path:
     """Persistent per-user data directory (e.g. ~/.local/share/ec2patcher on Linux)."""
@@ -42,3 +47,30 @@ def get_apt_max_age(override: float | None = None) -> timedelta:
     if not math.isfinite(hours) or hours < 0:
         raise ValueError(f"APT max age must be a non-negative number of hours, got {raw!r}")
     return timedelta(hours=hours)
+
+
+def _env_number(name: str, minimum: float) -> float | None:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return None
+    value = float(raw)
+    if not math.isfinite(value) or value < minimum:
+        raise ValueError(f"{name} must be a number >= {minimum:g}, got {raw!r}")
+    return value
+
+
+def get_canonical_timeout() -> float | None:
+    """Per-request timeout (seconds) of the Canonical Security API, or None for the default."""
+    return _env_number(CANONICAL_TIMEOUT_ENV, 1)
+
+
+def get_canonical_cache_ttl() -> timedelta | None:
+    """How long a cached Canonical CVE document is used without a request (None = default)."""
+    hours = _env_number(CANONICAL_CACHE_TTL_ENV, 0)
+    return None if hours is None else timedelta(hours=hours)
+
+
+def get_canonical_breaker_threshold() -> int | None:
+    """Consecutive failed lookups that stop further Canonical requests for the run."""
+    value = _env_number(CANONICAL_BREAKER_ENV, 1)
+    return None if value is None else int(value)

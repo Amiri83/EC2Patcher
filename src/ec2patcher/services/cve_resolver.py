@@ -572,11 +572,17 @@ def resolve_all(
             )
             continue
         try:
-            findings.extend(resolve_cve(cve, record, facts))
+            resolved = resolve_cve(cve, record, facts)
         except Exception as exc:  # noqa: BLE001 - one bad CVE must not break the server report
             findings.append(
                 Finding(
                     cve=cve, source=None, status=ANALYSIS_ERROR, detail=f"Analysis error: {exc}"
                 )
             )
+            continue
+        note = record.cache_note if record is not None else None
+        if note:  # ubuntu.com was unreachable: say which verdicts rest on older data
+            for finding in resolved:
+                finding.detail = f"{finding.detail} ({note})" if finding.detail else note
+        findings.extend(resolved)
     return findings
