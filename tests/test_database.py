@@ -104,7 +104,7 @@ def test_only_latest_report_kept(db):
 
 def test_schema_version_set(db):
     with sqlite3.connect(db.path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 8
 
 
 def cache_columns(path):
@@ -129,7 +129,7 @@ def test_v7_migration_creates_cve_metadata_cache(db_path):
         ("cve", "TEXT", 1), ("document", "TEXT", 0), ("fetched_at", "TEXT", 0),
     ]  # fmt: skip
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7  # not bumped
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     conn.close()
     db.put_cve_metadata("CVE-2026-50001", '{"id": "CVE-2026-50001"}', "t1")
     db.put_cve_metadata("CVE-2026-50001", None, "t2")  # upsert; NULL = confirmed 404
@@ -161,7 +161,7 @@ def test_reset_recreates_current_schema_and_instance_remains_usable(db):
     assert all(not path.exists() for path in sidecars)
     assert db.count_servers() == 0 and db.get_latest_report() is None
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 8
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }

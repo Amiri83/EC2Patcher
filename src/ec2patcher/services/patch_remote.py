@@ -5,10 +5,11 @@ APT archive file names, package names) and each value is additionally shell-quot
 command prints ``@@EC2P`` marked sections and ends with ``@@EC2P end`` so an incomplete
 output (lost connection) is never mistaken for a result.
 
-The only commands that change the server are: creating/cleaning the staging directory, and
-the single ``apt-get install`` of the explicit, verified local .deb files. There is no
-``apt-get upgrade``/``dist-upgrade``, no remote download (APT runs without any remote
-sources), no removal (``--no-remove``) and no reboot.
+The only commands that change the server are: creating/cleaning the staging directory, the
+single ``apt-get install`` of the explicit, verified local .deb files and, after a verified
+patch, ``sudo reboot`` when /run/reboot-required exists and the operator did not skip it.
+There is no ``apt-get upgrade``/``dist-upgrade``, no remote download (APT runs without any
+remote sources) and no removal (``--no-remove``).
 """
 
 import re
@@ -334,6 +335,70 @@ def parse_post_install(stdout: str) -> PostInstallState | None:
         reboot_packages=sorted(set(reboot[1:])),
         busy=busy[0] == "yes",
     )
+
+
+# --- reboot ---------------------------------------------------------------------------
+
+# Read-only: is a reboot pending right now, and which boot is this (to prove a reboot later).
+REBOOT_CHECK_COMMAND = (
+    f"echo '{MARK}reboot-check'; if [ -e /run/reboot-required ]; then echo yes; else echo no; "
+    f"fi; echo '{MARK}boot-id'; cat /proc/sys/kernel/random/boot_id; echo '{MARK}end'"
+)
+
+# The session usually drops while the server goes down, so a missing end marker is expected;
+# only a completed output with a non-zero exit status proves the reboot was refused.
+REBOOT_COMMAND = (
+    f"echo '{MARK}reboot-now'; sudo -n reboot 2>&1 </dev/null; rc=$?; "
+    f"echo '{MARK}rc'; echo $rc; echo '{MARK}end'"
+)
+
+# Read-only, after reconnecting: boot id (must differ from before), uptime and kernel.
+BOOT_STATE_COMMAND = (
+    f"echo '{MARK}boot-state'; cat /proc/sys/kernel/random/boot_id; "
+    f"echo '{MARK}uptime'; uptime -p; echo '{MARK}kernel'; uname -r; echo '{MARK}end'"
+)
+
+
+@dataclass
+class RebootCheck:
+    required: bool
+    boot_id: str
+
+
+def _first(sections: dict[str, list[str]], name: str) -> str:
+    return next((ln.strip() for ln in sections.get(name, []) if ln.strip()), "")
+
+
+def parse_reboot_check(stdout: str) -> RebootCheck | None:
+    sections = split_sections(stdout)
+    flag, boot_id = _first(sections, "reboot-check"), _first(sections, "boot-id")
+    if "end" not in sections or flag not in ("yes", "no") or not boot_id:
+        return None
+    return RebootCheck(flag == "yes", boot_id)
+
+
+def parse_reboot_refused(stdout: str) -> str | None:
+    """The reason if ``sudo reboot`` provably failed; None if it was (probably) issued."""
+    result = parse_apt(stdout, "reboot-now")
+    if not result.complete or result.returncode == 0:
+        return None
+    detail = "; ".join(ln.strip() for ln in result.output if ln.strip())[:300]
+    return f"sudo reboot failed (exit {result.returncode})" + (f": {detail}" if detail else ".")
+
+
+@dataclass
+class BootState:
+    boot_id: str
+    uptime: str
+    kernel: str
+
+
+def parse_boot_state(stdout: str) -> BootState | None:
+    sections = split_sections(stdout)
+    boot_id = _first(sections, "boot-state")
+    if "end" not in sections or not boot_id:
+        return None
+    return BootState(boot_id, _first(sections, "uptime"), _first(sections, "kernel"))
 
 
 # --- cleanup --------------------------------------------------------------------------

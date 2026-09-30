@@ -220,6 +220,7 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 .step-warning { color: var(--warning); }
 .step-pending { color: var(--muted); }
 .preview-form { align-items: center; margin-top: 12px; }
+.check-label { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; cursor: pointer; }
 select { padding: 6px 8px; font: inherit; border: 1px solid var(--border); border-radius: var(--radius); }
 
 /* Misc */

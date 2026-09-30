@@ -11,7 +11,7 @@
     <dt>Packages to Update</dt><dd>{{ patch.packages }}</dd>
     <dt>.deb Files</dt><dd>{{ patch.debs }}</dd>
     <dt>Expected Download Size</dt><dd>{{ patch.download_bytes|filesize }}</dd>
-    <dt>Expected Reboot</dt><dd>{% if analysis.expected_reboot %}<strong>YES EXPECTED</strong> (EC2Patcher will not reboot the server){% else %}NO{% endif %}</dd>
+    <dt>Expected Reboot</dt><dd>{% if analysis.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}NO{% endif %}</dd>
     <dt>Local Staging Path</dt><dd><code>{{ patch.local_path }}</code></dd>
     <dt>Remote Staging Path</dt><dd><code>{{ patch.remote_path }}</code></dd>
   </dl>
@@ -28,9 +28,10 @@
     </tbody>
   </table>
   </div>
-  <p class="muted small">The server is revalidated first; if anything changed since this analysis the patch is aborted before any download. Only the approved .deb files are installed (no apt upgrade / dist-upgrade). No automatic reboot.</p>
+  <p class="muted small">The server is revalidated first; if anything changed since this analysis the patch is aborted before any download. Only the approved .deb files are installed (no apt upgrade / dist-upgrade). After a verified patch and cleanup the server is rebooted with <code>sudo reboot</code> only if <code>/run/reboot-required</code> exists on it and Skip reboot is unchecked; EC2Patcher then waits up to 10 minutes for SSH to come back.</p>
   <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/approve" class="form-actions">
     <input type="hidden" name="confirm" value="yes">
+    <label class="check-label"><input type="checkbox" name="skip_reboot" value="1"> Skip reboot</label>
     <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}" class="btn btn-secondary">Cancel</a>
     <button type="submit" class="btn btn-danger" data-once>Approve &amp; Start Patching</button>
   </form>
