@@ -24,12 +24,16 @@ from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.services import (
     analysis_service,
     cve_resolver,
+    downloader,
     excel_export,
     local_apt,
     nvd,
+    patch_service,
     report_service,
     ssh_service,
+    staging,
 )
+from ec2patcher.services import patch_state as ps
 from ec2patcher.services.security_metadata import SecurityMetadata
 from ec2patcher.services.severity import SEVERITIES, SEVERITY_CLASSES
 from ec2patcher.validation import tag_rows, validate_server_input
@@ -56,6 +60,9 @@ NOTICES = {
     "cves_retrying": "Retrying {count} CVE(s) from the Investigate bucket.",
     "nothing_to_investigate": "There are no CVEs in the Investigate bucket to retry.",
     "database_reset": "Database reset. All stored data was removed.",
+    "saved": "Settings saved.",
+    "reset": "Settings reset to default.",
+    "rejected": "Patching was rejected for this report. No action was taken.",
 }
 
 
@@ -91,6 +98,8 @@ def create_app(
     apt: local_apt.LocalApt | None = None,
     apt_state_dir: str | None = None,
     apt_max_age_hours: float | None = None,
+    patch_starter: patch_service.Starter | None = None,
+    patch_fetcher: downloader.Fetcher | None = None,
 ) -> FastAPI:
     db = Database(db_path or get_data_dir() / DB_FILENAME)
     interrupted = db.mark_interrupted_runs()
@@ -112,6 +121,16 @@ def create_app(
         starter=analysis_starter or analysis_service.thread_starter,
         nvd_client=nvd_client,
         apt=apt,
+    )
+    interrupted = db.mark_interrupted_executions()
+    if interrupted:
+        logger.warning("Marked %d unfinished patch execution(s) as failed/unknown", interrupted)
+    patcher = patch_service.PatchService(
+        db,
+        runner=ssh_runner or subprocess.run,
+        starter=patch_starter or patch_service.thread_starter,
+        fetcher=patch_fetcher,
+        analysis_running=lambda: analyzer.is_running,
     )
 
     @asynccontextmanager
@@ -138,7 +157,11 @@ def create_app(
     templates.env.globals["apt_state_dir"] = apt.root
     templates.env.globals["apt_max_age_hours"] = apt.max_age.total_seconds() / 3600
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
+    templates.env.globals["patch_labels"] = ps.LABELS
+    templates.env.globals["patch_badges"] = ps.BADGES
+    templates.env.globals["default_staging_template"] = staging.DEFAULT_LOCAL_TEMPLATE
     app.state.analyzer = analyzer
+    app.state.patcher = patcher
 
     def run_ssh_test(name: str, ip: str, pem: str) -> ssh_service.SSHTestResult:
         if ssh_runner is not None:
@@ -453,19 +476,77 @@ def create_app(
             return redirect(page, notice="nothing_to_investigate")
         return redirect(page, notice="cves_retrying", count=count)
 
-    @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
-    def server_report(request: Request, run_id: int, analysis_id: int):
+    def server_report_page(
+        request: Request, run_id: int, analysis_id: int, status_code: int = 200, **ctx
+    ):
         run, analysis = stored_server_report(run_id, analysis_id)
         latest = db.get_latest_analysis_run()
         groups = analysis_service.remediation_groups(analysis.findings)
+        ctx.setdefault("notice", notice_from_query(request))
         return render(
-            request, "server_report.html", "reports", run=run, analysis=analysis,
-            summary=analysis_service.summarize(analysis),
+            request, "server_report.html", "reports", status_code=status_code, run=run,
+            analysis=analysis, summary=analysis_service.summarize(analysis),
             finding_groups=analysis_service.group_findings(analysis),
             remediation_groups=groups,
             finding_buckets=analysis_service.bucket_groups(groups),
             is_latest=latest is not None and latest.id == run_id,
-            notice=notice_from_query(request),
+            patch=patcher.eligibility(analysis), **ctx,
+        )  # fmt: skip
+
+    @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
+    def server_report(request: Request, run_id: int, analysis_id: int):
+        return server_report_page(request, run_id, analysis_id)
+
+    # --- patch execution (Phase 3) ---------------------------------------------------
+
+    @app.get("/analysis/{run_id}/servers/{analysis_id}/approve", response_class=HTMLResponse)
+    def confirm_patch(request: Request, run_id: int, analysis_id: int):
+        run, analysis = stored_server_report(run_id, analysis_id)
+        check = patcher.eligibility(analysis)
+        if not check.allowed:
+            return server_report_page(
+                request, run_id, analysis_id, status_code=409,
+                error="Patching is not available for this report: " + " ".join(check.reasons),
+            )  # fmt: skip
+        return render(
+            request, "patch_confirm.html", "reports", run=run, analysis=analysis, patch=check
+        )
+
+    @app.post("/analysis/{run_id}/servers/{analysis_id}/approve", response_class=HTMLResponse)
+    def approve_patch(request: Request, run_id: int, analysis_id: int, confirm: str = Form("")):
+        stored_server_report(run_id, analysis_id)
+        if confirm != "yes":
+            return redirect(f"/analysis/{run_id}/servers/{analysis_id}/approve")
+        try:
+            execution_id = patcher.approve(analysis_id)
+        except patch_service.PatchNotAllowedError as exc:
+            logger.warning("Patch approval refused for analysis %s: %s", analysis_id, exc)
+            return server_report_page(
+                request, run_id, analysis_id, status_code=409,
+                error=f"Patching was not started. {exc}",
+            )  # fmt: skip
+        return redirect(f"/patch/{execution_id}")
+
+    @app.post("/analysis/{run_id}/servers/{analysis_id}/reject", response_class=HTMLResponse)
+    def reject_patch(request: Request, run_id: int, analysis_id: int, confirm: str = Form("")):
+        stored_server_report(run_id, analysis_id)
+        if confirm != "yes":
+            return redirect(f"/analysis/{run_id}/servers/{analysis_id}")
+        try:
+            patcher.reject(analysis_id)
+        except patch_service.PatchNotAllowedError as exc:
+            return server_report_page(request, run_id, analysis_id, status_code=409, error=str(exc))
+        return redirect(f"/analysis/{run_id}/servers/{analysis_id}", notice="rejected")
+
+    @app.get("/patch/{execution_id}", response_class=HTMLResponse)
+    def patch_execution(request: Request, execution_id: int):
+        execution = db.get_execution(execution_id)
+        if execution is None:
+            raise StarletteHTTPException(404)
+        return render(
+            request, "patch_execution.html", "history", execution=execution,
+            steps=patch_service.progress_steps(execution),
+            is_active=execution.state in ps.ACTIVE,
         )  # fmt: skip
 
     @app.get("/analysis/{run_id}/servers/{analysis_id}/export.xlsx")
@@ -485,14 +566,31 @@ def create_app(
 
     @app.get("/history", response_class=HTMLResponse)
     def history(request: Request):
-        return render(request, "history.html", "history")
+        return render(request, "history.html", "history", executions=db.list_executions())
+
+    def settings_page(request: Request, status_code: int = 200, **ctx):
+        template = ctx.pop("template", None) or patcher.staging_template()
+        names = sorted(db.server_names(), key=str.casefold)
+        preview_name = ctx.pop("preview_name", None) or (names[0] if names else "ip-10-0-0-1")
+        preview, preview_error = None, None
+        try:
+            preview = staging.resolve_local(template, preview_name)
+        except staging.StagingError as exc:
+            preview_error = str(exc)
+        return render(
+            request, "settings.html", "settings", status_code=status_code, db_path=db.path,
+            staging_template=template, saved_template=patcher.staging_template(), preview=preview,
+            preview_error=preview_error, preview_name=preview_name, server_names=names,
+            remote_example=f"{staging.REMOTE_BASE}/{preview_name}",
+            metadata_status=metadata.status(), **ctx,
+        )  # fmt: skip
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings(request: Request):
-        return render(
-            request, "settings.html", "settings", db_path=db.path,
-            metadata_status=metadata.status(), notice=notice_from_query(request),
-        )  # fmt: skip
+        preview_name = request.query_params.get("server", "")
+        if staging.safe_name_error(preview_name):
+            preview_name = None
+        return settings_page(request, notice=notice_from_query(request), preview_name=preview_name)
 
     @app.post("/settings/clear-cache")
     def clear_security_cache():
@@ -502,18 +600,30 @@ def create_app(
     @app.post("/settings/reset-database", response_class=HTMLResponse)
     def reset_database(request: Request, confirm_text: str = Form("")):
         if analyzer.is_running:
-            return render(
-                request, "settings.html", "settings", status_code=409, db_path=db.path,
-                metadata_status=metadata.status(),
-                error="Database cannot be reset during analysis.",
-            )  # fmt: skip
+            return settings_page(
+                request, status_code=409, error="Database cannot be reset during analysis."
+            )
+        if patcher.is_running:
+            return settings_page(
+                request, status_code=409, error="Database cannot be reset during patching."
+            )
         if confirm_text != "RESET":
-            return render(
-                request, "settings.html", "settings", status_code=400, db_path=db.path,
-                metadata_status=metadata.status(), error="Type RESET exactly to confirm.",
-            )  # fmt: skip
+            return settings_page(request, status_code=400, error="Type RESET exactly to confirm.")
         db.reset()
         return redirect("/settings", notice="database_reset")
+
+    @app.post("/settings/staging", response_class=HTMLResponse)
+    def save_staging(request: Request, action: str = Form("save"), template: str = Form("")):
+        if action == "reset":
+            db.delete_setting(patch_service.STAGING_SETTING)
+            logger.info("Local patch download directory reset to default")
+            return redirect("/settings", notice="reset")
+        error = staging.check_template(template)
+        if error:
+            return settings_page(request, status_code=422, template=template, template_error=error)
+        db.set_setting(patch_service.STAGING_SETTING, template.strip())
+        logger.info("Local patch download directory set to %s", template.strip())
+        return redirect("/settings", notice="saved")
 
     # --- shutdown ------------------------------------------------------------
 

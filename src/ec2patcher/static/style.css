@@ -209,6 +209,19 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 .table .wrap { word-break: break-all; }
 .plain-list { margin: 0; padding-left: 18px; }
 
+/* Patch execution (Phase 3) */
+.patch-decision { border-left: 4px solid var(--primary); }
+.patch-decision .form-actions form { margin: 0; }
+.step-list { list-style: none; margin: 0; padding: 0; }
+.step { display: flex; gap: 10px; padding: 4px 0; }
+.step-done .progress-icon { color: var(--success); }
+.step-running .progress-icon { color: var(--primary); }
+.step-failed { color: var(--danger); font-weight: 600; }
+.step-warning { color: var(--warning); }
+.step-pending { color: var(--muted); }
+.preview-form { align-items: center; margin-top: 12px; }
+select { padding: 6px 8px; font: inherit; border: 1px solid var(--border); border-radius: var(--radius); }
+
 /* Misc */
 .empty-state { text-align: center; padding: 28px 12px; }
 .empty-title { font-weight: 600; font-size: 16px; margin: 0 0 4px; }

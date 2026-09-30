@@ -133,6 +133,86 @@ class ServerAnalysis:
     plan: list[PackagePlanRow] = field(default_factory=list)
 
 
+# --- Phase 3: patch decisions and executions (separate from the analysis snapshot) ------
+
+
+@dataclass
+class PatchPackageResult:
+    id: int
+    binary_package: str
+    architecture: str
+    before_version: str | None
+    target_version: str
+    after_version: str | None
+    deb_filename: str
+    size: int | None
+    checksum: str | None
+    is_dependency: bool
+    download_result: str | None
+    checksum_result: str | None
+    transfer_result: str | None
+    install_result: str | None
+    verification_result: str | None
+    detail: str | None
+
+
+@dataclass
+class PatchCveResult:
+    id: int
+    cve: str
+    source_package: str | None
+    fixed_version: str | None
+    resulting_version: str | None
+    result: str
+    detail: str | None
+
+
+@dataclass
+class PatchExecution:
+    id: int
+    analysis_run_id: int
+    server_analysis_id: int
+    server_id: int | None
+    server_name: str
+    display_name: str | None
+    ip_address: str | None
+    decision: str  # APPROVED | REJECTED
+    decided_at: str
+    state: str
+    failure_stage: str | None
+    started_at: str | None
+    finished_at: str | None
+    updated_at: str
+    local_staging_path: str | None
+    remote_staging_path: str | None
+    local_staging_created: bool
+    remote_staging_created: bool
+    expected_reboot: bool | None
+    expected_reboot_reason: str | None
+    reboot_required_after: bool | None
+    reboot_required_packages: list[str]
+    error_title: str | None
+    error_summary: str | None
+    error_package: str | None
+    partial_state_possible: bool
+    cleanup_status: str | None
+    cleanup_detail: str | None
+    install_started_at: str | None
+    install_finished_at: str | None
+    install_exit_status: int | None
+    install_output: str | None
+    simulation_output: str | None
+    audit_ok: bool | None
+    audit_output: str | None
+    notes: list[str] = field(default_factory=list)
+    packages: list[PatchPackageResult] = field(default_factory=list)
+    cves: list[PatchCveResult] = field(default_factory=list)
+
+    @property
+    def cves_verified(self) -> int:
+        return sum(1 for c in self.cves if c.result == "VERIFIED")
+
+
 @dataclass
 class AnalysisRun:
     id: int

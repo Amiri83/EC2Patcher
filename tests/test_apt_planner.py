@@ -206,3 +206,37 @@ def test_candidate_arguments_refuse_unsafe_names():
     policy, show = ap.candidate_arguments(["libssl3t64:amd64"])
     assert policy == ["policy", "--", "libssl3t64:amd64"]
     assert show == ["show", "--no-all-versions", "--", "libssl3t64:amd64"]
+
+
+def test_epoch_packages_resolve_with_real_pool_uris():
+    """Real apt output (Ubuntu 24.04): the pool URI omits the epoch, the archive name keeps it."""
+    from ec2patcher.services.apt_planner import parse_plan
+
+    requests = [("libaudit1", "1:3.1.2-2.1ubuntu0.1")]
+    stdout = "\n".join(
+        [
+            "@@EC2P simulate",
+            "Inst libaudit-common [1:3.1.2-2.1build1.1] (1:3.1.2-2.1ubuntu0.1 Ubuntu:24.04/noble-updates [all])",  # noqa: E501
+            "Inst libaudit1 [1:3.1.2-2.1build1.1] (1:3.1.2-2.1ubuntu0.1 Ubuntu:24.04/noble-updates [amd64])",  # noqa: E501
+            "@@EC2P simulate-rc", "0", "@@EC2P uris",
+            "'http://archive.ubuntu.com/ubuntu/pool/main/a/audit/libaudit-common_3.1.2-2.1ubuntu0.1_all.deb' libaudit-common_1%3a3.1.2-2.1ubuntu0.1_all.deb 5948 SHA256:b1b6fca3f7ed86db971c073352a6741f1f60f4a94eeb2c1eb0aca8a7e4b11660",  # noqa: E501
+            "'http://archive.ubuntu.com/ubuntu/pool/main/a/audit/libaudit1_3.1.2-2.1ubuntu0.1_amd64.deb' libaudit1_1%3a3.1.2-2.1ubuntu0.1_amd64.deb 47082 SHA256:326a55fce45a620f12b98baf581fb037eb0fcea1ab3969c54cf177f51be8abfe",  # noqa: E501
+            "@@EC2P uris-rc", "0", "@@EC2P end",
+        ]
+    )  # fmt: skip
+    plan = parse_plan(stdout, requests)
+    assert plan.ok
+    assert [(d.package, d.deb_filename, d.error) for d in plan.packages] == [
+        ("libaudit-common", "libaudit-common_1%3a3.1.2-2.1ubuntu0.1_all.deb", None),
+        ("libaudit1", "libaudit1_1%3a3.1.2-2.1ubuntu0.1_amd64.deb", None),
+    ]
+
+
+def test_uri_basename_must_still_match_package():
+    from ec2patcher.services.apt_planner import uri_basename_matches
+
+    name = "libaudit1_1%3a3.1.2-2_amd64.deb"
+    assert uri_basename_matches("http://a/pool/libaudit1_3.1.2-2_amd64.deb", name)
+    assert uri_basename_matches("http://a/pool/libaudit1_1%3a3.1.2-2_amd64.deb", name)
+    assert not uri_basename_matches("http://a/pool/libaudit1_3.1.2-3_amd64.deb", name)
+    assert not uri_basename_matches("http://a/pool/evil_3.1.2-2_amd64.deb", name)
