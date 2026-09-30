@@ -169,11 +169,16 @@ Approving (after a confirmation page) runs this pipeline; every step must pass:
 
 1. **Revalidate**: reconnect and compare hostname, Ubuntu version/codename, architecture and
    the installed version of every planned package with the analysis. Any drift aborts with
-   *PATCH ABORTED — SERVER STATE CHANGED* before anything is downloaded. `sudo -n true` must
+   *PATCH ABORTED — SERVER STATE CHANGED* before anything is downloaded. A package that is
+   already installed at its target version is not drift: it is dropped from the plan (and its
+   CVEs are still verified after the install). If every package is already at its target the
+   execution ends as **ALREADY PATCHED** without touching the server. `sudo -n true` must
    work (no password prompt, ever).
 2. **Download** each approved `.deb` once from its recorded URI into the local staging
    directory as `<file>.part`; it is renamed only after size and SHA256 match the plan.
 3. **Transfer** with `scp` to `/tmp/<server name>` on the server and verify size + `sha256sum`.
+   A failed copy is retried once; the exit code and stderr of every attempt are shown on the
+   execution page. If the retry fails too, local and remote staging are cleaned up.
 4. **Simulate** `apt-get -s install <explicit .deb paths>`; the simulation must install exactly
    the approved packages/versions from the staged files, with no removal or downgrade.
 5. **Install** `sudo -n apt-get install -y <explicit .deb paths>`. APT runs with **no remote
@@ -190,7 +195,7 @@ Approving (after a confirmation page) runs this pipeline; every step must pass:
    *Rebooting*, *Rebooted*, *REBOOT FAILED*, *Not run* after a failed patch) is stored in the
    history; the patch result itself is not changed by the reboot.
 
-On any failure the staging files are kept and their paths shown; a new analysis is required
+On any other failure the staging files are kept and their paths shown; a new analysis is required
 before trying again. A failed or interrupted install is never retried or rolled back; if the
 connection drops, the server is inspected once more and the result is either proven or
 recorded as *EXECUTION STATE UNKNOWN*. Each approved report can be executed once, and only
@@ -206,7 +211,8 @@ empty or when they hold EC2Patcher's own files; cleanup deletes only the files i
 The analysis run page has a **Patch All** button with a **Skip reboot** checkbox (unchecked by
 default). It opens one confirmation page listing the eligible servers in queue order and the
 servers that are **SKIPPED** with their reasons (unresolved plan, Canonical metadata
-unavailable, newer analysis, nothing to install, …). After confirming, the servers are patched
+unavailable, nothing to install, …). A server that was analyzed again after this run is
+patched from its **latest** analysis (linked on the confirmation page). After confirming, the servers are patched
 **one at a time** with the per-server pipeline above (including the reboot step). The queue
 **stops at the first failure** (a failed/unknown patch or a failed reboot); the remaining
 servers are shown as **NOT RUN**. A cleanup warning does not stop the queue.

@@ -22,6 +22,8 @@ SUCCESS = "SUCCESS"
 SUCCESS_WITH_CLEANUP_WARNING = "SUCCESS_WITH_CLEANUP_WARNING"
 FAILED = "FAILED"
 UNKNOWN = "UNKNOWN"
+# Revalidation found every approved package already at its target version: nothing to do.
+ALREADY_PATCHED = "ALREADY_PATCHED"
 
 # Pipeline order (used for progress display).
 PIPELINE = [
@@ -40,7 +42,7 @@ PIPELINE = [
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     PENDING_REVIEW: frozenset({APPROVED, REJECTED}),
     APPROVED: frozenset({REVALIDATING, FAILED}),
-    REVALIDATING: frozenset({DOWNLOADING, FAILED}),
+    REVALIDATING: frozenset({DOWNLOADING, FAILED, ALREADY_PATCHED}),
     DOWNLOADING: frozenset({VERIFYING_DOWNLOADS, FAILED}),
     VERIFYING_DOWNLOADS: frozenset({TRANSFERRING, FAILED}),
     TRANSFERRING: frozenset({VERIFYING_TRANSFER, FAILED}),
@@ -56,11 +58,14 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     SUCCESS_WITH_CLEANUP_WARNING: frozenset(),
     FAILED: frozenset(),
     UNKNOWN: frozenset(),
+    ALREADY_PATCHED: frozenset(),
 }
 
 TERMINAL = frozenset(s for s, targets in ALLOWED_TRANSITIONS.items() if not targets)
 ACTIVE = frozenset(PIPELINE)  # an approved execution that has not finished
 SUCCESSFUL = frozenset({SUCCESS, SUCCESS_WITH_CLEANUP_WARNING})
+# The server ends at the approved versions: a "Patch All" queue moves on to the next one.
+DONE = SUCCESSFUL | {ALREADY_PATCHED}
 # States in which remote packages may already have been modified.
 POST_INSTALL = frozenset({INSTALLING, VERIFYING_INSTALL, CLEANING_UP})
 
@@ -81,6 +86,7 @@ LABELS = {
     SUCCESS_WITH_CLEANUP_WARNING: "PATCH SUCCESSFUL (cleanup warning)",
     FAILED: "PATCH FAILED",
     UNKNOWN: "EXECUTION STATE UNKNOWN",
+    ALREADY_PATCHED: "ALREADY PATCHED",
 }
 
 BADGES = {
@@ -89,6 +95,7 @@ BADGES = {
     SUCCESS_WITH_CLEANUP_WARNING: "badge-success",
     FAILED: "badge-danger",
     UNKNOWN: "badge-danger",
+    ALREADY_PATCHED: "badge-success",
 }
 
 
@@ -96,7 +103,8 @@ BADGES = {
 # Set at approval: PENDING (reboot allowed) or SKIPPED (operator chose "Skip reboot").
 # After a verified patch PENDING becomes NOT_REQUIRED (no /run/reboot-required on the
 # server) or REQUESTED (sudo reboot issued, waiting for SSH) -> DONE / FAILED. A patch that
-# fails never reboots: PENDING -> NOT_RUN.
+# fails never reboots: PENDING -> NOT_RUN. Neither does an ALREADY_PATCHED server (nothing was
+# installed by EC2Patcher): PENDING -> NOT_RUN.
 REBOOT_PENDING = "PENDING"
 REBOOT_SKIPPED = "SKIPPED"
 REBOOT_NOT_REQUIRED = "NOT_REQUIRED"

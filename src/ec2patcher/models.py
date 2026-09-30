@@ -214,6 +214,8 @@ class PatchExecution:
     post_reboot_uptime: str | None = None
     post_reboot_kernel: str | None = None
     queue_id: int | None = None  # set when started by "Patch All"
+    # One entry per scp attempt: {filename, attempt, ok, exit_code, stderr, error}.
+    transfer_attempts: list[dict] = field(default_factory=list)
     packages: list[PatchPackageResult] = field(default_factory=list)
     cves: list[PatchCveResult] = field(default_factory=list)
 
