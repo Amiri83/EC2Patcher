@@ -14,8 +14,13 @@
     <dt>Started</dt><dd>{{ run.started_at|timestamp }}</dd>
     {% if run.completed_at %}<dt>Finished</dt><dd>{{ run.completed_at|timestamp }}</dd>{% endif %}
     <dt>Canonical security metadata</dt>
-    <dd>{% if run.metadata_updated_at %}Online per-CVE lookup &middot; checked {{ run.metadata_checked_at|timestamp }}{% else %}<span class="muted">not available</span>{% endif %}
-        {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}</dd>
+    <dd>{% include "_metadata_status.html" %}
+      {% if run.failed_lookups and not run.is_running %}
+        <form method="post" action="/analysis/{{ run.id }}/retry-lookups" class="inline-form">
+          <button type="submit" class="btn btn-secondary btn-sm">Retry failed lookups ({{ run.failed_lookups|length }})</button>
+        </form>
+        <div class="muted small">Queries ubuntu.com again for the failed CVEs only and re-analyzes the servers that reported them.</div>
+      {% endif %}</dd>
   </dl>
   {% if run.is_running and run.progress_message %}
     <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>
@@ -45,10 +50,9 @@
           {% elif s.status == "complete" %}
             <div class="server-meta">
               <span>{{ sm.reported }} CVE{{ "" if sm.reported == 1 else "s" }}</span>
-              <span class="{% if sm.count('PATCH_AVAILABLE') %}text-danger{% endif %}">{{ sm.count("PATCH_AVAILABLE") }} patch available</span>
-              <span>{{ sm.count("ALREADY_FIXED", "NOT_AFFECTED", "PACKAGE_NOT_INSTALLED") }} no action</span>
-              {% set open = sm.count("FIX_NOT_IN_CONFIGURED_REPOS", "PRO_OR_ESM_REQUIRED", "NO_FIX_PUBLISHED", "PENDING_OR_DEFERRED", "UNKNOWN", "METADATA_UNAVAILABLE", "ANALYSIS_ERROR") %}
-              {% if open %}<span class="text-warning">{{ open }} unresolved / no fix</span>{% endif %}
+              {% for key, title, n in sm.buckets %}
+                <span class="bucket-count bucket-{{ key }}{% if n and key == 'action' %} text-danger{% elif n and key == 'investigate' %} text-warning{% endif %}">{{ title }}: {{ n }}</span>
+              {% endfor %}
               <span>{{ sm.packages }} package{{ "" if sm.packages == 1 else "s" }} to update</span>
               <span>Reboot: {% if s.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}no expected reboot{% endif %}</span>
             </div>

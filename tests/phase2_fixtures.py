@@ -6,10 +6,12 @@ Ubuntu 24.04 (noble) EC2 instance running an AWS kernel. APT output formats were
 from real apt 3.x runs (fixtures/apt_*_real.txt).
 """
 
+import re
 import subprocess
 from pathlib import Path
 
 from ec2patcher.services.security_metadata import SecurityMetadata, parse_cve_document
+from ec2patcher.services.server_state import split_sections
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -296,8 +298,7 @@ def facts_output(
     kernel=RUNNING_KERNEL,
     reboot="no",
     reboot_pkgs=(),
-    apt_stamp=1790400000,
-    now=1790460000,
+    reboot_hooks=("libssl3t64:amd64",),
     motd=True,
 ) -> str:
     packages = NOBLE_PACKAGES if packages is None else packages
@@ -306,8 +307,7 @@ def facts_output(
         lines += ["Welcome to Ubuntu 24.04.3 LTS (GNU/Linux 6.8.0-1021-aws x86_64)", ""]
     lines += ["@@EC2P hostname", "ip-10-0-0-245", "@@EC2P os-release", os_release]
     lines += ["@@EC2P arch", arch, "@@EC2P kernel", kernel, "@@EC2P reboot", reboot, *reboot_pkgs]
-    lines += ["@@EC2P apt-update-stamp"] + ([str(apt_stamp)] if apt_stamp else [])
-    lines += ["@@EC2P apt-lists-mtime", str(apt_stamp or 1790000000), "@@EC2P now", str(now)]
+    lines += ["@@EC2P reboot-hooks"] + [f"/var/lib/dpkg/info/{n}.postinst" for n in reboot_hooks]
     lines += ["@@EC2P dpkg"] + ["\t".join(p) for p in packages] + ["@@EC2P end"]
     return "\n".join(lines) + "\n"
 
@@ -395,12 +395,13 @@ PLAN_OUTPUT = (
 
 
 class ScriptedSSH:
-    """Fake ssh runner answering by remote command type and target IP."""
+    """Fake ssh runner answering the (only) facts command by target IP.
 
-    def __init__(self, facts=None, candidates=None, plan=None, failures=None):
+    Servers are read-only for patch planning: any other remote command - in particular an
+    apt-cache / apt-get query - fails the test."""
+
+    def __init__(self, facts=None, failures=None):
         self.facts = facts or facts_output()
-        self.candidates = candidates  # callable(names) -> str, or None for default
-        self.plan = PLAN_OUTPUT if plan is None else plan
         self.failures = failures or {}  # ip -> (returncode, stderr) or exception
         self.calls: list[list[str]] = []
 
@@ -413,16 +414,86 @@ class ScriptedSSH:
             raise failure
         if failure:
             return subprocess.CompletedProcess(args, failure[0], "", failure[1])
-        if "@@EC2P dpkg" in command:
-            out = self.facts
-        elif "apt-cache policy" in command:
-            names = [
-                n.strip("'")
-                for n in command.split("apt-cache policy -- ")[1].split(" 2>&1")[0].split()
-            ]
-            out = (self.candidates or candidates_output)(names)
-        elif "--print-uris" in command:
-            out = self.plan
-        else:
+        if "@@EC2P dpkg" not in command or "apt-cache" in command or "apt-get" in command:
             raise AssertionError(f"unexpected remote command: {command}")
-        return subprocess.CompletedProcess(args, 0, out, "")
+        return subprocess.CompletedProcess(args, 0, self.facts, "")
+
+
+# --- local APT backend -----------------------------------------------------------------
+
+_SOURCE_RE = re.compile(r"^deb \[arch=(\S+) signed-by=\S+\] (\S+) (\S+) (.+)$")
+
+
+def apt_options(args: list[str]) -> dict[str, str]:
+    return {args[i + 1].partition("=")[0]: args[i + 1].partition("=")[2]
+            for i, a in enumerate(args) if a == "-o"}  # fmt: skip
+
+
+def apt_operands(args: list[str]) -> list[str]:
+    """Arguments after the binary that are not ``-o key=value`` options."""
+    rest, skip = [], False
+    for arg in args[1:]:
+        if skip:
+            skip = False
+        elif arg == "-o":
+            skip = True
+        else:
+            rest.append(arg)
+    return rest
+
+
+class FakeApt:
+    """Fake workstation apt-get / apt-cache backend for local_apt.
+
+    ``update`` writes Packages index files for every line of the private sources.list into
+    the private Dir::State; queries answer from the fixture transcripts (``candidates`` /
+    ``plan``) and refuse to run before the private lists exist."""
+
+    def __init__(self, candidates=None, plan=None, update_error=None, policy_error=None):
+        self.candidates = candidates  # callable(names) -> marked transcript, or None
+        self.plan = PLAN_OUTPUT if plan is None else plan
+        self.update_error = update_error  # stderr of a failing apt-get update
+        self.policy_error = policy_error  # stderr of a failing apt-cache policy
+        self.calls: list[list[str]] = []
+        self.envs: list[dict] = []  # environment of each call
+        self.statuses: list[str] = []  # dpkg status files seen by queries
+
+    @property
+    def updates(self) -> list[list[str]]:
+        return [c for c in self.calls if apt_operands(c)[-1:] == ["update"]]
+
+    def __call__(self, args, **kwargs):
+        assert isinstance(args, list) and not kwargs.get("shell"), args
+        assert args[0] in ("apt-get", "apt-cache") and "sudo" not in args, args
+        self.calls.append(args)
+        self.envs.append(kwargs.get("env") or {})
+        opts, ops = apt_options(args), apt_operands(args)
+        lists = Path(opts["Dir::State"]) / "lists"
+        if ops[-1] == "update":
+            if self.update_error:
+                return subprocess.CompletedProcess(args, 100, "", self.update_error)
+            for line in Path(opts["Dir::Etc::sourcelist"]).read_text().splitlines():
+                arch, uri, suite, components = _SOURCE_RE.match(line).groups()
+                host = uri.split("://", 1)[1].replace("/", "_")
+                for comp in components.split():
+                    name = f"{host}_dists_{suite}_{comp}_binary-{arch}_Packages"
+                    (lists / name).write_text("")
+            return subprocess.CompletedProcess(args, 0, "Reading package lists...\n", "")
+        assert any(lists.glob("*_Packages")), "APT query before the private apt-get update"
+        self.statuses.append(Path(opts["Dir::State::status"]).read_text())
+        if ops[0] in ("policy", "show"):
+            if ops[0] == "policy" and self.policy_error:
+                return subprocess.CompletedProcess(args, 100, "", self.policy_error)
+            names = ops[ops.index("--") + 1 :]
+            text = (self.candidates or candidates_output)(names)
+            return subprocess.CompletedProcess(args, 0, _section(text, ops[0]), "")
+        sections = split_sections(self.plan)
+        key = "simulate" if ops[0] == "-s" else "uris"
+        assert ops[0] in ("-s", "--print-uris") and ops[1] == "install", ops
+        rc = int(next((ln for ln in sections.get(f"{key}-rc", []) if ln.strip()), "0"))
+        return subprocess.CompletedProcess(args, rc, _section(self.plan, key), "")
+
+
+def _section(text: str, name: str) -> str:
+    lines = split_sections(text).get(name, [])
+    return "\n".join(lines) + ("\n" if lines else "")

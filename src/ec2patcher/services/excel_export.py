@@ -136,8 +136,11 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         ("Report File", run.report_filename),
     ]
 
+    tally = run.lookup_tally
     if run.metadata_updated_at:
         metadata = "Online per-CVE lookup"
+        if tally.total:
+            metadata = f"{tally.state} per-CVE lookup · {tally.label}"
         if run.metadata_checked_at:
             metadata += f" · checked {format_timestamp(run.metadata_checked_at)}"
     else:
@@ -151,11 +154,11 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         rows.append(("Canonical Metadata Warning", run.metadata_warning))
 
     if analysis.apt_updated_at:
-        apt = f"Updated {format_timestamp(analysis.apt_updated_at)}"
+        apt = f"Workstation private lists updated {format_timestamp(analysis.apt_updated_at)}"
         if analysis.apt_age_hours is not None:
             apt += f" ({analysis.apt_age_hours:.1f} hours before analysis)"
     else:
-        apt = "unknown"
+        apt = "not used"
     current_reboot = _yes_no_unknown(analysis.current_reboot_required, "YES", "NO")
     if analysis.current_reboot_required and analysis.reboot_required_packages:
         current_reboot += f" ({', '.join(analysis.reboot_required_packages)})"
@@ -173,6 +176,7 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         ("Reboot Note", cve_resolver.REBOOT_HELP),
         ("Reported CVEs", summary.reported),
         *((f"Severity {s} (NVD CVSS)", summary.by_severity[s]) for s in SEVERITIES),
+        *((f"{title} (CVEs)", n) for _, title, n in summary.buckets),
         ("Patch available", summary.count(cve_resolver.PATCH_AVAILABLE)),
         ("Already fixed", summary.count(cve_resolver.ALREADY_FIXED)),
         ("Not affected", summary.count(cve_resolver.NOT_AFFECTED)),

@@ -49,18 +49,35 @@ page shows each server as *Waiting*, *Analyzing*, *Complete* or *Failed* (with t
 Servers are analyzed one after another; one failing server never affects the others. When it
 finishes, **View Report** opens the per-server pre-patch report.
 
-**Read-only.** For each server in the latest report, EC2Patcher runs three fixed commands over
+**Read-only.** For each server in the latest report, EC2Patcher runs **one** fixed command over
 the same SSH connection settings as the SSH test (`ubuntu@<ip>` with the configured PEM), as the
-unprivileged `ubuntu` user, **without sudo**:
+unprivileged `ubuntu` user, **without sudo**. It collects the facts: hostname,
+`/etc/os-release`, `dpkg --print-architecture`, `uname -r`, `/run/reboot-required(.pkgs)`,
+which installed maintainer scripts request a reboot, and `dpkg-query` (binary package, version,
+**source package**, source version, architecture and dependency fields).
 
-1. Facts: hostname, `/etc/os-release`, `dpkg --print-architecture`, `uname -r`,
-   `/run/reboot-required(.pkgs)`, APT list age, and `dpkg-query` (binary package, version,
-   **source package**, source version).
-2. APT candidates: `apt-cache policy` / `apt-cache show` for the affected binary packages, and
-   whether their installed maintainer scripts request a reboot.
+The server is never asked for APT candidates or plans. Those are resolved **on the
+workstation** against a private APT state per Ubuntu release and architecture
+(`<data dir>/apt/<codename>-<arch>/`, e.g. `noble-amd64`). Its `sources.list` holds only the
+Ubuntu archive pockets `<codename>`, `<codename>-updates` and `<codename>-security` (never
+`-proposed` / `-backports`) for the server's architecture. Every `apt-get` / `apt-cache` call
+passes `-o Dir::State=…`, `-o Dir::Cache=…`, `-o Dir::Etc::sourcelist=…` (plus the other
+`Dir::Etc` overrides), so the workstation's own APT configuration and state are never used or
+changed, and no `sudo` is needed:
+
+1. `apt-get update` on the private state, only when its lists are older than the configured
+   maximum age (default 6 hours, at most once per analysis run and release). If the update
+   fails, the affected findings are reported as *Analysis error*. Candidates are never guessed.
+2. APT candidates: `apt-cache policy` / `apt-cache show` for the affected binary packages,
+   evaluated against a dpkg status file rebuilt from the server's `dpkg-query` output.
 3. APT plan: `apt-get -s install ...` (simulation) and `apt-get --print-uris install ...` for
    the exact candidate versions. `--print-uris` prints the URI, `.deb` file name, size and
    SHA256 of every package the upgrade needs **without downloading anything**.
+
+Because the lists are always current, a candidate older than Canonical's fix means the fix is
+genuinely not published in those pockets (*Fixed version not in configured repositories*).
+Fixes published only in Ubuntu Pro / ESM stay *Ubuntu Pro / ESM required*, since the private
+state has no Pro credentials.
 
 Nothing is downloaded, copied, installed, removed or restarted. There is no SCP and no reboot.
 
@@ -75,7 +92,7 @@ each reported CVE and the server's Ubuntu release:
    (no substring matching).
 3. Versions are compared with Debian semantics (epochs, revisions, `~`), identical to
    `dpkg --compare-versions`.
-4. If a patch is required, the server's APT candidate must be at least the fixed version;
+4. If a patch is required, the archive's APT candidate must be at least the fixed version;
    otherwise the finding says *Fix known - suitable APT candidate not available* and why.
 5. The APT simulation + `--print-uris` produce the exact .deb plan. Packages fixing several
    CVEs appear once, linked to every CVE they fix.
@@ -158,6 +175,10 @@ Case doesn't matter on input. IDs are normalized to uppercase and de-duplicated.
 
 - Python 3.10+
 - OpenSSH client (`ssh`) on `PATH` (for SSH tests and analysis)
+- APT (`apt-get`, `apt-cache`) and the Ubuntu archive keyring
+  (`/usr/share/keyrings/ubuntu-archive-keyring.gpg`) on the workstation, plus internet access
+  to `archive.ubuntu.com` / `security.ubuntu.com` (or `ports.ubuntu.com` for arm64), for local
+  APT resolution
 - Internet access to `ubuntu.com` for per-CVE Canonical security metadata and to
   `services.nvd.nist.gov` for CVSS severity (optional: without it severities are Unknown)
 
@@ -184,6 +205,8 @@ Options:
 | `--host` | `127.0.0.1` | Bind address (localhost only by default; there is no authentication) |
 | `--port` | `8080` | Port |
 | `--data-dir` | per-user data dir | Where the database and log live (also `$EC2PATCHER_DATA_DIR`) |
+| `--apt-state-dir` | `<data dir>/apt` | Private APT state for local resolution (also `$EC2PATCHER_APT_STATE_DIR`) |
+| `--apt-max-age-hours` | `6` | Refresh the private APT lists when older than this; `0` = every run (also `$EC2PATCHER_APT_MAX_AGE_HOURS`) |
 | `--no-browser` | off | Do not open a browser |
 
 Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
@@ -195,6 +218,7 @@ Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
 | SQLite database | `~/.local/share/ec2patcher/ec2patcher.db` |
 | Log file | `~/.local/share/ec2patcher/ec2patcher.log` |
 | NVD CVSS cache | `~/.cache/ec2patcher/nvd/` |
+| Private APT state | `~/.local/share/ec2patcher/apt/<codename>-<arch>/` |
 
 Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
 user data directory. The schema is created and migrated automatically on startup. A database
@@ -208,9 +232,9 @@ analysis tables, Phase 2.2 adds the CVSS columns); existing servers, tags and re
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-The tests mock `ssh` and NVD and use fixture Canonical VEX data, NVD API responses and captured
-APT output, so they never need a real EC2 server, a real PEM, internet access or package
-installs.
+The tests mock `ssh`, NVD and the local `apt-get` / `apt-cache` backend and use fixture
+Canonical VEX data, NVD API responses and captured APT output, so they never need a real EC2
+server, a real PEM, internet access or package installs.
 
 ## Project layout
 
@@ -230,7 +254,8 @@ src/ec2patcher/
     debversion.py         Debian version comparison (dpkg semantics)
     cve_resolver.py       CVE status, APT candidate check, package plan, reboot expectation
     nvd.py                NVD CVE API 2.0 client + cache, CVSS selection (severity only)
-    apt_planner.py        apt-cache / apt-get -s / --print-uris commands and parsers
+    apt_planner.py        apt-cache / apt-get -s / --print-uris arguments and parsers
+    local_apt.py          private per-release APT state on the workstation (update, queries)
     analysis_service.py   background analysis runs, persistence
   templates/         Jinja2 templates
   static/            CSS + a small amount of vanilla JS
@@ -243,6 +268,6 @@ tests/               pytest suite
   It also rejects cross-site POSTs, which guards against CSRF and DNS-rebinding attacks from
   websites open in your browser.
 - The app never reads PEM contents. Subprocesses never use `shell=True`.
-- Analysis commands are fixed strings; package names and versions are validated against strict
-  patterns and shell-quoted. No `sudo`, no downloads, no installs.
+- The remote analysis command is a fixed string. Local APT commands are argument lists; package
+  names and versions are validated against strict patterns. No `sudo`, no downloads, no installs.
 - Unexpected errors show a generic message in the GUI; details go to the log.

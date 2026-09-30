@@ -11,6 +11,7 @@ from phase2_fixtures import (
     ALL_CVES,
     REAL_REPORT,
     ScriptedSSH,
+    apt_operands,
     facts_output,
     failing_fetcher,
     make_metadata,
@@ -22,7 +23,8 @@ from test_web import upload
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
 from ec2patcher.services import cve_resolver as cr
-from ec2patcher.services.analysis_service import AnalysisService, summarize
+from ec2patcher.services import server_state
+from ec2patcher.services.analysis_service import AnalysisService, investigate_cves, summarize
 from ec2patcher.services.security_metadata import SecurityMetadata
 
 GOOD, BAD = "ip-10-0-0-245", "ip-10-0-0-215"
@@ -90,18 +92,19 @@ def test_real_report_shape_end_to_end(setup, metadata):
     assert summarize(bad).cve_status == {"CVE-2026-63076": "NOT_ANALYZED"}
 
 
-def test_ssh_is_fixed_user_argument_list_without_shell(setup, metadata, pem_file):
+def test_ssh_is_fixed_user_argument_list_without_shell(setup, metadata, pem_file, fake_apt):
     ssh = ScriptedSSH()
     run_analysis(setup, metadata, ssh)
-    assert len(ssh.calls) == 6  # facts + APT candidates + APT plan, for each of the 2 servers
+    assert len(ssh.calls) == 2  # only the read-only facts command, once per server
     for args in ssh.calls:
         assert args[0] == "ssh" and args[1:3] == ["-i", str(pem_file)]
         assert args[-2] in (f"ubuntu@{GOOD_IP}", f"ubuntu@{BAD_IP}")
         remote = args[-1]
-        assert "sudo" not in remote
-        for cmd in re.findall(r"apt-get[^;]*", remote):
-            assert " -s " in cmd or "--print-uris" in cmd, cmd  # never a real install
+        assert remote == server_state.FACTS_COMMAND
+        assert "sudo" not in remote and "apt-get" not in remote and "apt-cache" not in remote
         assert "dpkg -i" not in remote and "scp" not in remote and "reboot " not in remote
+    # Candidates and the plan were resolved locally instead.
+    assert fake_apt.updates and any("--print-uris" in c for c in fake_apt.calls)
 
 
 def test_no_install_download_or_reboot_anywhere(setup, metadata, monkeypatch):
@@ -163,22 +166,206 @@ def test_lookup_failure_reports_unknown_and_continues_discovery(setup, tmp_path)
     assert len(ssh.calls) == 2  # facts only; no candidate check or package plan
 
 
-def test_plan_failure_keeps_required_updates_visible(setup, metadata):
-    plan = "@@EC2P simulate\nE: Unable to correct problems\n@@EC2P simulate-rc\n100\n@@EC2P uris\n@@EC2P uris-rc\n100\n@@EC2P end\n"  # noqa: E501
-    good = run_analysis(setup, metadata, ScriptedSSH(plan=plan)).servers[0]
+API = "https://ubuntu.com/security/cves/{}.json"
+
+
+def flaky_fetcher(calls, failing):
+    """online_fetcher that times out for the CVEs in ``failing`` (mutable)."""
+    base = online_fetcher()
+
+    def fetch(url):
+        calls.append(url)
+        if url.rsplit("/", 1)[1].removesuffix(".json") in failing:
+            raise TimeoutError("timed out")
+        return base(url)
+
+    return fetch
+
+
+def test_run_persists_lookup_tallies(setup, tmp_path):
+    calls, failing = [], {"CVE-2026-54874"}
+    meta = SecurityMetadata(setup, fetcher=flaky_fetcher(calls, failing))
+    run = run_analysis(setup, meta, ScriptedSSH())
+    assert run.metadata_lookups == {
+        "CVE-2026-63076": "ok", "CVE-2026-54874": "failed", "CVE-2026-63075": "ok",
+    }  # fmt: skip
+    assert run.lookup_tally.label == "2 ok / 0 cached / 1 failed"
+    assert run.lookup_tally.state == "Degraded"
+    assert run.failed_lookups == ["CVE-2026-54874"]
+    # One failed CVE did not trip the breaker: the other CVEs still resolved.
+    assert summarize(run.servers[0]).cve_status == {
+        "CVE-2026-63076": cr.PATCH_AVAILABLE,
+        "CVE-2026-54874": cr.METADATA_UNAVAILABLE,
+        "CVE-2026-63075": cr.PATCH_AVAILABLE,
+    }
+
+
+def test_retry_failed_lookups_re_runs_only_the_failed_cves(setup, tmp_path):
+    calls, failing = [], {"CVE-2026-54874"}
+    cache = setup  # the application database holds the Canonical cache
+    run = run_analysis(
+        setup, SecurityMetadata(cache, fetcher=flaky_fetcher(calls, failing)), ScriptedSSH()
+    )
+    assert run.failed_lookups == ["CVE-2026-54874"]
+
+    # ubuntu.com is back. A fresh instance (as after a restart) proves the CVEs that
+    # succeeded come from the SQLite cache, not from the network.
+    failing.clear()
+    calls.clear()
+    ssh = ScriptedSSH()
+    service = AnalysisService(
+        setup, SecurityMetadata(cache, fetcher=flaky_fetcher(calls, failing)), runner=ssh,
+        starter=sync,
+    )  # fmt: skip
+    assert service.retry_failed_lookups(run.id) == 1
+    assert calls == [API.format("CVE-2026-54874")]  # only the failed CVE hit ubuntu.com
+    assert len(ssh.calls) == 1  # only GOOD reported the failed CVE; BAD is untouched
+
+    run = setup.get_analysis_run(run.id)
+    assert run.status == "completed" and not run.is_running
+    assert run.lookup_tally.label == "3 ok / 0 cached / 0 failed"
+    assert run.lookup_tally.state == "Online"
+    assert summarize(run.servers[0]).cve_status["CVE-2026-54874"] == cr.PATCH_AVAILABLE
+    assert summarize(run.servers[1]).cve_status == {"CVE-2026-63076": cr.PATCH_AVAILABLE}
+    assert service.retry_failed_lookups(run.id) == 0  # nothing left to retry
+
+
+def test_retry_keeps_previous_results_when_server_is_unreachable(setup, tmp_path):
+    calls, failing = [], {"CVE-2026-54874"}
+    meta = SecurityMetadata(setup, fetcher=flaky_fetcher(calls, failing))
+    run = run_analysis(setup, meta, ScriptedSSH())
+    before = summarize(run.servers[0]).cve_status
+
+    failing.clear()
+    ssh = ScriptedSSH(failures={GOOD_IP: (255, "ssh: connect to host port 22: Connection refused")})
+    service = AnalysisService(setup, meta, runner=ssh, starter=sync)
+    assert service.retry_failed_lookups(run.id) == 1
+
+    run = setup.get_analysis_run(run.id)
+    good = run.servers[0]
+    assert good.status == "complete" and summarize(good).cve_status == before
+    assert run.failed_lookups == ["CVE-2026-54874"]  # still failed: nothing was re-resolved
+
+
+def test_retry_is_refused_while_analysis_runs(setup, tmp_path):
+    calls, failing = [], {"CVE-2026-54874"}
+    meta = SecurityMetadata(setup, fetcher=flaky_fetcher(calls, failing))
+    run = run_analysis(setup, meta, ScriptedSSH())
+    service = AnalysisService(setup, meta, runner=ScriptedSSH(), starter=sync)
+    service._running = True
+    assert service.retry_failed_lookups(run.id) is None
+    assert setup.get_analysis_run(run.id).failed_lookups == ["CVE-2026-54874"]
+
+
+def spy_start_run(meta):
+    """Record the start_run() arguments of ``meta``."""
+    runs, original = [], meta.start_run
+
+    def start_run(force_refresh=False, cves=None):
+        runs.append((force_refresh, None if cves is None else sorted(cves)))
+        original(force_refresh, cves)
+
+    meta.start_run = start_run
+    return runs
+
+
+def test_retry_failed_lookups_force_refreshes_the_failed_cves(setup):
+    calls, failing = [], {"CVE-2026-54874"}
+    meta = SecurityMetadata(setup, fetcher=flaky_fetcher(calls, failing))
+    run = run_analysis(setup, meta, ScriptedSSH())
+    runs = spy_start_run(meta)
+    failing.clear()
+    AnalysisService(setup, meta, runner=ScriptedSSH(), starter=sync).retry_failed_lookups(run.id)
+    assert runs == [(True, ["CVE-2026-54874"])]
+
+
+def test_reanalyze_server_force_refreshes_all_its_cves(setup):
+    calls = []
+    meta = SecurityMetadata(setup, fetcher=flaky_fetcher(calls, set()))
+    run = run_analysis(setup, meta, ScriptedSSH(failures=AUTH_FAILURE))
+    good, bad = run.servers
+    assert run.status == "completed_with_errors"
+
+    calls.clear()
+    runs = spy_start_run(meta)
+    ssh = ScriptedSSH()
+    service = AnalysisService(setup, meta, runner=ssh, starter=sync)
+    assert service.reanalyze_server(run.id, good.id)
+    assert runs == [(True, None)]
+    # Memo and SQLite cache are fresh, yet every CVE of the server is fetched again.
+    assert sorted(calls) == sorted(API.format(cve) for cve in REAL_REPORT[GOOD])
+    assert [args[-2] for args in ssh.calls] == [f"ubuntu@{GOOD_IP}"]  # only this server
+
+    # The failed server can be re-analyzed too (its SSH now works): the run recovers.
+    assert service.reanalyze_server(run.id, bad.id)
+    run = setup.get_analysis_run(run.id)
+    assert [s.status for s in run.servers] == ["complete", "complete"]
+    assert run.servers[1].error is None
+    assert run.status == "completed" and run.progress_message is None
+    assert run.lookup_tally.label == "3 ok / 0 cached / 0 failed"
+
+
+def test_reanalyze_keeps_previous_results_when_server_is_unreachable(setup, metadata):
+    run = run_analysis(setup, metadata, ScriptedSSH())
+    good = run.servers[0]
+    before = summarize(good).cve_status
+    refused = ScriptedSSH(failures={GOOD_IP: (255, "ssh: connect to host port 22: refused")})
+    assert AnalysisService(setup, metadata, runner=refused, starter=sync).reanalyze_server(
+        run.id, good.id
+    )
+    good = setup.get_server_analysis(good.id)
+    assert good.status == "complete" and summarize(good).cve_status == before
+    assert "Re-analysis at" in good.warnings[-1] and "refused" in good.warnings[-1]
+
+
+def test_reanalyze_refused_while_running_or_for_foreign_server(setup, metadata):
+    run = run_analysis(setup, metadata, ScriptedSSH())
+    other = run_analysis(setup, metadata, ScriptedSSH())
+    service = AnalysisService(setup, metadata, runner=ScriptedSSH(), starter=sync)
+    assert not service.reanalyze_server(run.id, other.servers[0].id)
+    service._running = True
+    assert not service.reanalyze_server(run.id, run.servers[0].id)
+    assert service.retry_cves(run.id, {"CVE-2026-63076"}) is None
+
+
+def test_retry_investigate_cves_force_refreshes_only_those_cves(setup):
+    calls, failing = [], {"CVE-2026-54874"}
+    meta = SecurityMetadata(setup, fetcher=flaky_fetcher(calls, failing))
+    run = run_analysis(setup, meta, ScriptedSSH())
+    good = setup.get_server_analysis(run.servers[0].id)
+    cves = investigate_cves(good)
+    assert cves == {"CVE-2026-54874"}  # METADATA_UNAVAILABLE -> Investigate bucket
+
+    failing.clear()
+    calls.clear()
+    runs = spy_start_run(meta)
+    ssh = ScriptedSSH()
+    service = AnalysisService(setup, meta, runner=ssh, starter=sync)
+    assert service.retry_cves(run.id, cves, {good.id}) == 1
+    assert runs == [(True, ["CVE-2026-54874"])]
+    assert calls == [API.format("CVE-2026-54874")]  # the other CVEs come from the cache
+    assert [args[-2] for args in ssh.calls] == [f"ubuntu@{GOOD_IP}"]
+    good = setup.get_server_analysis(good.id)
+    assert summarize(good).cve_status["CVE-2026-54874"] == cr.PATCH_AVAILABLE
+    assert investigate_cves(good) == set()
+
+
+def test_plan_failure_keeps_required_updates_visible(setup, metadata, fake_apt):
+    fake_apt.plan = "@@EC2P simulate\nE: Unable to correct problems\n@@EC2P simulate-rc\n100\n@@EC2P uris\n@@EC2P uris-rc\n100\n@@EC2P end\n"  # noqa: E501
+    good = run_analysis(setup, metadata, ScriptedSSH()).servers[0]
     assert good.status == "complete"
     assert good.plan and all(p.status == "unresolved" and p.deb_filename is None for p in good.plan)
     assert all("Unable to resolve package download plan" in p.reason for p in good.plan)
     assert summarize(good).cve_status["CVE-2026-63076"] == cr.PATCH_AVAILABLE
 
 
-def test_candidate_query_failure_marks_errors(setup, metadata):
-    def boom(names):
-        return "no markers"
-
-    good = run_analysis(setup, metadata, ScriptedSSH(candidates=boom)).servers[0]
+def test_candidate_query_failure_marks_errors(setup, metadata, fake_apt):
+    fake_apt.policy_error = "E: The package cache file is corrupted"
+    good = run_analysis(setup, metadata, ScriptedSSH()).servers[0]
     statuses = {f.status for f in good.findings if f.source_package == "openssl"}
     assert statuses == {cr.ANALYSIS_ERROR}
+    assert all("package cache file is corrupted" in f.detail for f in good.findings
+               if f.source_package == "openssl")  # fmt: skip
     assert good.plan == []
 
 
@@ -192,6 +379,34 @@ def test_all_status_types_reconcile(setup, metadata):
         cr.PRO_OR_ESM_REQUIRED, cr.FIX_NOT_IN_CONFIGURED_REPOS, cr.UNKNOWN, cr.PENDING_OR_DEFERRED,
     ):  # fmt: skip
         assert summary.by_status.get(status), status
+
+
+def test_candidate_below_fix_is_fix_not_in_repos_without_update_hint(setup, metadata):
+    report = {GOOD: ALL_CVES, BAD: ["CVE-2026-63076"]}
+    good = run_analysis(setup, metadata, ScriptedSSH(), report=report).servers[0]
+    libxml2 = next(f for f in good.findings if f.source_package == "libxml2")
+    assert libxml2.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
+    assert "apt-get update" not in libxml2.detail
+    assert not any("apt-get update" in w or "sudo" in w for w in good.warnings)
+    # The report shows the age of the workstation's private lists.
+    assert good.apt_updated_at and good.apt_age_hours is not None and good.apt_age_hours < 1
+
+
+def test_private_apt_update_failure_is_reported_not_faked(setup, metadata, fake_apt):
+    fake_apt.update_error = (
+        "E: Failed to fetch http://archive.ubuntu.com/ubuntu/dists/noble/InRelease"
+    )
+    good = run_analysis(setup, metadata, ScriptedSSH()).servers[0]
+    assert good.status == "complete"
+    openssl = [f for f in good.findings if f.source_package == "openssl"]
+    assert openssl and {f.status for f in openssl} == {cr.ANALYSIS_ERROR}
+    assert all("apt-get update of the private noble/amd64 APT lists failed" in f.detail
+               for f in openssl)  # fmt: skip
+    assert all(f.apt_candidate is None for f in good.findings) and good.plan == []
+    assert any(w.startswith("Local APT resolution failed:") for w in good.warnings)
+    # No candidate query ran against the missing lists; the next server reuses the failure.
+    assert all(apt_operands(c)[-1] == "update" for c in fake_apt.calls)
+    assert len(fake_apt.updates) == 1
 
 
 def test_display_name_never_matches_report(db, pem_file, metadata):
@@ -295,13 +510,34 @@ def test_phase2_migration_keeps_existing_data(db_path):
     assert db.list_analysis_runs() == []
 
 
+def test_lookup_tally_migration(db_path, pem_file):
+    from ec2patcher.database import _MIGRATIONS
+
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as conn:
+        for version in range(1, 7):
+            conn.executescript(_MIGRATIONS[version])
+        conn.execute("PRAGMA user_version = 6")
+    conn.close()
+    db = Database(db_path)
+    db.create_server(GOOD, GOOD_IP, str(pem_file))
+    db.save_report("r.json", {GOOD: ["CVE-2026-63076"]}, "VALID")
+    server = db.get_server_by_name(GOOD)
+    run_id = db.create_analysis_run(db.get_latest_report(), [(GOOD, server, None)])
+    run = db.get_analysis_run(run_id)
+    assert run.metadata_lookups == {}
+    assert run.lookup_tally.state == "Not recorded"
+    db.update_analysis_run(run_id, metadata_lookups={"CVE-2026-63076": "cached"})
+    assert db.get_analysis_run(run_id).lookup_tally.label == "0 ok / 1 cached / 0 failed"
+
+
 # --- web / UI -------------------------------------------------------------------------
 
 
 @pytest.fixture
 def web(db_path, tmp_path):
     def factory(ssh=None, fetcher=None):
-        meta = SecurityMetadata(tmp_path / "web-cache", fetcher=fetcher or online_fetcher())
+        meta = SecurityMetadata(db_path, fetcher=fetcher or online_fetcher())
         app = create_app(
             db_path=db_path, ssh_runner=ssh or ScriptedSSH(failures=AUTH_FAILURE),
             metadata=meta, analysis_starter=sync, shutdown_handler=lambda: None,
@@ -396,6 +632,69 @@ def test_settings_cache_and_database_controls_are_independent(web, pem_file, db_
     assert db.count_servers() == 0 and db.get_latest_report() is None
 
 
+def test_status_panel_tallies_and_retry_button(web, pem_file, db_path):
+    calls, failing = [], {"CVE-2026-54874"}
+    with web(ssh=ScriptedSSH(), fetcher=flaky_fetcher(calls, failing)) as c:
+        add_servers(c, pem_file)
+        upload(c, REAL_REPORT)
+        run_url = c.post("/reports/analyze", follow_redirects=False).headers["location"]
+        page = c.get(run_url).text
+        assert "Degraded per-CVE lookup" in page
+        assert "2 ok / 0 cached / 1 failed" in page
+        assert f'action="{run_url}/retry-lookups"' in page
+        assert "Retry failed lookups (1)" in page
+
+        failing.clear()
+        calls.clear()
+        r = c.post(f"{run_url}/retry-lookups", follow_redirects=True)
+        assert r.status_code == 200
+        assert "Retrying 1 failed Canonical lookup(s)." in r.text
+        assert calls == [API.format("CVE-2026-54874")]
+        assert "Online per-CVE lookup" in r.text and "3 ok / 0 cached / 0 failed" in r.text
+        assert "retry-lookups" not in r.text  # nothing left to retry: no button
+
+        r = c.post(f"{run_url}/retry-lookups", follow_redirects=True)
+        assert "There are no failed Canonical lookups to retry." in r.text
+        assert c.post("/analysis/999/retry-lookups").status_code == 404
+
+
+def test_server_report_reanalyze_and_retry_investigate_buttons(web, pem_file, db_path):
+    calls, failing = [], {"CVE-2026-54874"}
+    with web(ssh=ScriptedSSH(), fetcher=flaky_fetcher(calls, failing)) as c:
+        add_servers(c, pem_file)
+        upload(c, REAL_REPORT)
+        run_url = c.post("/reports/analyze", follow_redirects=False).headers["location"]
+        run = Database(db_path).get_latest_analysis_run()
+        good, bad = (s.id for s in run.servers)
+        page = c.get(f"{run_url}/servers/{good}").text
+        assert f'action="{run_url}/servers/{good}/reanalyze"' in page
+        assert f'action="{run_url}/servers/{good}/retry-investigate"' in page
+        assert "Retry these CVEs (1)" in page
+
+        failing.clear()
+        calls.clear()
+        r = c.post(f"{run_url}/servers/{good}/retry-investigate", follow_redirects=True)
+        assert r.status_code == 200
+        assert "Retrying 1 CVE(s) from the Investigate bucket." in r.text
+        assert calls == [API.format("CVE-2026-54874")]
+        assert "retry-investigate" not in r.text  # Investigate bucket is empty now
+        r = c.post(f"{run_url}/servers/{good}/retry-investigate", follow_redirects=True)
+        assert "There are no CVEs in the Investigate bucket to retry." in r.text
+
+        calls.clear()  # every CVE is cached and memoized; Re-analyze fetches them anyway
+        r = c.post(f"{run_url}/servers/{good}/reanalyze", follow_redirects=True)
+        assert r.status_code == 200 and "Re-analyzing this server" in r.text
+        assert sorted(calls) == sorted(API.format(cve) for cve in REAL_REPORT[GOOD])
+
+        assert c.post(f"/analysis/999/servers/{good}/reanalyze").status_code == 404
+        assert c.post(f"{run_url}/servers/999/retry-investigate").status_code == 404
+        c.app.state.analyzer._running = True
+        try:
+            assert c.post(f"{run_url}/servers/{bad}/reanalyze").status_code == 409
+        finally:
+            c.app.state.analyzer._running = False
+
+
 def test_analyze_without_report(web):
     with web() as c:
         r = c.post("/reports/analyze")
@@ -416,7 +715,10 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert "Permission denied (publickey)" in page
         assert "Billing API" in page
         assert '<meta http-equiv="refresh"' not in page  # finished runs do not auto-refresh
-        assert "3 patch available" in page and "Reboot: <strong>YES EXPECTED</strong>" in page
+        counters = re.findall(r'class="bucket-count[^"]*">([^<]+)</span>', page)
+        assert counters == ["Action required: 3", "Investigate: 0", "No action: 0"], counters
+        assert "unresolved / no fix" not in page
+        assert "Reboot: <strong>YES EXPECTED</strong>" in page
 
         links = re.findall(r'href="(/analysis/\d+/servers/\d+)"', page)
         assert len(links) == 2
@@ -448,6 +750,12 @@ def test_analysis_progress_and_reports(web, pem_file):
         # Sources without an installed package remain visible as individual rows.
         assert "linux-gcp" in report
         assert "Package not installed" in report
+        assert "Repository Candidate" in report
+        # Findings are bucketed by status via the view helper; no-action rows are collapsed.
+        assert re.search(r"Action required: [1-9]\d*</span>", report)
+        assert '<details class="report-details bucket bucket-no_action">' in report
+        assert report.index("linux-gcp") > report.index("bucket-no_action")
+        assert "NOT CURRENT" not in report  # fixture APT lists are ~17h old
         assert "Repository Candidate" in report
         analysis_id = c.app.state.db.get_latest_analysis_run().servers[0].id
         for finding in c.app.state.db.get_server_analysis(analysis_id).findings:

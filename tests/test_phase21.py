@@ -35,7 +35,7 @@ from ec2patcher.app import create_app
 from ec2patcher.database import _MIGRATIONS, SCHEMA_VERSION, Database
 from ec2patcher.formatting import format_size
 from ec2patcher.models import AnalysisRun, ServerAnalysis
-from ec2patcher.services import analysis_service, apt_planner, nvd, ssh_service
+from ec2patcher.services import analysis_service, local_apt, nvd, ssh_service
 from ec2patcher.services import cve_resolver as cr
 from ec2patcher.services import excel_export as xl
 from ec2patcher.services.security_metadata import (
@@ -138,9 +138,7 @@ def severity_docs():
 @pytest.fixture
 def web(db_path, tmp_path):
     def factory(ssh=None, fetcher=None, nvd_transport=None):
-        meta = SecurityMetadata(
-            tmp_path / "web-cache", fetcher=fetcher or online_fetcher(severity_docs())
-        )
+        meta = SecurityMetadata(db_path, fetcher=fetcher or online_fetcher(severity_docs()))
         nvd_client = make_nvd_client(tmp_path, nvd_transport or FakeNvd(REPORT_CVES))
         app = create_app(
             db_path=db_path, ssh_runner=ssh or ScriptedSSH(failures=AUTH_FAILURE),
@@ -180,7 +178,7 @@ def test_severity_persisted_with_findings(analyzed):
     assert by_key[("CVE-2026-10004", "bash")].severity == "Low"
     assert by_key[("CVE-2026-10005", "nginx")].priority is None
     assert by_key[("CVE-2026-10005", "nginx")].severity == "Unknown"  # not in NVD
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 7
 
 
 def test_severity_column_rendered(web, analyzed):
@@ -272,7 +270,8 @@ def test_export_summary_matches_stored_snapshot(web, analyzed):
     assert s["Running Kernel"] == "6.8.0-1021-aws"
     assert s["Canonical Security Metadata"].startswith("Online per-CVE lookup")
     assert s["Canonical Metadata Stale"] == "NO"
-    assert s["APT Metadata"].startswith("Updated ") and "hours before analysis" in s["APT Metadata"]
+    assert s["APT Metadata"].startswith("Workstation private lists updated ")
+    assert "hours before analysis" in s["APT Metadata"]
     assert s["Current Reboot Required"] == "NO"
     assert s["Expected Reboot After Planned Patch"] == "YES EXPECTED"
     assert s["Reported CVEs"] == 5 == summary.reported
@@ -435,8 +434,8 @@ def test_export_does_not_touch_ssh_metadata_apt_or_state(web, analyzed, db_path,
 
     monkeypatch.setattr(ssh_service, "run_remote", forbidden("ssh run_remote"))
     monkeypatch.setattr(ssh_service, "check_connection", forbidden("ssh check_connection"))
-    monkeypatch.setattr(apt_planner, "build_candidate_command", forbidden("apt candidates"))
-    monkeypatch.setattr(apt_planner, "build_plan_command", forbidden("apt plan"))
+    for method in ("prepare", "candidates", "plan"):
+        monkeypatch.setattr(local_apt.LocalApt, method, forbidden(f"local apt {method}"))
     for method in ("ensure_fresh", "lookup", "refresh"):
         if hasattr(SecurityMetadata, method):
             monkeypatch.setattr(SecurityMetadata, method, forbidden(f"metadata.{method}"))

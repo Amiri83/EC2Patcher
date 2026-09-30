@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}{{ analysis.server_name }} - Pre-Patch Report{% endblock %}
+{% block head %}{% if run.is_running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
 {% block heading %}Pre-Patch Report: {{ analysis.server_name }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
+  {% if analysis.server_id and not run.is_running %}
+    <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/reanalyze" class="inline-form" title="Re-collect this server's facts (read-only) and fetch all of its CVEs from Canonical again, bypassing the cache">
+      <button type="submit" class="btn btn-secondary">Re-analyze</button>
+    </form>
+  {% endif %}
   <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/export.xlsx" class="btn btn-primary" download>Export to Excel</a>
   <a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>
 </div>{% endblock %}
@@ -9,6 +15,49 @@
 {% macro severity_cell(f) %}<span class="badge {{ severity_classes[f.severity] }}"{% if f.nvd_note %} title="{{ f.nvd_note }}"{% endif %}>{{ f.severity }}</span>{% if f.priority %}<div class="muted small">Ubuntu Priority: {{ f.priority }}</div>{% endif %}{% endmacro %}
 {% macro cvss_cell(f) %}{% if f.cvss_score is not none %}<span{% if f.cvss_vector %} title="{{ f.cvss_vector }}"{% endif %}>{{ f.cvss_label }}</span>{% else %}<span class="muted">—</span>{% endif %}
   <div class="muted small">{% if f.nvd_status is none %}not captured{% elif f.nvd_status in ("ok", "stale") %}Source: {{ "NVD" if f.cvss_source == "nvd@nist.gov" else (f.cvss_source or "unknown") }}{% if f.cvss_source_type and f.cvss_source != "nvd@nist.gov" %} ({{ f.cvss_source_type }}){% endif %}{% if f.nvd_status == "stale" %} &middot; stale cache{% endif %}{% else %}{{ nvd_status_labels.get(f.nvd_status, f.nvd_status) }}{% endif %}</div>{% endmacro %}
+{% macro findings_table(groups) %}
+  {% if groups %}
+    <div class="table-scroll">
+    <table class="table findings-table">
+      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Canonical Fixed Version</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th></tr></thead>
+      <tbody>
+      {% for g in groups %}
+          <tr>
+            <td><span class="badge badge-neutral">{{ g.cve_count }} CVE{{ "s" if g.cve_count != 1 else "" }}</span>
+              {% if g.cve_count > 1 %}
+                <details><summary>Affected CVEs</summary>
+                  <ul class="plain-list">{% for f in g.rows %}<li><code>{{ f.cve }}</code> {{ severity_cell(f) }} {{ cvss_cell(f) }}</li>{% endfor %}</ul>
+                </details>
+              {% else %}<div><code>{{ g.cves[0] }}</code></div>{% endif %}
+            </td>
+            <td>{{ severity_cell(g.highest_row) }}</td>
+            <td class="cvss">{{ cvss_cell(g.highest_row) }}</td>
+            <td><strong>{{ g.source or '-' }}</strong></td>
+            <td><code>{{ g.installed_version or "-" }}</code></td>
+            <td>{% if g.fixed_version %}<code>{{ g.fixed_version }}</code>{% for pocket in g.pockets %} <span class="muted small">({{ pocket }})</span>{% endfor %}{% else %}-{% endif %}</td>
+            <td><code>{{ g.candidate_version or "-" }}</code></td>
+            <td><span class="badge {{ status_classes.get(g.status, 'badge-neutral') }}">{{ status_labels.get(g.status, g.status) }}</span>
+                {% if g.detail %}<div class="muted small finding-detail">{{ g.detail }}</div>{% endif %}</td>
+            <td class="pkg-list">
+              {% if g.binary_packages|length > 6 %}
+                <details><summary>{{ g.binary_packages|length }} packages</summary>{% for b in g.binary_packages %}<code>{{ b }}</code> {% endfor %}</details>
+              {% else %}
+                {% for b in g.binary_packages %}<code>{{ b }}</code> {% else %}<span class="muted">-</span>{% endfor %}
+              {% endif %}
+            </td>
+          </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% else %}
+    <p class="muted small">None.</p>
+  {% endif %}
+{% endmacro %}
+{% set bucket_classes = {"action": "badge-danger", "investigate": "badge-warning", "no_action": "badge-success"} %}
+{% if run.is_running and run.progress_message %}
+  <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>
+{% endif %}
 {% if not is_latest %}
   <div class="alert alert-warning">This is a historical report from analysis #{{ run.id }}. A newer analysis exists.</div>
 {% endif %}
@@ -32,11 +81,10 @@
     <dt>Running Kernel</dt><dd>{{ analysis.running_kernel or "-" }}</dd>
     <dt>Analysis Time</dt><dd>{{ (analysis.completed_at or analysis.started_at or run.started_at)|timestamp }}</dd>
     <dt>Canonical Security Metadata</dt>
-    <dd>{% if run.metadata_updated_at %}Online per-CVE lookup &middot; checked {{ run.metadata_checked_at|timestamp }}{% else %}not available{% endif %}
-        {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}
+    <dd>{% include "_metadata_status.html" %}
         <div class="muted small">{{ run.metadata_source or "" }}</div></dd>
     <dt>APT Metadata</dt>
-    <dd>{% if analysis.apt_updated_at %}Updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">unknown</span>{% endif %}</dd>
+    <dd>{% if analysis.apt_updated_at %}Workstation private lists{% if analysis.os_codename %} ({{ analysis.os_codename }}, {{ analysis.os_codename }}-updates, {{ analysis.os_codename }}-security{% if analysis.architecture %}; {{ analysis.architecture }}{% endif %}){% endif %} updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">not used</span>{% endif %}</dd>
     <dt>Current Reboot Required</dt>
     <dd>{% if analysis.current_reboot_required is none %}<span class="muted">unknown</span>{% elif analysis.current_reboot_required %}<strong>YES</strong>{% if analysis.reboot_required_packages %} <span class="muted small">({{ analysis.reboot_required_packages|join(", ") }})</span>{% endif %}{% else %}NO{% endif %}</dd>
     <dt>Expected Reboot After Planned Patch</dt>
@@ -67,6 +115,9 @@
   <p class="muted small severity-breakdown">Severity (NVD CVSS, per reported CVE):
     {% for sev in severities %}<span class="badge {{ severity_classes[sev] }}">{{ sev }}: {{ summary.by_severity[sev] }}</span>{% endfor %}
   </p>
+  <p class="muted small bucket-summary">By action (per reported CVE):
+    {% for key, title, n in summary.buckets %}<span class="badge {{ bucket_classes[key] if n else 'badge-neutral' }}">{{ title }}: {{ n }} CVE{{ "s" if n != 1 else "" }}</span>{% endfor %}
+  </p>
   {% if summary.by_status %}
     <p class="muted small status-breakdown">By status:
       {% for status, count in summary.by_status|dictsort %}
@@ -82,39 +133,27 @@
 <div class="card">
   <h2>CVE Findings</h2>
   {% if analysis.findings %}
-    <div class="table-scroll">
-    <table class="table findings-table">
-      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Canonical Fixed Version</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th></tr></thead>
-      <tbody>
-      {% for g in remediation_groups %}
-          <tr>
-            <td><span class="badge badge-neutral">{{ g.cve_count }} CVE{{ "s" if g.cve_count != 1 else "" }}</span>
-              {% if g.cve_count > 1 %}
-                <details><summary>Affected CVEs</summary>
-                  <ul class="plain-list">{% for f in g.rows %}<li><code>{{ f.cve }}</code> {{ severity_cell(f) }} {{ cvss_cell(f) }}</li>{% endfor %}</ul>
-                </details>
-              {% else %}<div><code>{{ g.cves[0] }}</code></div>{% endif %}
-            </td>
-            <td>{{ severity_cell(g.highest_row) }}</td>
-            <td class="cvss">{{ cvss_cell(g.highest_row) }}</td>
-            <td><strong>{{ g.source or '-' }}</strong></td>
-            <td><code>{{ g.installed_version or "-" }}</code></td>
-            <td>{% if g.fixed_version %}<code>{{ g.fixed_version }}</code>{% for pocket in g.pockets %} <span class="muted small">({{ pocket }})</span>{% endfor %}{% else %}-{% endif %}</td>
-            <td><code>{{ g.candidate_version or "-" }}</code></td>
-            <td><span class="badge {{ status_classes.get(g.status, 'badge-neutral') }}">{{ status_labels.get(g.status, g.status) }}</span>
-                {% if g.detail %}<div class="muted small finding-detail">{{ g.detail }}</div>{% endif %}</td>
-            <td class="pkg-list">
-              {% if g.binary_packages|length > 6 %}
-                <details><summary>{{ g.binary_packages|length }} packages</summary>{% for b in g.binary_packages %}<code>{{ b }}</code> {% endfor %}</details>
-              {% else %}
-                {% for b in g.binary_packages %}<code>{{ b }}</code> {% else %}<span class="muted">-</span>{% endfor %}
-              {% endif %}
-            </td>
-          </tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    </div>
+    <p class="bucket-counts">
+      {% for b in finding_buckets %}<span class="badge {{ bucket_classes[b.key] if b.count else 'badge-neutral' }}">{{ b.title }}: {{ b.count }}</span>
+        <span class="muted small">({{ b.cve_count }} CVE{{ "s" if b.cve_count != 1 else "" }})</span>{% endfor %}
+    </p>
+    {% for b in finding_buckets %}
+      {% if b.key == "no_action" %}
+        <details class="report-details bucket bucket-{{ b.key }}">
+          <summary><strong>{{ b.title }}</strong> <span class="muted small">({{ b.count }})</span></summary>
+          {{ findings_table(b.groups) }}
+        </details>
+      {% else %}
+        <h3 class="bucket bucket-{{ b.key }}">{{ b.title }} <span class="muted small">({{ b.count }})</span></h3>
+        {% if b.key == "investigate" and b.count and analysis.server_id and not run.is_running %}
+          <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/retry-investigate" class="inline-form">
+            <button type="submit" class="btn btn-secondary btn-sm">Retry these CVEs ({{ b.cve_count }})</button>
+          </form>
+          <span class="muted small">Fetches these CVEs from Canonical again (bypassing the cache) and re-analyzes this server.</span>
+        {% endif %}
+        {{ findings_table(b.groups) }}
+      {% endif %}
+    {% endfor %}
   {% else %}
     <p class="muted">No findings{% if analysis.status == "failed" %} - the analysis of this server failed before CVEs could be evaluated. Reported CVEs: {{ analysis.reported_cves|join(", ") }}{% endif %}.</p>
   {% endif %}
@@ -123,7 +162,7 @@
 <div class="card">
   <h2>Package / .deb Plan</h2>
   {% if analysis.plan %}
-    <p class="muted small">Planned only &mdash; nothing has been downloaded. Target versions are the current APT candidates on the server.</p>
+    <p class="muted small">Planned only &mdash; nothing has been downloaded. Target versions are the current APT candidates of the Ubuntu archive for this server's release and architecture, resolved on this workstation.</p>
     <div class="table-scroll">
     <table class="table plan-table">
       <thead><tr><th>Binary Package</th><th>Current Version</th><th>Target Version</th><th>.deb Filename</th><th class="num">Size</th><th>Related CVEs</th><th>Reboot Impact</th></tr></thead>
@@ -153,7 +192,7 @@
   <details class="report-details">
     <summary><strong>Technical details</strong> <span class="muted small">(download URIs, checksums, APT invocation)</span></summary>
     {% if analysis.apt_arguments %}
-      <p class="small">APT invocation used for planning (simulation / <code>--print-uris</code> only):</p>
+      <p class="small">APT invocation used for planning on the workstation (simulation / <code>--print-uris</code> only, against the private APT state):</p>
       <pre>apt-get {{ analysis.apt_arguments|join(" ") }}</pre>
     {% endif %}
     <div class="table-scroll">
