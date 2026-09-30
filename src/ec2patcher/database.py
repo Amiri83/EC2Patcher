@@ -27,7 +27,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -301,6 +301,10 @@ _MIGRATIONS = {
         );
         CREATE INDEX idx_patch_queue_items_queue ON patch_queue_items(queue_id);
     """,
+    # Every scp attempt (exit code + stderr) of an execution, shown on its page.
+    9: """
+        ALTER TABLE patch_executions ADD COLUMN transfer_attempts TEXT NOT NULL DEFAULT '[]';
+    """,
 }
 
 
@@ -463,6 +467,7 @@ _EXECUTION_COLUMNS = {
     "install_started_at", "install_finished_at", "install_exit_status", "install_output",
     "simulation_output", "audit_ok", "audit_output", "notes", "reboot_status", "reboot_detail",
     "reboot_requested_at", "reboot_finished_at", "post_reboot_uptime", "post_reboot_kernel",
+    "transfer_attempts",
 }  # fmt: skip
 _QUEUE_COLUMNS = {"finished_at", "state", "stop_reason"}
 _QUEUE_ITEM_COLUMNS = {"status", "execution_id", "detail"}
@@ -518,6 +523,7 @@ def _row_to_execution(row: sqlite3.Row) -> PatchExecution:
         post_reboot_uptime=row["post_reboot_uptime"],
         post_reboot_kernel=row["post_reboot_kernel"],
         queue_id=row["queue_id"],
+        transfer_attempts=json.loads(row["transfer_attempts"] or "[]"),
     )
 
 
@@ -1023,6 +1029,16 @@ class Database:
             uploaded_at=row["uploaded_at"],
             status=row["status"],
         )
+
+    def latest_analysis_for_server(self, server_name: str) -> ServerAnalysis | None:
+        """The server's analysis from the most recent run that includes it (by name)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM server_analyses WHERE server_name = ? COLLATE NOCASE "
+                "ORDER BY run_id DESC LIMIT 1",
+                (server_name,),
+            ).fetchone()
+        return self.get_server_analysis(row["id"]) if row else None
 
     def newer_analysis_exists(self, analysis: ServerAnalysis) -> bool:
         """True if a later analysis run includes the same server (by canonical name)."""

@@ -9,7 +9,12 @@ Pipeline (one server, one execution at a time; every step must pass before the n
   -> INSTALLING (apt-get install of the explicit local .debs) -> VERIFYING_INSTALL (versions,
   dpkg --audit, Canonical fixed versions, /run/reboot-required) -> CLEANING_UP -> SUCCESS.
 
-Any failure stops the pipeline, preserves local and remote staging files and records why.
+Revalidation drops packages that are already installed at their target version (e.g.
+patched by hand since the analysis); when that leaves nothing to install the execution ends
+as ALREADY_PATCHED. Each scp copy is retried once; a copy that still fails ends the pipeline
+after cleaning up both staging directories (exit code and stderr of every attempt are kept).
+
+Any other failure stops the pipeline, preserves local and remote staging files and records why.
 After the install may have started nothing is assumed: the outcome is verified on the
 server or recorded as UNKNOWN. There is no rollback and no upgrade/dist-upgrade.
 NVD is never contacted here; CVE checks use the Canonical fixed versions stored at analysis.
@@ -21,7 +26,8 @@ the server answers with a new boot id (at most REBOOT_TIMEOUT_SECONDS); the post
 uptime and kernel are recorded.
 
 "Patch All" runs the same pipeline (plus reboot) for the eligible servers of one analysis
-run, one server at a time, and stops the queue at the first failed server.
+run, one server at a time, and stops the queue at the first failed server. A server that was
+analyzed again after that run is patched from its latest analysis.
 """
 
 import logging
@@ -58,6 +64,9 @@ REBOOT_TIMEOUT_SECONDS = 600  # SSH must be back within 10 minutes of "sudo rebo
 REBOOT_POLL_SECONDS = 10
 REBOOT_ATTEMPT_TIMEOUT_SECONDS = 30
 MAX_STORED_OUTPUT = 20000
+SCP_ATTEMPTS = 2  # one retry per .deb
+MAX_STORED_SCP_STDERR = 2000
+ALREADY_AT_TARGET = "ALREADY AT TARGET"
 
 SERVER_CHANGED = "PATCH ABORTED — SERVER STATE CHANGED"
 PATCH_FAILED = "PATCH FAILED"
@@ -84,6 +93,15 @@ def _tail(lines: list[str] | str, limit: int = MAX_STORED_OUTPUT) -> str:
     return text if len(text) <= limit else "[... output truncated ...]\n" + text[-limit:]
 
 
+def _same_version(installed: str | None, target: str) -> bool:
+    if not installed:
+        return False
+    try:
+        return debversion.compare_versions(installed, target) == 0
+    except debversion.InvalidVersionError:
+        return installed == target
+
+
 class PatchNotAllowedError(Exception):
     """Approval/rejection refused; the message is shown to the user."""
 
@@ -96,9 +114,11 @@ class PatchAbort(Exception):  # noqa: N818 - control flow, not an error in the c
         package: str | None = None,
         state: str = ps.FAILED,
         partial: bool = False,
+        cleanup: bool = False,  # delete the staging files instead of preserving them
     ):
         super().__init__(message)
         self.title, self.package, self.state, self.partial = title, package, state, partial
+        self.cleanup = cleanup
 
 
 # --- plan validation -----------------------------------------------------------------
@@ -237,6 +257,8 @@ class Eligibility:
     download_bytes: int = 0
     unpatched_notes: list[str] = field(default_factory=list)
     not_checked_warning: str | None = None
+    # "Patch All": the run's own (older) analysis this one replaces, if any.
+    superseded: ServerAnalysis | None = None
 
 
 # --- execution context --------------------------------------------------------------
@@ -254,6 +276,8 @@ class _Context:
     debs: dict[str, dict]  # filename -> {uri, size, sha256, package_ids}
     notes: list[str] = field(default_factory=list)
     reboot_required: bool = False  # /run/reboot-required seen by the post-install check
+    dropped: list[PatchPackageResult] = field(default_factory=list)  # already at target
+    transfer_attempts: list[dict] = field(default_factory=list)
 
     @property
     def filenames(self) -> list[str]:
@@ -457,6 +481,18 @@ class PatchService:
             move(ps.REVALIDATING, started_at=_now())
             ctx = self._context(execution)
             self._revalidate(ctx)
+            if not ctx.packages:  # every approved package is already at its target version
+                fields = {}
+                if ctx.execution.reboot_status == ps.REBOOT_PENDING:
+                    fields = {
+                        "reboot_status": ps.REBOOT_NOT_RUN,
+                        "reboot_detail": "Nothing was installed; the server was not rebooted.",
+                    }
+                move(
+                    ps.ALREADY_PATCHED, finished_at=_now(), cleanup_status="NOT_NEEDED",
+                    notes=ctx.notes, **fields,
+                )  # fmt: skip
+                return
             move(ps.DOWNLOADING)
             self._download(ctx)
             move(ps.VERIFYING_DOWNLOADS)
@@ -529,6 +565,14 @@ class PatchService:
                 else None
             ),
         }
+        if abort.cleanup and ctx is not None and target != ps.SUCCESS_WITH_CLEANUP_WARNING:
+            try:
+                warning = self._cleanup(ctx)
+            except Exception as exc:
+                logger.exception("Patch execution %s: cleanup after failure crashed", execution_id)
+                warning = f"Cleanup error: {exc}"
+            fields["cleanup_status"] = "WARNING" if warning else "DELETED"
+            fields["cleanup_detail"] = warning
         if target == ps.SUCCESS_WITH_CLEANUP_WARNING:
             fields = {
                 "finished_at": _now(),
@@ -622,8 +666,13 @@ class PatchService:
         if facts.os_id != "ubuntu":
             drift.append(f"Operating system is not Ubuntu ({facts.os_id or 'unknown'}).")
         installed = {(p.base_name, p.architecture): p.version for p in facts.packages}
+        remaining, dropped = [], []
         for pkg in ctx.packages:
             current = installed.get((pkg.binary_package, pkg.architecture))
+            if _same_version(current, pkg.target_version):
+                dropped.append(pkg)  # already patched since the analysis: nothing to do
+                continue
+            remaining.append(pkg)
             if current != pkg.before_version:
                 drift.append(
                     f"{pkg.binary_package} ({pkg.architecture}): installed "
@@ -632,8 +681,43 @@ class PatchService:
                 )
         if drift:
             raise PatchAbort(f"{DRIFT_MESSAGE} " + "; ".join(drift), title=SERVER_CHANGED)
+        if dropped:
+            self._drop_already_installed(ctx, dropped, remaining)
+        if not remaining:
+            logger.info(
+                "Patch execution %s: all %d package(s) already at target; nothing to install",
+                ctx.execution.id, len(dropped),
+            )  # fmt: skip
+            return
         self._check_sudo(ctx)
         logger.info("Patch execution %s: revalidation passed", ctx.execution.id)
+
+    def _drop_already_installed(
+        self,
+        ctx: _Context,
+        dropped: list[PatchPackageResult],
+        remaining: list[PatchPackageResult],
+    ) -> None:
+        """Take packages already at their target version out of this execution's plan."""
+        for pkg in dropped:
+            self.db.update_execution_package(
+                pkg.id, after_version=pkg.target_version, install_result=ALREADY_AT_TARGET,
+                verification_result="VERIFIED",
+                detail="Already installed at the target version at revalidation; not reinstalled.",
+            )  # fmt: skip
+            pkg.after_version, pkg.verification_result = pkg.target_version, "VERIFIED"
+        ctx.dropped, ctx.packages = dropped, remaining
+        needed = {p.deb_filename for p in remaining}
+        ctx.debs = {name: deb for name, deb in ctx.debs.items() if name in needed}
+        names = ", ".join(f"{p.binary_package} {p.target_version}" for p in dropped)
+        ctx.notes.append(
+            f"{len(dropped)} package(s) already at the target version were dropped from the "
+            f"plan: {names}."
+        )
+        logger.info(
+            "Patch execution %s: dropped %d package(s) already at target: %s",
+            ctx.execution.id, len(dropped), names,
+        )  # fmt: skip
 
     def _download(self, ctx: _Context) -> None:
         try:
@@ -712,18 +796,46 @@ class PatchService:
         if not result.ok or "ok" not in result.stdout.split():
             raise PatchAbort(f"Could not write to {ctx.remote_dir}: {result.error or 'no output'}")
         for filename in ctx.filenames:
-            size = ctx.debs[filename]["size"]
-            timeout = min(3600, 120 + size // (256 * 1024))
-            sent = ssh_service.run_scp(
-                ctx.ip, ctx.pem, [str(ctx.local_dir / filename)], ctx.remote_dir,
-                runner=self.runner, timeout=timeout,
-            )  # fmt: skip
+            sent = self._copy(ctx, filename)
             outcome = "TRANSFERRED" if sent.ok else "FAILED"
             for p in self._packages_with(ctx, filename):
                 self.db.update_execution_package(p.id, transfer_result=outcome)
             if not sent.ok:
-                raise PatchAbort(f"Transfer of {filename} failed: {sent.error}", package=filename)
+                exit_code = "none" if sent.returncode is None else sent.returncode
+                # A partial copy is useless: remove local and remote staging files.
+                raise PatchAbort(
+                    f"Transfer of {filename} failed after {SCP_ATTEMPTS} attempts "
+                    f"(scp exit {exit_code}): {sent.error}",
+                    package=filename, cleanup=True,
+                )  # fmt: skip
             logger.info("Patch execution %s: transferred %s", ctx.execution.id, filename)
+
+    def _copy(self, ctx: _Context, filename: str) -> ssh_service.RemoteResult:
+        """scp one .deb, retrying once; every attempt is recorded on the execution."""
+        timeout = min(3600, 120 + ctx.debs[filename]["size"] // (256 * 1024))
+        for attempt in range(1, SCP_ATTEMPTS + 1):
+            sent = ssh_service.run_scp(
+                ctx.ip, ctx.pem, [str(ctx.local_dir / filename)], ctx.remote_dir,
+                runner=self.runner, timeout=timeout,
+            )  # fmt: skip
+            ctx.transfer_attempts.append(
+                {
+                    "filename": filename,
+                    "attempt": attempt,
+                    "ok": sent.ok,
+                    "exit_code": sent.returncode,
+                    "stderr": _tail(sent.stderr.strip(), MAX_STORED_SCP_STDERR) or None,
+                    "error": sent.error,
+                }
+            )
+            self.db.update_execution(ctx.execution.id, transfer_attempts=ctx.transfer_attempts)
+            if sent.ok:
+                return sent
+            logger.warning(
+                "Patch execution %s: scp of %s failed (attempt %d/%d, exit %s): %s",
+                ctx.execution.id, filename, attempt, SCP_ATTEMPTS, sent.returncode, sent.error,
+            )  # fmt: skip
+        return sent
 
     def _verify_transfer(self, ctx: _Context) -> None:
         command = patch_remote.verify_transfer_command(ctx.remote_dir, ctx.filenames)
@@ -832,7 +944,9 @@ class PatchService:
         return post
 
     def _query_post(self, ctx: _Context) -> patch_remote.PostInstallState | None:
-        command = patch_remote.post_install_command([p.binary_package for p in ctx.packages])
+        # Dropped packages are queried too: their CVEs are verified like the installed ones.
+        names = [p.binary_package for p in [*ctx.packages, *ctx.dropped]]
+        command = patch_remote.post_install_command(names)
         result = self._remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
         if not result.ok:
             logger.warning("Patch execution %s: state query failed", ctx.execution.id)
@@ -1059,8 +1173,23 @@ class PatchService:
     # --- "Patch All" -------------------------------------------------------------------
 
     def queue_preview(self, run: AnalysisRun) -> list[tuple[ServerAnalysis, Eligibility]]:
-        """Every server of the run in queue order, with its eligibility (read-only)."""
-        return [(analysis, self.eligibility(analysis)) for analysis in run.servers]
+        """Every server of the run in queue order, with its eligibility (read-only).
+
+        A server analyzed again after this run is represented by its latest analysis (the
+        run's own one is kept in ``Eligibility.superseded``).
+        """
+        preview = []
+        for analysis in run.servers:
+            latest = None
+            if self.db.newer_analysis_exists(analysis):
+                latest = self.db.latest_analysis_for_server(analysis.server_name)
+            if latest is None or latest.id == analysis.id:
+                preview.append((analysis, self.eligibility(analysis)))
+                continue
+            check = self.eligibility(latest)
+            check.superseded = analysis
+            preview.append((latest, check))
+        return preview
 
     def start_queue(self, run_id: int, confirmed_ids: list[int], skip_reboot: bool) -> int:
         """Record a queue for the confirmed, still eligible servers of the run and start it.
@@ -1077,10 +1206,14 @@ class PatchService:
             items = []
             for analysis, check in self.queue_preview(run):
                 status, detail = ps.ITEM_PENDING, None
+                ids = {analysis.id} | ({check.superseded.id} if check.superseded else set())
                 if not check.allowed:
                     status, detail = ps.ITEM_SKIPPED, " ".join(check.reasons)
-                elif analysis.id not in confirmed:
+                elif confirmed.isdisjoint(ids):
                     status, detail = ps.ITEM_SKIPPED, "Not in the confirmed server list."
+                if check.superseded:
+                    latest = f"Uses the latest analysis #{analysis.run_id} (newer than this run)."
+                    detail = f"{latest} {detail}" if detail else latest
                 items.append(
                     {
                         "server_analysis_id": analysis.id,
@@ -1145,7 +1278,11 @@ class PatchService:
                 self.db.update_queue_item(item.id, status=ps.ITEM_FAILED, detail=failure)
                 self._stop_queue(queue_id, item.server_name, failure)
                 return
-            self.db.update_queue_item(item.id, status=ps.ITEM_SUCCESS)
+            done: dict = {"status": ps.ITEM_SUCCESS}
+            if self.db.get_execution(execution_id).state == ps.ALREADY_PATCHED:
+                note = "Already patched: every package was already at its target version."
+                done["detail"] = f"{item.detail} {note}" if item.detail else note
+            self.db.update_queue_item(item.id, **done)
         self.db.update_patch_queue(queue_id, state=ps.QUEUE_COMPLETED, finished_at=_now())
         logger.info("Patch All queue %s completed", queue_id)
 
@@ -1172,7 +1309,7 @@ class PatchService:
 
 def queue_failure(execution: PatchExecution) -> str | None:
     """Why this execution stops a "Patch All" queue (None: the server is done)."""
-    if execution.state not in ps.SUCCESSFUL:
+    if execution.state not in ps.DONE:
         title = execution.error_title or ps.LABELS.get(execution.state, execution.state)
         return f"{title}: {execution.error_summary or 'no details'}"
     if execution.reboot_status == ps.REBOOT_FAILED:
@@ -1193,9 +1330,15 @@ def progress_steps(execution: PatchExecution) -> list[ProgressStep]:
     """The step list shown while/after patching (no raw terminal output)."""
     if execution.decision != ps.APPROVED:
         return []
+    if execution.state == ps.ALREADY_PATCHED:
+        return [
+            ProgressStep("Preflight revalidation", "done"),
+            ProgressStep("All packages already at the target version; nothing to install", "done"),
+        ]
     debs: dict[str, PatchPackageResult] = {}
     for p in execution.packages:
-        debs.setdefault(p.deb_filename, p)
+        if p.install_result != ALREADY_AT_TARGET:  # dropped at revalidation: never copied
+            debs.setdefault(p.deb_filename, p)
     total = len(debs)
     downloaded = sum(1 for p in debs.values() if p.download_result == "DOWNLOADED")
     transferred = sum(1 for p in debs.values() if p.transfer_result in ("TRANSFERRED", "VERIFIED"))
