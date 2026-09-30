@@ -209,6 +209,7 @@ class FakeUbuntu:
         # behaviour knobs
         self.unreachable = False
         self.scp_fail = False
+        self.scp_failures = 0  # the next N scp calls die mid-copy (truncated remote file)
         self.corrupt_transfer = False
         self.sim_rc = 0
         self.sim_extra: list[str] = []
@@ -247,6 +248,12 @@ class FakeUbuntu:
     def installed(self, name, arch="amd64"):
         row = self.packages.get((name, arch))
         return row[0] if row else None
+
+    def preinstall(self, names=None):
+        """Install PLAN packages (all, or ``names``) at their target version out of band."""
+        for package, arch, _, target, source, sv, _, _, _ in PLAN:
+            if names is None or package in names:
+                self.packages[(package, arch)] = [target, source, sv, "ii "]
 
     # --- dispatch ------------------------------------------------------------------------
 
@@ -320,6 +327,13 @@ class FakeUbuntu:
         split = args.index("--")
         files, dest = args[split + 1 : -1], args[-1]
         d = dest.split(":", 1)[1].rstrip("/")
+        if self.scp_failures:
+            self.scp_failures -= 1
+            for path in files:
+                with open(path, "rb") as fh:
+                    self.dirs[d][path.rsplit("/", 1)[1]] = fh.read()[:10]
+            stderr = "client_loop: send disconnect: Broken pipe\nlost connection"
+            return _done(args, rc=1, stderr=stderr)
         for path in files:
             with open(path, "rb") as fh:
                 data = fh.read()
