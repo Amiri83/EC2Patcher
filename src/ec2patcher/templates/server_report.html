@@ -96,6 +96,50 @@
   {% endif %}
 </div>
 
+<div class="card patch-decision" id="patch-decision">
+  <div class="card-header">
+    <h2>Patch Decision</h2>
+    {% set ex = patch.execution %}
+    {% if ex %}<span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ patch_labels.get(ex.state, ex.state)|upper }}</span>
+    {% else %}<span class="badge badge-neutral">PENDING REVIEW</span>{% endif %}
+  </div>
+  {% if patch.not_checked_warning %}<div class="alert alert-warning not-checked-warning">{{ patch.not_checked_warning }}</div>{% endif %}
+  {% if ex and ex.decision == "REJECTED" %}
+    <p><strong>Rejected</strong> on {{ ex.decided_at|timestamp }}. No packages were downloaded, copied or installed. The report remains available for reference.</p>
+  {% elif ex %}
+    <p>Approved on {{ ex.decided_at|timestamp }}. <a href="/patch/{{ ex.id }}" class="btn btn-secondary btn-sm">View Patch Execution #{{ ex.id }}</a></p>
+  {% else %}
+    <dl class="kv">
+      <dt>Local Staging</dt><dd>{% if patch.local_path %}<code>{{ patch.local_path }}</code>{% else %}<span class="text-danger">unavailable</span>{% endif %}
+          <div class="muted small">From Settings &rarr; Local Patch Download Directory</div></dd>
+      <dt>Remote Staging</dt><dd><code>{{ patch.remote_path or "-" }}</code></dd>
+      <dt>Expected Reboot</dt><dd>{% if analysis.expected_reboot is none %}unknown{% elif analysis.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}NO{% endif %}</dd>
+      <dt>Packages to Update</dt><dd>{{ patch.packages }} ({{ patch.debs }} .deb file{{ "" if patch.debs == 1 else "s" }})</dd>
+      <dt>Download Size</dt><dd>{{ patch.download_bytes|filesize }}</dd>
+    </dl>
+    {% if patch.reasons %}
+      <div class="alert alert-warning patch-blocked"><strong>Patching is not available for this report.</strong>
+        <ul class="plain-list">{% for r in patch.reasons %}<li>{{ r }}</li>{% endfor %}</ul></div>
+    {% endif %}
+    {% if patch.unpatched_notes %}
+      <details class="small"><summary>{{ patch.unpatched_notes|length }} finding(s) cannot be fixed by this patch</summary>
+        <ul class="plain-list">{% for n in patch.unpatched_notes %}<li>{{ n }}</li>{% endfor %}</ul></details>
+    {% endif %}
+    <div class="form-actions">
+      <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/reject"
+            data-confirm="Reject patching for {{ analysis.server_name }}? No action will be taken on the server.">
+        <input type="hidden" name="confirm" value="yes">
+        <button type="submit" class="btn btn-danger-outline">Reject</button>
+      </form>
+      {% if patch.allowed %}
+        <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/approve" class="btn btn-primary">Approve &amp; Patch</a>
+      {% else %}
+        <button type="button" class="btn btn-primary" disabled>Approve &amp; Patch</button>
+      {% endif %}
+    </div>
+  {% endif %}
+</div>
+
 <div class="card">
   <h2>Summary</h2>
   <div class="summary-grid">
@@ -183,7 +227,8 @@
     </table>
     </div>
   {% else %}
-    <p class="muted">No package updates are planned for this server.</p>
+    <p class="muted">No package updates are planned for this server{% if patch.not_checked_warning %} for the CVEs that were checked{% endif %}.</p>
+    {% if patch.not_checked_warning %}<div class="alert alert-warning">{{ patch.not_checked_warning }}</div>{% endif %}
   {% endif %}
 </div>
 

@@ -2,12 +2,32 @@
 {% block title %}Settings{% endblock %}
 {% block heading %}Settings{% endblock %}
 {% block content %}
-<div class="card">
+<div class="card form-card">
   <h2>Patch &amp; Download Settings</h2>
-  <div class="empty-state">
-    <p class="empty-title">Not available yet</p>
-    <p class="muted">Patch and package download settings will be added in later phases.</p>
-  </div>
+  <form method="post" action="/settings/staging">
+    <div class="field{% if template_error %} has-error{% endif %}">
+      <label for="template">Local Patch Download Directory</label>
+      <input type="text" id="template" name="template" value="{{ staging_template }}" autocomplete="off">
+      {% if template_error %}<div class="field-error">{{ template_error }}</div>{% endif %}
+      <div class="hint">Must contain <code>${server_name}</code> and resolve to an absolute path (<code>~</code> is expanded). Default: <code>{{ default_staging_template }}</code>. Changes apply to future patch executions only.</div>
+    </div>
+    <dl class="kv staging-preview">
+      <dt>Saved Template</dt><dd><code>{{ saved_template }}</code></dd>
+      <dt>Resolved for {{ preview_name }}</dt><dd>{% if preview %}<code>{{ preview }}</code>{% else %}<span class="text-danger">{{ preview_error }}</span>{% endif %}</dd>
+      <dt>Remote Staging</dt><dd><code>{{ remote_example }}</code> <span class="muted small">(fixed: /tmp/${server_name} on the server)</span></dd>
+    </dl>
+    <div class="form-actions">
+      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
+      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+    </div>
+  </form>
+  {% if server_names|length > 1 %}
+  <form method="get" action="/settings" class="inline preview-form">
+    <label for="server" class="muted small">Preview for server</label>
+    <select id="server" name="server">{% for n in server_names %}<option value="{{ n }}"{% if n == preview_name %} selected{% endif %}>{{ n }}</option>{% endfor %}</select>
+    <button type="submit" class="btn btn-secondary btn-sm">Preview</button>
+  </form>
+  {% endif %}
 </div>
 <div class="card">
   <h2>Application</h2>

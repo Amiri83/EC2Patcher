@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Confirm Patch - {{ analysis.server_name }}{% endblock %}
+{% block heading %}Approve &amp; Patch: {{ analysis.server_name }}{% endblock %}
+{% block content %}
+<div class="card confirm-card">
+  <div class="alert alert-error"><strong>This action will modify installed packages on this server.</strong></div>
+  <dl class="kv">
+    <dt>Server Name</dt><dd>{{ analysis.server_name }}</dd>
+    <dt>Display Name</dt><dd>{{ analysis.display_name or "-" }}</dd>
+    <dt>IP</dt><dd><code>{{ analysis.ip_address }}</code></dd>
+    <dt>Packages to Update</dt><dd>{{ patch.packages }}</dd>
+    <dt>.deb Files</dt><dd>{{ patch.debs }}</dd>
+    <dt>Expected Download Size</dt><dd>{{ patch.download_bytes|filesize }}</dd>
+    <dt>Expected Reboot</dt><dd>{% if analysis.expected_reboot %}<strong>YES EXPECTED</strong> (EC2Patcher will not reboot the server){% else %}NO{% endif %}</dd>
+    <dt>Local Staging Path</dt><dd><code>{{ patch.local_path }}</code></dd>
+    <dt>Remote Staging Path</dt><dd><code>{{ patch.remote_path }}</code></dd>
+  </dl>
+  <div class="table-scroll">
+  <table class="table small">
+    <thead><tr><th>Binary Package</th><th>Current</th><th>Target</th><th>.deb</th></tr></thead>
+    <tbody>
+      {% for p in analysis.plan %}
+      <tr><td>{{ p.binary_package }} <span class="muted">{{ p.architecture }}</span></td>
+          <td><code>{{ p.current_version or "not installed" }}</code></td>
+          <td><code>{{ p.target_version }}</code></td>
+          <td><code>{{ p.deb_filename }}</code></td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="muted small">The server is revalidated first; if anything changed since this analysis the patch is aborted before any download. Only the approved .deb files are installed (no apt upgrade / dist-upgrade). No automatic reboot.</p>
+  <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/approve" class="form-actions">
+    <input type="hidden" name="confirm" value="yes">
+    <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}" class="btn btn-secondary">Cancel</a>
+    <button type="submit" class="btn btn-danger" data-once>Approve &amp; Start Patching</button>
+  </form>
+</div>
+{% endblock %}
