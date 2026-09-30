@@ -19,6 +19,7 @@ from ec2patcher.services.analysis_service import (
     remediation_groups,
     summarize,
 )
+from ec2patcher.services.patch_service import Eligibility
 from ec2patcher.services.severity import SEVERITIES, SEVERITY_CLASSES
 
 
@@ -238,6 +239,7 @@ def render_report(rows, **context):
         remediation_groups=remediation_groups(rows),
         finding_buckets=bucket_groups(remediation_groups(rows)),
         is_latest=True,
+        patch=Eligibility(allowed=False),
         version="test",
         active="reports",
         **context,

@@ -15,11 +15,15 @@ from ec2patcher.models import (
     AnalysisRun,
     CveFindingRow,
     PackagePlanRow,
+    PatchCveResult,
+    PatchExecution,
+    PatchPackageResult,
     Server,
     ServerAnalysis,
     StoredReport,
     Tag,
 )
+from ec2patcher.services import patch_state
 
 SCHEMA_VERSION = 7
 
@@ -272,6 +276,14 @@ class DuplicateTagKeyError(Exception):
     """Raised when the same tag key is given twice for one server."""
 
 
+class DecisionExistsError(Exception):
+    """The analysis was already approved or rejected (args[0]: existing execution id)."""
+
+
+class ExecutionActiveError(Exception):
+    """Another patch execution is still running (args[0]: its execution id)."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -404,6 +416,94 @@ def _row_to_plan(row: sqlite3.Row) -> PackagePlanRow:
         requests_reboot=bool(row["requests_reboot"]),
         status=row["status"],
         reason=row["reason"],
+    )
+
+
+_EXECUTION_COLUMNS = {
+    "failure_stage", "started_at", "finished_at", "updated_at", "local_staging_path",
+    "remote_staging_path", "local_staging_created", "remote_staging_created",
+    "reboot_required_after", "reboot_required_packages", "error_title", "error_summary",
+    "error_package", "partial_state_possible", "cleanup_status", "cleanup_detail",
+    "install_started_at", "install_finished_at", "install_exit_status", "install_output",
+    "simulation_output", "audit_ok", "audit_output", "notes",
+}  # fmt: skip
+_EXECUTION_PACKAGE_COLUMNS = {
+    "after_version", "download_result", "checksum_result", "transfer_result", "install_result",
+    "verification_result", "detail",
+}  # fmt: skip
+
+
+def _row_to_execution(row: sqlite3.Row) -> PatchExecution:
+    return PatchExecution(
+        id=row["id"],
+        analysis_run_id=row["analysis_run_id"],
+        server_analysis_id=row["server_analysis_id"],
+        server_id=row["server_id"],
+        server_name=row["server_name"],
+        display_name=row["display_name"],
+        ip_address=row["ip_address"],
+        decision=row["decision"],
+        decided_at=row["decided_at"],
+        state=row["state"],
+        failure_stage=row["failure_stage"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        updated_at=row["updated_at"],
+        local_staging_path=row["local_staging_path"],
+        remote_staging_path=row["remote_staging_path"],
+        local_staging_created=bool(row["local_staging_created"]),
+        remote_staging_created=bool(row["remote_staging_created"]),
+        expected_reboot=_bool_or_none(row["expected_reboot"]),
+        expected_reboot_reason=row["expected_reboot_reason"],
+        reboot_required_after=_bool_or_none(row["reboot_required_after"]),
+        reboot_required_packages=json.loads(row["reboot_required_packages"] or "[]"),
+        error_title=row["error_title"],
+        error_summary=row["error_summary"],
+        error_package=row["error_package"],
+        partial_state_possible=bool(row["partial_state_possible"]),
+        cleanup_status=row["cleanup_status"],
+        cleanup_detail=row["cleanup_detail"],
+        install_started_at=row["install_started_at"],
+        install_finished_at=row["install_finished_at"],
+        install_exit_status=row["install_exit_status"],
+        install_output=row["install_output"],
+        simulation_output=row["simulation_output"],
+        audit_ok=_bool_or_none(row["audit_ok"]),
+        audit_output=row["audit_output"],
+        notes=json.loads(row["notes"] or "[]"),
+    )
+
+
+def _row_to_execution_package(row: sqlite3.Row) -> PatchPackageResult:
+    return PatchPackageResult(
+        id=row["id"],
+        binary_package=row["binary_package"],
+        architecture=row["architecture"],
+        before_version=row["before_version"],
+        target_version=row["target_version"],
+        after_version=row["after_version"],
+        deb_filename=row["deb_filename"],
+        size=row["size"],
+        checksum=row["checksum"],
+        is_dependency=bool(row["is_dependency"]),
+        download_result=row["download_result"],
+        checksum_result=row["checksum_result"],
+        transfer_result=row["transfer_result"],
+        install_result=row["install_result"],
+        verification_result=row["verification_result"],
+        detail=row["detail"],
+    )
+
+
+def _row_to_execution_cve(row: sqlite3.Row) -> PatchCveResult:
+    return PatchCveResult(
+        id=row["id"],
+        cve=row["cve"],
+        source_package=row["source_package"],
+        fixed_version=row["fixed_version"],
+        resulting_version=row["resulting_version"],
+        result=row["result"],
+        detail=row["detail"],
     )
 
 
@@ -863,3 +963,253 @@ class Database:
             uploaded_at=row["uploaded_at"],
             status=row["status"],
         )
+
+    def newer_analysis_exists(self, analysis: ServerAnalysis) -> bool:
+        """True if a later analysis run includes the same server (by canonical name)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM server_analyses WHERE server_name = ? COLLATE NOCASE "
+                "AND run_id > ? LIMIT 1",
+                (analysis.server_name, analysis.run_id),
+            ).fetchone()
+        return row is not None
+
+    # --- settings (Phase 3) ---------------------------------------------------
+
+    def get_setting(self, key: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, value, _now()),
+            )
+
+    def delete_setting(self, key: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+    # --- patch executions (Phase 3) -----------------------------------------------
+
+    def create_patch_decision(
+        self,
+        analysis: ServerAnalysis,
+        decision: str,
+        local_staging_path: str | None = None,
+        remote_staging_path: str | None = None,
+        packages: list[dict] | None = None,
+    ) -> int:
+        """Record APPROVED or REJECTED for one analysis, atomically.
+
+        Raises DecisionExistsError if the analysis already has a decision and
+        ExecutionActiveError if approving while another execution is active.
+        """
+        patch_state.check_transition(patch_state.PENDING_REVIEW, decision)
+        now = _now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")  # serialise concurrent approvals
+            existing = conn.execute(
+                "SELECT id FROM patch_executions WHERE server_analysis_id = ?", (analysis.id,)
+            ).fetchone()
+            if existing:
+                raise DecisionExistsError(existing["id"])
+            if decision == patch_state.APPROVED:
+                active = self._active_execution_id(conn)
+                if active is not None:
+                    raise ExecutionActiveError(active)
+            cur = conn.execute(
+                "INSERT INTO patch_executions (analysis_run_id, server_analysis_id, server_id, "
+                "server_name, display_name, ip_address, decision, decided_at, state, updated_at, "
+                "local_staging_path, remote_staging_path, expected_reboot, "
+                "expected_reboot_reason, cleanup_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    analysis.run_id, analysis.id, analysis.server_id, analysis.server_name,
+                    analysis.display_name, analysis.ip_address, decision, now, decision, now,
+                    local_staging_path, remote_staging_path,
+                    None if analysis.expected_reboot is None else int(analysis.expected_reboot),
+                    analysis.expected_reboot_reason,
+                    "NOT_STARTED" if decision == patch_state.APPROVED else None,
+                ),
+            )  # fmt: skip
+            execution_id = cur.lastrowid
+            for p in packages or []:
+                conn.execute(
+                    "INSERT INTO patch_execution_packages (execution_id, binary_package, "
+                    "architecture, before_version, target_version, deb_filename, size, checksum, "
+                    "is_dependency) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        execution_id, p["binary_package"], p["architecture"],
+                        p["before_version"], p["target_version"], p["deb_filename"], p["size"],
+                        p["checksum"], int(p["is_dependency"]),
+                    ),
+                )  # fmt: skip
+        return execution_id
+
+    @staticmethod
+    def _active_execution_id(conn) -> int | None:
+        placeholders = ",".join("?" * len(patch_state.ACTIVE))
+        row = conn.execute(
+            f"SELECT id FROM patch_executions WHERE state IN ({placeholders}) "  # noqa: S608
+            "ORDER BY id LIMIT 1",
+            tuple(sorted(patch_state.ACTIVE)),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def active_execution_id(self) -> int | None:
+        with self.connect() as conn:
+            return self._active_execution_id(conn)
+
+    def transition_execution(self, execution_id: int, current: str, target: str, **fields) -> None:
+        """Compare-and-set state change; only transitions allowed by patch_state succeed."""
+        patch_state.check_transition(current, target)
+        fields = {**fields, "updated_at": _now()}
+        with self.connect() as conn:
+            values, assignments = self._execution_assignments(fields)
+            cur = conn.execute(
+                f"UPDATE patch_executions SET state = ?, {assignments} "  # noqa: S608
+                "WHERE id = ? AND state = ?",
+                (target, *values, execution_id, current),
+            )
+            if cur.rowcount != 1:
+                raise patch_state.InvalidTransitionError(
+                    f"Execution {execution_id} is not in state {current}; cannot move to {target}."
+                )
+
+    def update_execution(self, execution_id: int, **fields) -> None:
+        fields = {**fields, "updated_at": _now()}
+        with self.connect() as conn:
+            values, assignments = self._execution_assignments(fields)
+            conn.execute(
+                f"UPDATE patch_executions SET {assignments} WHERE id = ?",  # noqa: S608
+                (*values, execution_id),
+            )
+
+    @staticmethod
+    def _execution_assignments(fields: dict) -> tuple[list, str]:
+        unknown = set(fields) - _EXECUTION_COLUMNS
+        if unknown:
+            raise ValueError(f"Unknown column(s) for patch_executions: {sorted(unknown)}")
+        values = [
+            json.dumps(v) if isinstance(v, list) else (int(v) if isinstance(v, bool) else v)
+            for v in fields.values()
+        ]
+        return values, ", ".join(f"{column} = ?" for column in fields)
+
+    def update_execution_package(self, package_id: int, **fields) -> None:
+        self._update("patch_execution_packages", _EXECUTION_PACKAGE_COLUMNS, package_id, fields)
+
+    def replace_execution_cves(self, execution_id: int, rows: list[dict]) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM patch_execution_cves WHERE execution_id = ?", (execution_id,))
+            conn.executemany(
+                "INSERT INTO patch_execution_cves (execution_id, cve, source_package, "
+                "fixed_version, resulting_version, result, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        execution_id, r["cve"], r["source_package"], r["fixed_version"],
+                        r["resulting_version"], r["result"], r["detail"],
+                    )
+                    for r in rows
+                ],
+            )  # fmt: skip
+
+    def get_execution(self, execution_id: int) -> PatchExecution | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM patch_executions WHERE id = ?", (execution_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            execution = _row_to_execution(row)
+            self._load_execution_details(conn, execution)
+        return execution
+
+    def get_execution_for_analysis(self, analysis_id: int) -> PatchExecution | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM patch_executions WHERE server_analysis_id = ?", (analysis_id,)
+            ).fetchone()
+        return self.get_execution(row["id"]) if row else None
+
+    def list_executions(self, limit: int = 200) -> list[PatchExecution]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM patch_executions ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            executions = [_row_to_execution(r) for r in rows]
+            for execution in executions:
+                self._load_execution_details(conn, execution)
+        return executions
+
+    @staticmethod
+    def _load_execution_details(conn, execution: PatchExecution) -> None:
+        execution.packages = [
+            _row_to_execution_package(r)
+            for r in conn.execute(
+                "SELECT * FROM patch_execution_packages WHERE execution_id = ? "
+                "ORDER BY is_dependency, binary_package",
+                (execution.id,),
+            )
+        ]
+        execution.cves = [
+            _row_to_execution_cve(r)
+            for r in conn.execute(
+                "SELECT * FROM patch_execution_cves WHERE execution_id = ? ORDER BY cve, id",
+                (execution.id,),
+            )
+        ]
+
+    def mark_interrupted_executions(self) -> int:
+        """Executions still active at startup were cut short by a restart.
+
+        Before installing nothing on the server's packages changed -> FAILED. Once the
+        install may have started the outcome is not provable -> UNKNOWN. Staging files are
+        preserved either way. Returns the number of executions updated.
+        """
+        now = _now()
+        count = 0
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, state FROM patch_executions WHERE state IN "  # noqa: S608
+                f"({','.join('?' * len(patch_state.ACTIVE))})",
+                tuple(sorted(patch_state.ACTIVE)),
+            ).fetchall()
+            for row in rows:
+                state = row["state"]
+                if state == patch_state.CLEANING_UP:
+                    target, title = patch_state.SUCCESS_WITH_CLEANUP_WARNING, None
+                    fields = {
+                        "cleanup_status": "WARNING",
+                        "cleanup_detail": "The application stopped during cleanup; "
+                        "staging directories may still exist.",
+                    }
+                elif state in patch_state.POST_INSTALL:
+                    target, title = patch_state.UNKNOWN, "EXECUTION STATE UNKNOWN"
+                    fields = {"partial_state_possible": 1, "cleanup_status": "PRESERVED"}
+                else:
+                    target, title = patch_state.FAILED, "PATCH FAILED"
+                    fields = {"cleanup_status": "PRESERVED"}
+                if title:
+                    fields.update(
+                        error_title=title,
+                        failure_stage=state,
+                        error_summary="The application stopped while the patch was running "
+                        f"(stage: {patch_state.LABELS[state]}). Run a new analysis before "
+                        "retrying.",
+                    )
+                values, assignments = self._execution_assignments(
+                    {**fields, "finished_at": now, "updated_at": now}
+                )
+                conn.execute(
+                    f"UPDATE patch_executions SET state = ?, {assignments} "  # noqa: S608
+                    "WHERE id = ? AND state = ?",
+                    (target, *values, row["id"], state),
+                )
+                count += 1
+        return count

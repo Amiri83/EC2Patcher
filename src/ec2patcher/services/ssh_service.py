@@ -64,15 +64,73 @@ def build_ssh_command(
     return [
         SSH_BINARY,
         "-i", str(expand_pem_path(pem_path)),
-        "-o", "BatchMode=yes",
-        "-o", "IdentitiesOnly=yes",
-        "-o", "PasswordAuthentication=no",
-        "-o", f"ConnectTimeout={CONNECT_TIMEOUT_SECONDS}",
-        "-o", "StrictHostKeyChecking=accept-new",
+        *SSH_OPTIONS,
         "--",
         f"{SSH_USER}@{ip_address}",
         remote_command,
     ]  # fmt: skip
+
+
+SCP_BINARY = "scp"
+SSH_OPTIONS = [
+    "-o", "BatchMode=yes",
+    "-o", "IdentitiesOnly=yes",
+    "-o", "PasswordAuthentication=no",
+    "-o", f"ConnectTimeout={CONNECT_TIMEOUT_SECONDS}",
+    "-o", "StrictHostKeyChecking=accept-new",
+]  # fmt: skip
+
+
+def build_scp_command(
+    ip_address: str, pem_path: str, local_files: list[str], remote_dir: str
+) -> list[str]:
+    """``scp -i <pem> <options> -- <files...> ubuntu@<ip>:<remote_dir>/`` as an argument list.
+
+    Callers validate ``remote_dir`` and the file names (no shell metacharacters).
+    """
+    host = f"[{ip_address}]" if ":" in ip_address else ip_address
+    return [
+        SCP_BINARY, "-q", "-i", str(expand_pem_path(pem_path)), *SSH_OPTIONS,
+        "--", *local_files, f"{SSH_USER}@{host}:{remote_dir.rstrip('/')}/",
+    ]  # fmt: skip
+
+
+def run_scp(
+    ip_address: str,
+    pem_path: str,
+    local_files: list[str],
+    remote_dir: str,
+    runner: Runner = subprocess.run,
+    timeout: int = PROCESS_TIMEOUT_SECONDS,
+) -> RemoteResult:
+    """Copy local files to ``ubuntu@<ip>:<remote_dir>/`` (no shell, same ssh options)."""
+    normalized_ip, ip_error = check_ip_address(ip_address)
+    if ip_error:
+        return RemoteResult(ok=False, error=ip_error)
+    pem_error = check_pem_path(pem_path)
+    if pem_error:
+        return RemoteResult(ok=False, error=pem_error)
+    command = build_scp_command(normalized_ip, pem_path, local_files, remote_dir)
+    try:
+        proc = runner(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return RemoteResult(ok=False, error=f"The file transfer did not finish within {timeout}s.")
+    except FileNotFoundError:
+        return RemoteResult(ok=False, error="The 'scp' command was not found.")
+    except OSError as exc:
+        logger.exception("Could not start scp process")
+        return RemoteResult(ok=False, error=f"Could not run scp: {exc.strerror or exc}")
+    stdout, stderr = proc.stdout or "", proc.stderr or ""
+    if proc.returncode != 0:
+        return RemoteResult(False, stdout, stderr, proc.returncode, describe_ssh_error(stderr))
+    return RemoteResult(True, stdout, stderr, proc.returncode)
 
 
 def parse_remote_info(stdout: str) -> dict[str, str]:
