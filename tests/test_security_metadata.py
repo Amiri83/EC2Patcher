@@ -3,6 +3,7 @@
 import http.server
 import json
 import socket
+import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from phase2_fixtures import facts_output, online_fetcher
 
 from ec2patcher import config
+from ec2patcher.database import Database
 from ec2patcher.services import cve_resolver as cr
 from ec2patcher.services import security_metadata
 from ec2patcher.services.security_metadata import (
@@ -305,7 +307,7 @@ def test_default_fetcher_uses_configured_timeout(monkeypatch):
     monkeypatch.setattr(
         security_metadata, "http_get", lambda url, timeout=None: seen.append(timeout) or {}
     )
-    assert SecurityMetadata().timeout == 30  # default per-request timeout
+    assert SecurityMetadata().timeout == 20  # default per-request timeout
     meta = SecurityMetadata(timeout=7)
     with pytest.raises(ValueError):
         meta.lookup("CVE-2026-50001")
@@ -346,7 +348,7 @@ def test_http_4xx_other_than_429_is_not_retried():
     assert len(calls) == 1
 
 
-# --- retry, circuit breaker and disk cache ----------------------------------------------
+# --- retry, circuit breaker and SQLite cache --------------------------------------------
 
 SUDO_DOC = {
     "id": "CVE-2026-50001",
@@ -430,11 +432,11 @@ def test_success_between_failures_resets_the_consecutive_count():
 
 def test_consecutive_failures_trip_breaker_and_cached_copy_is_used(tmp_path):
     clock = Clock()
-    cache = tmp_path / "canonical"
+    cache = tmp_path / "cache.db"
     # A previous run cached CVE-2026-50005, 30 hours ago (older than the 24 h TTL).
     warm = SecurityMetadata(cache, fetcher=lambda url: doc_for("CVE-2026-50005"), now=clock)
     warm.lookup("CVE-2026-50005")
-    assert (cache / "CVE-2026-50005.json").is_file()
+    assert Database(cache).get_cve_metadata("CVE-2026-50005") is not None
     clock.value = T0 + timedelta(hours=30)
 
     calls = []
@@ -462,7 +464,7 @@ def test_consecutive_failures_trip_breaker_and_cached_copy_is_used(tmp_path):
 
 def test_cache_fallback_after_retries_marks_age(tmp_path):
     clock = Clock()
-    cache = tmp_path / "canonical"
+    cache = tmp_path / "cache.db"
     SecurityMetadata(cache, fetcher=lambda url: SUDO_DOC, now=clock).lookup("CVE-2026-50001")
     clock.value = T0 + timedelta(hours=26, minutes=5)
 
@@ -484,16 +486,17 @@ def test_cache_fallback_after_retries_marks_age(tmp_path):
 
 def test_fresh_cache_is_used_without_request_and_expired_cache_is_refreshed(tmp_path):
     clock = Clock()
-    cache = tmp_path / "canonical"
+    cache = tmp_path / "cache.db"
+    db = Database(cache)
     calls = []
 
     def fetch(url):
         calls.append(url)
         return SUDO_DOC
 
-    SecurityMetadata(cache, fetcher=fetch, now=clock).lookup("CVE-2026-50001")
-    entry = json.loads((cache / "CVE-2026-50001.json").read_text())
-    assert entry == {"cve": "CVE-2026-50001", "fetched_at": T0.isoformat(), "document": SUDO_DOC}
+    SecurityMetadata(db, fetcher=fetch, now=clock).lookup("CVE-2026-50001")
+    document, fetched_at = db.get_cve_metadata("CVE-2026-50001")
+    assert (json.loads(document), fetched_at) == (SUDO_DOC, T0.isoformat())
 
     clock.value = T0 + timedelta(hours=23)  # new process, within the TTL: no request
     record = SecurityMetadata(cache, fetcher=fetch, now=clock).lookup("CVE-2026-50001")
@@ -503,14 +506,16 @@ def test_fresh_cache_is_used_without_request_and_expired_cache_is_refreshed(tmp_
     meta = SecurityMetadata(cache, fetcher=fetch, now=clock)
     assert meta.lookup("CVE-2026-50001").cache_note is None
     assert len(calls) == 2
-    fetched = json.loads((cache / "CVE-2026-50001.json").read_text())["fetched_at"]
-    assert fetched == clock.value.isoformat()
-    assert meta.clear() and not list(cache.glob("*.json"))
+    assert db.get_cve_metadata("CVE-2026-50001")[1] == clock.value.isoformat()
+    assert meta.clear()  # clear() empties the table too
+    assert db.get_cve_metadata("CVE-2026-50001") is None
 
 
-def test_404_is_cached_on_disk_for_offline_lookups(tmp_path):
-    cache = tmp_path / "canonical"
+def test_404_is_cached_as_null_for_offline_lookups(tmp_path):
+    cache = tmp_path / "cache.db"
     SecurityMetadata(cache, fetcher=online_fetcher(docs=[])).lookup("CVE-2026-99999")
+    document, _ = Database(cache).get_cve_metadata("CVE-2026-99999")
+    assert document is None  # NULL document = Canonical confirmed 404
     offline = SecurityMetadata(cache, fetcher=failing_fetch)
     assert offline.lookup("CVE-2026-99999", network=False) is None
     with pytest.raises(MetadataUnreachable, match="only failed lookups are retried"):
@@ -519,11 +524,255 @@ def test_404_is_cached_on_disk_for_offline_lookups(tmp_path):
 
 
 def test_corrupt_cache_entry_is_ignored(tmp_path):
-    cache = tmp_path / "canonical"
-    cache.mkdir()
-    (cache / "CVE-2026-50001.json").write_text("{not json")
-    meta = SecurityMetadata(cache, fetcher=lambda url: SUDO_DOC)
+    db = Database(tmp_path / "cache.db")
+    db.put_cve_metadata("CVE-2026-50001", "{not json", T0.isoformat())
+    meta = SecurityMetadata(db, fetcher=lambda url: SUDO_DOC)
     assert meta.lookup("CVE-2026-50001").for_release("noble")[0].source == "sudo"
+    assert json.loads(db.get_cve_metadata("CVE-2026-50001")[0]) == SUDO_DOC  # rewritten
+
+
+def test_failures_are_never_cached(tmp_path):
+    db = Database(tmp_path / "cache.db")
+
+    def server_error(url):
+        raise HTTPError(url, 503, "Service Unavailable", None, None)
+
+    for fetch in (failing_fetch, server_error, lambda url: {"id": "other"}):
+        meta = SecurityMetadata(db, fetcher=fetch)
+        with pytest.raises((OSError, ValueError)):
+            meta.lookup("CVE-2026-50001")
+    assert db.get_cve_metadata("CVE-2026-50001") is None
+
+
+@pytest.mark.parametrize("broken", ["get_cve_metadata", "put_cve_metadata"])
+def test_cache_errors_fall_back_to_network(tmp_path, monkeypatch, broken):
+    def fail(*args):
+        raise sqlite3.OperationalError("database is locked")
+
+    db = Database(tmp_path / "cache.db")
+    monkeypatch.setattr(db, broken, fail)
+    calls = []
+    meta = SecurityMetadata(db, fetcher=online_fetcher(calls=calls))
+    assert meta.lookup("CVE-2026-63076").for_release("noble")  # the lookup still succeeds
+    assert len(calls) == 1
+    assert meta.run_outcomes() == {"CVE-2026-63076": "ok"}
+
+
+def test_unopenable_cache_database_falls_back_to_network(tmp_path):
+    not_a_db = tmp_path / "cache.db"
+    not_a_db.write_text("this is not a SQLite database")
+    meta = SecurityMetadata(not_a_db, fetcher=lambda url: SUDO_DOC)
+    assert meta.lookup("CVE-2026-50001").for_release("noble")[0].source == "sudo"
+    meta.clear()  # never raises either
+
+
+def test_sqlite_cache_is_shared_across_instances_and_force_refresh_bypasses_it(tmp_path):
+    db = Database(tmp_path / "cache.db")
+    calls = []
+    SecurityMetadata(db, fetcher=online_fetcher(calls=calls)).lookup("CVE-2026-63076")
+    meta = SecurityMetadata(db, fetcher=online_fetcher(calls=calls))
+    meta.lookup("CVE-2026-63076")
+    assert len(calls) == 1  # loaded from SQLite, no request
+    meta.lookup("CVE-2026-63076", force_refresh=True)
+    assert len(calls) == 2  # bypasses memo and SQLite
+    meta.lookup("CVE-2026-63076")
+    assert len(calls) == 2  # memoized again
+
+
+def test_force_refresh_run_fetches_each_cve_once_and_only_the_given_cves(tmp_path):
+    db = Database(tmp_path / "cache.db")
+    calls = []
+    meta = SecurityMetadata(db, fetcher=online_fetcher(calls=calls))
+    for cve in ("CVE-2026-63076", "CVE-2026-63075"):
+        meta.lookup(cve)
+    assert len(calls) == 2
+
+    meta.start_run(force_refresh=True, cves=["cve-2026-63076"])
+    for _ in range(3):  # e.g. one lookup per server reporting the CVE
+        meta.lookup("CVE-2026-63076")
+        meta.lookup("CVE-2026-63075")
+    # forced once; the other CVE comes from the memo
+    assert calls[2:] == [security_metadata.API_URL.format(cve="CVE-2026-63076")]
+
+    meta.start_run(force_refresh=True)  # every CVE
+    meta.lookup("CVE-2026-63075")
+    meta.lookup("CVE-2026-63076")
+    assert len(calls) == 5
+    meta.start_run()  # a normal run: memo / cache again
+    meta.lookup("CVE-2026-63075")
+    assert len(calls) == 5
+
+
+def test_force_refresh_failure_falls_back_to_cached_copy(tmp_path):
+    clock = Clock()
+    db = Database(tmp_path / "cache.db")
+    SecurityMetadata(db, fetcher=lambda url: SUDO_DOC, now=clock).lookup("CVE-2026-50001")
+    clock.value = T0 + timedelta(minutes=5)
+    meta = SecurityMetadata(db, fetcher=failing_fetch, now=clock)
+    record = meta.lookup("CVE-2026-50001", force_refresh=True)
+    assert record.cache_note == "Canonical metadata from cache (age 5m)"
+    assert meta.run_outcomes() == {"CVE-2026-50001": "cached"}
+
+
+def investigating_doc(cve):
+    doc = doc_for(cve)
+    return {
+        **doc,
+        "packages": [
+            *doc["packages"],
+            {
+                "name": "curl",
+                "statuses": [
+                    {"release_codename": "noble", "status": "needs-triage", "pocket": None}
+                ],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "document, ttl_hours",
+    [(SUDO_DOC, 24), (investigating_doc("CVE-2026-50001"), 1), (None, 24)],
+    ids=["settled", "under_investigation", "confirmed-404"],
+)
+def test_cache_ttl_is_24h_when_settled_and_1h_under_investigation(tmp_path, document, ttl_hours):
+    clock = Clock()
+    db = Database(tmp_path / "cache.db")
+    stored = None if document is None else json.dumps(document)
+    db.put_cve_metadata("CVE-2026-50001", stored, T0.isoformat())
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        return SUDO_DOC
+
+    clock.value = T0 + timedelta(hours=ttl_hours) - timedelta(minutes=1)
+    SecurityMetadata(db, fetcher=fetch, now=clock).lookup("CVE-2026-50001")
+    assert calls == []  # still fresh
+    clock.value = T0 + timedelta(hours=ttl_hours)
+    SecurityMetadata(db, fetcher=fetch, now=clock).lookup("CVE-2026-50001")
+    assert len(calls) == 1  # expired: refreshed
+
+
+def test_memo_expires_with_the_cache_ttl(tmp_path):
+    clock = Clock()
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        return investigating_doc("CVE-2026-50001")
+
+    meta = SecurityMetadata(tmp_path / "cache.db", fetcher=fetch, now=clock)
+    meta.lookup("CVE-2026-50001")
+    meta.lookup("CVE-2026-50001")
+    assert len(calls) == 1
+    clock.value = T0 + timedelta(hours=1)  # a long-running process: memo is not forever
+    meta.lookup("CVE-2026-50001")
+    assert len(calls) == 2
+
+
+# --- pacing and circuit breaker ---------------------------------------------------------
+
+
+class FakeMonotonic:
+    """A monotonic clock that only advances when the code under test sleeps."""
+
+    def __init__(self):
+        self.value, self.sleeps = 100.0, []
+
+    def __call__(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.value += seconds
+
+
+def test_pacing_sleeps_only_between_outbound_fetches(tmp_path):
+    clock = FakeMonotonic()
+    db = Database(tmp_path / "cache.db")
+    db.put_cve_metadata("CVE-2026-63075", None, datetime.now(timezone.utc).isoformat())
+    calls = []
+    meta = SecurityMetadata(
+        db, fetcher=online_fetcher(calls=calls), pace=1.0, sleep=clock.sleep, monotonic=clock
+    )
+    meta.lookup("CVE-2026-63076")
+    assert clock.sleeps == []  # the first fetch of a run never waits
+    meta.lookup("CVE-2026-63076")  # memo hit
+    meta.lookup("CVE-2026-63075")  # SQLite cache hit
+    assert clock.sleeps == [] and len(calls) == 1
+    meta.lookup("CVE-2026-54874")
+    assert clock.sleeps == [1.0] and len(calls) == 2  # ~1 s after the previous request
+
+    clock.value += 0.4  # time passes between lookups: only the rest is waited
+    meta.lookup("CVE-2026-10004")
+    assert clock.sleeps == pytest.approx([1.0, 0.6])
+    clock.value += 5
+    meta.lookup("CVE-2026-10005")
+    assert clock.sleeps == pytest.approx([1.0, 0.6])  # already more than 1 s apart
+
+    meta.start_run()  # resets the pacing clock: the first fetch of the run does not wait
+    meta.lookup("CVE-2026-10006", force_refresh=True)
+    assert clock.sleeps == pytest.approx([1.0, 0.6])
+
+
+def test_pacing_applies_to_retries_after_short_backoff():
+    clock = FakeMonotonic()
+    meta = SecurityMetadata(
+        fetcher=failing_fetch, pace=1.0, backoff=0.25, sleep=clock.sleep, monotonic=clock
+    )
+    with pytest.raises(OSError):
+        meta.lookup("CVE-2026-50001")
+    # attempt 1 immediately; backoff 0.25 + pacing 0.75; backoff 0.5 + pacing 0.5
+    assert clock.sleeps == [0.25, 0.75, 0.5, 0.5]
+
+
+def test_default_pacing_is_one_second():
+    # conftest zeroes PACE_SECONDS for speed; the dataclass default captured it at import.
+    assert security_metadata.MetadataStatus(available=True).pace_seconds == 1.0
+
+
+def test_breaker_trips_after_three_consecutive_failures_and_success_resets_count():
+    replies = {  # CVE -> fails?
+        "CVE-2026-50001": True, "CVE-2026-50002": True, "CVE-2026-50003": False,
+        "CVE-2026-50004": True, "CVE-2026-50005": True, "CVE-2026-50006": False,
+        "CVE-2026-50007": True, "CVE-2026-50008": True, "CVE-2026-50009": True,
+        "CVE-2026-50010": False,
+    }  # fmt: skip
+    calls = []
+
+    def fetch(url):
+        cve = url.rsplit("/", 1)[1].removesuffix(".json")
+        calls.append(cve)
+        if replies[cve]:
+            raise TimeoutError("timed out")
+        return doc_for(cve)
+
+    meta = SecurityMetadata(fetcher=fetch, attempts=1)
+    for cve in list(replies)[:6]:
+        try:
+            meta.lookup(cve)
+        except OSError:
+            pass
+        assert not meta.breaker_open  # two failures, then a success resets the count
+    for cve in ("CVE-2026-50007", "CVE-2026-50008"):
+        with pytest.raises(TimeoutError):
+            meta.lookup(cve)
+    assert not meta.breaker_open
+    with pytest.raises(TimeoutError):
+        meta.lookup("CVE-2026-50009")
+    assert meta.breaker_open  # third consecutive failure
+    with pytest.raises(MetadataUnreachable):
+        meta.lookup("CVE-2026-50010")  # skipped although it would have succeeded
+    assert "CVE-2026-50010" not in calls
+
+    meta.start_run()  # resets the breaker and the consecutive-failure count
+    assert not meta.breaker_open
+    for cve in ("CVE-2026-50007", "CVE-2026-50008"):
+        with pytest.raises(TimeoutError):
+            meta.lookup(cve)
+    assert not meta.breaker_open  # counting started again from zero
+    assert meta.lookup("CVE-2026-50010") is not None
 
 
 # --- proxy ------------------------------------------------------------------------------
