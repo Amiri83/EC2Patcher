@@ -47,12 +47,14 @@ NOTICES = {
     "cleared": "All configured servers were removed ({count} deleted).",
     "not_found": "That server no longer exists.",
     "cache_cleared": (
-        "Security lookup memory and disk cache cleared. "
-        "The next analysis will query Canonical again."
+        "Security lookup memory and cache cleared. The next analysis will query Canonical again."
     ),
-    "cache_clean": "Security lookup memory and disk cache are already clear.",
+    "cache_clean": "Security lookup memory and cache are already clear.",
     "lookups_retrying": "Retrying {count} failed Canonical lookup(s).",
     "no_failed_lookups": "There are no failed Canonical lookups to retry.",
+    "reanalyzing": "Re-analyzing this server; all of its CVEs are fetched from Canonical again.",
+    "cves_retrying": "Retrying {count} CVE(s) from the Investigate bucket.",
+    "nothing_to_investigate": "There are no CVEs in the Investigate bucket to retry.",
     "database_reset": "Database reset. All stored data was removed.",
 }
 
@@ -95,6 +97,7 @@ def create_app(
     if interrupted:
         logger.warning("Marked %d unfinished analysis run(s) as interrupted", interrupted)
     metadata = metadata or SecurityMetadata(
+        db,
         timeout=config.get_canonical_timeout(),
         max_age=config.get_canonical_cache_ttl(),
         breaker_threshold=config.get_canonical_breaker_threshold(),
@@ -425,6 +428,31 @@ def create_app(
             raise StarletteHTTPException(404)
         return run, analysis
 
+    @app.post("/analysis/{run_id}/servers/{analysis_id}/reanalyze", response_class=HTMLResponse)
+    def reanalyze_server(request: Request, run_id: int, analysis_id: int):
+        """Re-analyze one server, fetching all of its CVEs from ubuntu.com again."""
+        stored_server_report(run_id, analysis_id)
+        if not analyzer.reanalyze_server(run_id, analysis_id):
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        return redirect(f"/analysis/{run_id}/servers/{analysis_id}", notice="reanalyzing")
+
+    @app.post(
+        "/analysis/{run_id}/servers/{analysis_id}/retry-investigate", response_class=HTMLResponse
+    )
+    def retry_investigate_cves(request: Request, run_id: int, analysis_id: int):
+        """Fetch the CVEs of the server's Investigate bucket again and re-analyze it."""
+        _, analysis = stored_server_report(run_id, analysis_id)
+        cves = analysis_service.investigate_cves(analysis)  # from the stored report only
+        count = analyzer.retry_cves(
+            run_id, cves, {analysis_id}, message=f"Retrying CVEs of {analysis.server_name}"
+        )
+        if count is None:
+            return reports_page(request, status_code=409, error="An analysis is already running.")
+        page = f"/analysis/{run_id}/servers/{analysis_id}"
+        if not count:
+            return redirect(page, notice="nothing_to_investigate")
+        return redirect(page, notice="cves_retrying", count=count)
+
     @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
     def server_report(request: Request, run_id: int, analysis_id: int):
         run, analysis = stored_server_report(run_id, analysis_id)
@@ -437,6 +465,7 @@ def create_app(
             remediation_groups=groups,
             finding_buckets=analysis_service.bucket_groups(groups),
             is_latest=latest is not None and latest.id == run_id,
+            notice=notice_from_query(request),
         )  # fmt: skip
 
     @app.get("/analysis/{run_id}/servers/{analysis_id}/export.xlsx")

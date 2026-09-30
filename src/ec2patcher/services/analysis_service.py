@@ -171,51 +171,84 @@ class AnalysisService:
         )
         logger.info("Analysis run %s finished (%d server failure(s))", run_id, failures)
 
-    # --- retry failed Canonical lookups -------------------------------------------
+    # --- follow-up actions on a finished run -----------------------------------------
+    # Retry failed lookups (whole run), Retry these CVEs (Investigate bucket of one server)
+    # and Re-analyze (one server) run in the background with the run marked as running, and
+    # force-refresh their CVEs from ubuntu.com (bypassing the memo and the cache).
+
+    def _start_followup(self, run_id: int, message: str, job: Callable[[str], None]) -> bool:
+        """Run ``job(previous_status)`` in the background; False if an analysis is running."""
+        with self._lock:
+            if self._running:
+                return False
+            run = self.db.get_analysis_run(run_id, details=False)
+            if run is None or run.is_running:
+                return False
+            self._running = True
+        try:
+            self.db.update_analysis_run(run_id, status="running", progress_message=message)
+            self.starter(lambda: self._followup_safely(run_id, run.status, job))
+        except Exception:
+            self._running = False
+            self.db.update_analysis_run(run_id, status=run.status, progress_message=None)
+            raise
+        return True
+
+    def _followup_safely(self, run_id: int, previous_status: str, job) -> None:
+        try:
+            job(previous_status)
+        except Exception:
+            logger.exception("Follow-up action on run %s crashed", run_id)
+            self.db.update_analysis_run(run_id, status=previous_status, progress_message=None)
+        finally:
+            self._running = False
 
     def retry_failed_lookups(self, run_id: int) -> int | None:
         """Re-resolve the CVEs of ``run_id`` whose Canonical lookup failed, in the background.
 
         Returns the number of CVEs retried (0 = nothing to retry), or None if an analysis
         is already running. Only the failed CVEs are requested from ubuntu.com again."""
-        with self._lock:
-            if self._running:
-                return None
-            run = self.db.get_analysis_run(run_id, details=False)
-            if run is None or run.is_running or not run.failed_lookups:
-                return 0
-            self._running = True
-        failed = run.failed_lookups
-        try:
-            self.db.update_analysis_run(
-                run_id, status="running", progress_message="Retrying failed Canonical lookups"
-            )
-            self.starter(lambda: self._retry_safely(run_id, run.status, set(failed)))
-        except Exception:
-            self._running = False
-            self.db.update_analysis_run(run_id, status=run.status, progress_message=None)
-            raise
-        logger.info("Retrying %d failed Canonical lookup(s) of run %s", len(failed), run_id)
-        return len(failed)
+        run = self.db.get_analysis_run(run_id, details=False)
+        failed = set(run.failed_lookups) if run else set()
+        return self.retry_cves(run_id, failed, message="Retrying failed Canonical lookups")
 
-    def _retry_safely(self, run_id: int, previous_status: str, failed: set[str]) -> None:
-        try:
-            self.retry_lookups(run_id, failed, previous_status)
-        except Exception:
-            logger.exception("Retrying the failed lookups of run %s crashed", run_id)
-            self.db.update_analysis_run(run_id, status=previous_status, progress_message=None)
-        finally:
-            self._running = False
+    def retry_cves(
+        self,
+        run_id: int,
+        cves: set[str],
+        analysis_ids: set[int] | None = None,
+        message: str = "Retrying Canonical lookups",
+    ) -> int | None:
+        """Force-refresh ``cves`` from ubuntu.com and re-analyze the completed servers (all,
+        or ``analysis_ids``) that reported them. Returns the number of CVEs retried (0 =
+        nothing to retry), or None if an analysis is already running."""
+        cves = {c.strip().upper() for c in cves}
+        if not cves:
+            return 0
 
-    def retry_lookups(self, run_id: int, failed: set[str], previous_status: str) -> None:
+        def job(previous_status: str) -> None:
+            self.retry_lookups(run_id, cves, previous_status, analysis_ids)
+
+        if not self._start_followup(run_id, message, job):
+            return None
+        logger.info("Retrying %d Canonical lookup(s) of run %s", len(cves), run_id)
+        return len(cves)
+
+    def retry_lookups(
+        self,
+        run_id: int,
+        failed: set[str],
+        previous_status: str,
+        analysis_ids: set[int] | None = None,
+    ) -> None:
         """Re-analyze the completed servers that reported a CVE in ``failed``.
 
-        Canonical is queried again for ``failed`` only; every other CVE is resolved from the
-        memo / disk cache (network only if it is missing there, e.g. after Clear Security
-        Cache). A server that cannot be re-analyzed keeps its previous results, and its
-        failed CVEs stay failed."""
+        Canonical is queried again (force refresh) for ``failed`` only; every other CVE is
+        resolved from the memo / cache (network only if it is missing there, e.g. after
+        Clear Security Cache). A server that cannot be re-analyzed keeps its previous
+        results, and its failed CVEs stay failed."""
         run = self.db.get_analysis_run(run_id, details=True)
-        self.metadata.start_run()
+        self.metadata.start_run(force_refresh=True, cves=failed)
         self.nvd.start_run()
         self.apt.start_run()
 
@@ -230,6 +263,7 @@ class AnalysisService:
         affected = [
             s for s in run.servers
             if s.status == "complete" and failed.intersection(s.reported_cves)
+            and (analysis_ids is None or s.id in analysis_ids)
         ]  # fmt: skip
         still_failed: set[str] = set()
         for index, analysis in enumerate(affected, start=1):
@@ -258,6 +292,70 @@ class AnalysisService:
             "Retried lookups of run %s: %d of %d still failed", run_id,
             sum(1 for cve in failed if lookups.get(cve) == FAILED_LOOKUP), len(failed),
         )  # fmt: skip
+
+    def reanalyze_server(self, run_id: int, analysis_id: int) -> bool:
+        """Re-analyze one server of ``run_id`` in the background, force-refreshing all of
+        its CVEs from ubuntu.com. False if an analysis is running (or the server is not
+        part of the run)."""
+        analysis = self.db.get_server_analysis(analysis_id)
+        if analysis is None or analysis.run_id != run_id:
+            return False
+
+        def job(previous_status: str) -> None:
+            self.reanalyze(run_id, analysis_id, previous_status)
+
+        message = f"Re-analyzing {analysis.server_name}"
+        if not self._start_followup(run_id, message, job):
+            return False
+        logger.info("Re-analyzing %s of run %s", analysis.server_name, run_id)
+        return True
+
+    def reanalyze(self, run_id: int, analysis_id: int, previous_status: str) -> None:
+        """Re-collect facts and re-resolve every CVE of one server (read-only, as a run).
+
+        A server that was complete keeps its previous results if the re-analysis fails."""
+        analysis = self.db.get_server_analysis(analysis_id)
+        run = self.db.get_analysis_run(run_id, details=False)
+        self.metadata.start_run(force_refresh=True)
+        self.nvd.start_run()
+        self.apt.start_run()
+        label = analysis.server_name
+
+        def progress(message: str) -> None:
+            self.db.update_analysis_run(run_id, progress_message=f"Re-analyzing {label}: {message}")
+
+        try:
+            error = self._analyze(analysis, progress)
+        except Exception as exc:
+            logger.exception("Re-analysis of %s failed unexpectedly", label)
+            error = f"Unexpected error: {exc}"
+        if not error:
+            self.db.update_server_analysis(analysis_id, error=None)
+        elif analysis.status == "complete":  # the previous results are still stored
+            logger.warning("Re-analysis of %s failed: %s", label, error)
+            self.db.update_server_analysis(
+                analysis_id,
+                warnings=[*analysis.warnings, f"Re-analysis at {_now()} failed: {error}"],
+            )
+        else:
+            logger.warning("Re-analysis of %s failed: %s", label, error)
+            self.db.update_server_analysis(
+                analysis_id, status="failed", completed_at=_now(), error=error
+            )
+
+        status = previous_status
+        if previous_status in ("completed", "completed_with_errors"):
+            servers = self.db.get_analysis_run(run_id, details=False).servers
+            failed = any(s.status == "failed" for s in servers)
+            status = "completed_with_errors" if failed else "completed"
+        lookups = {**run.metadata_lookups, **self.metadata.run_outcomes()}
+        self.db.update_analysis_run(
+            run_id,
+            status=status,
+            progress_message=None,
+            metadata_checked_at=_now(),
+            metadata_lookups=lookups,
+        )
 
     # --- one server -----------------------------------------------------------------
 
@@ -577,6 +675,12 @@ def bucket_groups(groups: list[RemediationGroup]) -> list[FindingBucket]:
     for group in groups:
         buckets[bucket_for_status(group.status)].groups.append(group)
     return list(buckets.values())
+
+
+def investigate_cves(analysis: ServerAnalysis) -> set[str]:
+    """CVEs listed in the Investigate bucket of a server report ('Retry these CVEs')."""
+    groups = remediation_groups(analysis.findings)
+    return {cve for g in groups if bucket_for_status(g.status) == INVESTIGATE for cve in g.cves}
 
 
 @dataclass

@@ -1,7 +1,13 @@
 {% extends "base.html" %}
 {% block title %}{{ analysis.server_name }} - Pre-Patch Report{% endblock %}
+{% block head %}{% if run.is_running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
 {% block heading %}Pre-Patch Report: {{ analysis.server_name }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
+  {% if analysis.server_id and not run.is_running %}
+    <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/reanalyze" class="inline-form" title="Re-collect this server's facts (read-only) and fetch all of its CVEs from Canonical again, bypassing the cache">
+      <button type="submit" class="btn btn-secondary">Re-analyze</button>
+    </form>
+  {% endif %}
   <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/export.xlsx" class="btn btn-primary" download>Export to Excel</a>
   <a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>
 </div>{% endblock %}
@@ -49,6 +55,9 @@
   {% endif %}
 {% endmacro %}
 {% set bucket_classes = {"action": "badge-danger", "investigate": "badge-warning", "no_action": "badge-success"} %}
+{% if run.is_running and run.progress_message %}
+  <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>
+{% endif %}
 {% if not is_latest %}
   <div class="alert alert-warning">This is a historical report from analysis #{{ run.id }}. A newer analysis exists.</div>
 {% endif %}
@@ -136,6 +145,12 @@
         </details>
       {% else %}
         <h3 class="bucket bucket-{{ b.key }}">{{ b.title }} <span class="muted small">({{ b.count }})</span></h3>
+        {% if b.key == "investigate" and b.count and analysis.server_id and not run.is_running %}
+          <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/retry-investigate" class="inline-form">
+            <button type="submit" class="btn btn-secondary btn-sm">Retry these CVEs ({{ b.cve_count }})</button>
+          </form>
+          <span class="muted small">Fetches these CVEs from Canonical again (bypassing the cache) and re-analyzes this server.</span>
+        {% endif %}
         {{ findings_table(b.groups) }}
       {% endif %}
     {% endfor %}

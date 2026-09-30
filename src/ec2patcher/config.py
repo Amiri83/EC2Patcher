@@ -21,8 +21,8 @@ APT_MAX_AGE_ENV = "EC2PATCHER_APT_MAX_AGE_HOURS"
 DEFAULT_APT_MAX_AGE_HOURS = 6.0  # 0 = run the private apt-get update on every analysis run
 
 # Canonical per-CVE lookups (unset = the defaults in services.security_metadata).
-CANONICAL_TIMEOUT_ENV = "EC2PATCHER_CANONICAL_TIMEOUT_SECONDS"  # per request, default 30
-CANONICAL_CACHE_TTL_ENV = "EC2PATCHER_CANONICAL_CACHE_TTL_HOURS"  # disk cache, default 24
+CANONICAL_TIMEOUT_ENV = "EC2PATCHER_CANONICAL_TIMEOUT_SECONDS"  # per request, default 20
+CANONICAL_CACHE_TTL_ENV = "EC2PATCHER_CANONICAL_CACHE_TTL_HOURS"  # settled CVEs, default 24
 CANONICAL_BREAKER_ENV = "EC2PATCHER_CANONICAL_BREAKER_THRESHOLD"  # consecutive, default 3
 
 

@@ -138,9 +138,7 @@ def severity_docs():
 @pytest.fixture
 def web(db_path, tmp_path):
     def factory(ssh=None, fetcher=None, nvd_transport=None):
-        meta = SecurityMetadata(
-            tmp_path / "web-cache", fetcher=fetcher or online_fetcher(severity_docs())
-        )
+        meta = SecurityMetadata(db_path, fetcher=fetcher or online_fetcher(severity_docs()))
         nvd_client = make_nvd_client(tmp_path, nvd_transport or FakeNvd(REPORT_CVES))
         app = create_app(
             db_path=db_path, ssh_runner=ssh or ScriptedSSH(failures=AUTH_FAILURE),
