@@ -24,12 +24,18 @@
     {% if ex.remote_staging_path %}<dt>Remote Staging</dt><dd><code>{{ ex.remote_staging_path }}</code></dd>{% endif %}
     <dt>Expected Reboot (analysis)</dt><dd>{% if ex.expected_reboot is none %}unknown{% elif ex.expected_reboot %}YES EXPECTED{% else %}NO{% endif %}</dd>
     <dt>Reboot Required After Patch</dt>
-    <dd>{% if ex.reboot_required_after is none %}<span class="muted">not checked</span>{% elif ex.reboot_required_after %}<strong>YES</strong>{% if ex.reboot_required_packages %} <span class="muted small">({{ ex.reboot_required_packages|join(", ") }})</span>{% endif %}
-        <div class="muted small">EC2Patcher does not reboot servers. Schedule a reboot yourself.</div>{% else %}NO{% endif %}</dd>
+    <dd>{% if ex.reboot_required_after is none %}<span class="muted">not checked</span>{% elif ex.reboot_required_after %}<strong>YES</strong>{% if ex.reboot_required_packages %} <span class="muted small">({{ ex.reboot_required_packages|join(", ") }})</span>{% endif %}{% else %}NO{% endif %}</dd>
+    {% if ex.reboot_status %}<dt>Reboot</dt>
+    <dd><span class="badge {{ reboot_badges.get(ex.reboot_status, 'badge-warning') }}">{{ reboot_labels.get(ex.reboot_status, ex.reboot_status) }}</span>
+        {% if ex.reboot_detail %}<div class="muted small">{{ ex.reboot_detail }}</div>{% endif %}</dd>
+    {% if ex.reboot_requested_at %}<dt>Reboot Requested</dt><dd>{{ ex.reboot_requested_at|timestamp }}{% if ex.reboot_finished_at %} &middot; finished {{ ex.reboot_finished_at|timestamp }}{% endif %}</dd>{% endif %}
+    {% if ex.post_reboot_uptime or ex.post_reboot_kernel %}<dt>After Reboot</dt><dd>Uptime: {{ ex.post_reboot_uptime or "-" }} &middot; Kernel: <code>{{ ex.post_reboot_kernel or "-" }}</code></dd>{% endif %}
+    {% endif %}
+    {% if ex.queue_id %}<dt>Patch All</dt><dd><a href="/patch-all/{{ ex.queue_id }}">Patch All #{{ ex.queue_id }}</a></dd>{% endif %}
     {% if ex.cleanup_status %}<dt>Cleanup</dt><dd>{{ {"DELETED": "Local and remote staging deleted", "WARNING": "CLEANUP WARNING", "PRESERVED": "Temporary files preserved", "NOT_NEEDED": "Nothing to clean up", "NOT_STARTED": "Not started"}.get(ex.cleanup_status, ex.cleanup_status) }}
         {% if ex.cleanup_detail %}<div class="muted small">{{ ex.cleanup_detail }}</div>{% endif %}</dd>{% endif %}
   </dl>
-  {% if is_active %}<p class="progress-message">{{ patch_labels.get(ex.state, ex.state) }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>{% endif %}
+  {% if is_active %}<p class="progress-message">{% if ex.state in patch_labels and ex.state not in ("SUCCESS", "SUCCESS_WITH_CLEANUP_WARNING") %}{{ patch_labels[ex.state] }}{% else %}{{ reboot_labels.get(ex.reboot_status, "Reboot") }}{% endif %}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>{% endif %}
 </div>
 
 {% if ex.state in ("FAILED", "UNKNOWN") %}

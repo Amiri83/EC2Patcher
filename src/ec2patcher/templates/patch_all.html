@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Patch All #{{ queue.id }}{% endblock %}
+{% block head %}{% if queue.is_running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block heading %}Patch All #{{ queue.id }}{% endblock %}
+{% block header_actions %}<div class="header-actions">
+  <a href="/analysis/{{ queue.analysis_run_id }}" class="btn btn-secondary">Analysis #{{ queue.analysis_run_id }}</a>
+  <a href="/history" class="btn btn-secondary">History</a>
+</div>{% endblock %}
+{% block content %}
+<div class="card {% if queue.state == 'COMPLETED' %}result-ok{% elif queue.state == 'STOPPED' %}result-fail{% endif %}">
+  <div class="card-header">
+    <h2>{% if queue.is_running %}Patching servers one at a time{% elif queue.state == "COMPLETED" %}PATCH ALL COMPLETED{% else %}PATCH ALL STOPPED{% endif %}</h2>
+    <span class="badge {{ {'COMPLETED': 'badge-success', 'STOPPED': 'badge-danger'}.get(queue.state, 'badge-warning') }}">{{ queue.state }}</span>
+  </div>
+  <dl class="kv">
+    <dt>Started</dt><dd>{{ queue.created_at|timestamp }}</dd>
+    {% if queue.finished_at %}<dt>Finished</dt><dd>{{ queue.finished_at|timestamp }}</dd>{% endif %}
+    <dt>Reboot</dt><dd>{% if queue.skip_reboot %}Skipped (Skip reboot was checked){% else %}If /run/reboot-required exists after patching{% endif %}</dd>
+    {% if queue.stop_reason %}<dt>Stopped Because</dt><dd class="text-danger">{{ queue.stop_reason }}</dd>{% endif %}
+  </dl>
+  {% if queue.is_running %}<p class="progress-message">Patching&hellip; <span class="muted small">(this page refreshes automatically)</span></p>{% endif %}
+  {% set not_run = queue.items|selectattr("status", "equalto", "NOT_RUN")|list %}
+  {% if not_run %}<div class="alert alert-warning"><strong>Not run ({{ not_run|length }}):</strong> {{ not_run|map(attribute="server_name")|join(", ") }}</div>{% endif %}
+</div>
+
+<div class="card">
+  <h2>Servers</h2>
+  <div class="table-scroll">
+  <table class="table patch-all-items">
+    <thead><tr><th>#</th><th>Server</th><th>Status</th><th>Patch</th><th>Reboot</th><th>Detail</th><th></th></tr></thead>
+    <tbody>
+      {% for item in queue.items %}
+      {% set ex = executions.get(item.execution_id) %}
+      <tr class="{% if item.status in ('FAILED', 'NOT_RUN') %}row-warning{% endif %}">
+        <td class="num">{{ loop.index }}</td>
+        <td><strong>{{ item.server_name }}</strong>{% if item.display_name %}<div class="muted small">{{ item.display_name }}</div>{% endif %}</td>
+        <td><span class="badge {{ queue_item_badges.get(item.status, 'badge-warning') }}">{{ item.status }}</span></td>
+        <td>{% if ex %}<span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ patch_labels.get(ex.state, ex.state) }}</span>{% else %}-{% endif %}</td>
+        <td>{% if ex and ex.reboot_status %}<span class="badge {{ reboot_badges.get(ex.reboot_status, 'badge-warning') }}">{{ reboot_labels.get(ex.reboot_status, ex.reboot_status) }}</span>{% else %}-{% endif %}</td>
+        <td class="small">{{ item.detail or "" }}</td>
+        <td>{% if item.execution_id %}<a href="/patch/{{ item.execution_id }}" class="btn btn-secondary btn-sm">Details</a>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endblock %}
