@@ -136,8 +136,11 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
         ("Report File", run.report_filename),
     ]
 
+    tally = run.lookup_tally
     if run.metadata_updated_at:
         metadata = "Online per-CVE lookup"
+        if tally.total:
+            metadata = f"{tally.state} per-CVE lookup · {tally.label}"
         if run.metadata_checked_at:
             metadata += f" · checked {format_timestamp(run.metadata_checked_at)}"
     else:

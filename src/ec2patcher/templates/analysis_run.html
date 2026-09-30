@@ -14,8 +14,13 @@
     <dt>Started</dt><dd>{{ run.started_at|timestamp }}</dd>
     {% if run.completed_at %}<dt>Finished</dt><dd>{{ run.completed_at|timestamp }}</dd>{% endif %}
     <dt>Canonical security metadata</dt>
-    <dd>{% if run.metadata_updated_at %}Online per-CVE lookup &middot; checked {{ run.metadata_checked_at|timestamp }}{% else %}<span class="muted">not available</span>{% endif %}
-        {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}</dd>
+    <dd>{% include "_metadata_status.html" %}
+      {% if run.failed_lookups and not run.is_running %}
+        <form method="post" action="/analysis/{{ run.id }}/retry-lookups" class="inline-form">
+          <button type="submit" class="btn btn-secondary btn-sm">Retry failed lookups ({{ run.failed_lookups|length }})</button>
+        </form>
+        <div class="muted small">Queries ubuntu.com again for the failed CVEs only and re-analyzes the servers that reported them.</div>
+      {% endif %}</dd>
   </dl>
   {% if run.is_running and run.progress_message %}
     <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>

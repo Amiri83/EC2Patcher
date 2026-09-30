@@ -19,7 +19,13 @@
 </div>
 <div class="card">
   <h2>Security Data</h2>
-  <p class="muted">Canonical security data is queried online per CVE during analysis. Repeated lookups are kept in memory until cleared or restart.</p>
+  <p class="muted">Canonical security data is queried online per CVE during analysis. Each fetched CVE is also cached on disk; while the copy is younger than the cache TTL it is used without a request, and an older copy is used (and marked with its age) only when ubuntu.com cannot be reached.</p>
+  <dl class="kv">
+    <dt>Disk cache</dt><dd><code>{{ metadata_status.cache_dir }}</code></dd>
+    <dt>Cache TTL</dt><dd>{{ "%g"|format(metadata_status.cache_ttl_hours) }} hours</dd>
+    <dt>Requests</dt><dd>{{ "%g"|format(metadata_status.timeout_seconds) }} s timeout, up to {{ metadata_status.attempts }} attempts with backoff; lookups pause for the rest of the run after {{ metadata_status.breaker_threshold }} consecutive failures</dd>
+    <dt>Proxy</dt><dd>HTTPS_PROXY / NO_PROXY from the environment</dd>
+  </dl>
   <form method="post" action="/settings/clear-cache">
     <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
   </form>

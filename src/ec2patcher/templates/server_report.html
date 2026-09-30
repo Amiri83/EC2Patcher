@@ -72,8 +72,7 @@
     <dt>Running Kernel</dt><dd>{{ analysis.running_kernel or "-" }}</dd>
     <dt>Analysis Time</dt><dd>{{ (analysis.completed_at or analysis.started_at or run.started_at)|timestamp }}</dd>
     <dt>Canonical Security Metadata</dt>
-    <dd>{% if run.metadata_updated_at %}Online per-CVE lookup &middot; checked {{ run.metadata_checked_at|timestamp }}{% else %}not available{% endif %}
-        {% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}
+    <dd>{% include "_metadata_status.html" %}
         <div class="muted small">{{ run.metadata_source or "" }}</div></dd>
     <dt>APT Metadata</dt>
     <dd>{% if analysis.apt_updated_at %}Workstation private lists{% if analysis.os_codename %} ({{ analysis.os_codename }}, {{ analysis.os_codename }}-updates, {{ analysis.os_codename }}-security{% if analysis.architecture %}; {{ analysis.architecture }}{% endif %}){% endif %} updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">not used</span>{% endif %}</dd>
