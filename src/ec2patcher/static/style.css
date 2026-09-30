@@ -168,6 +168,7 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 }
 .dropzone:hover, .dropzone.dragover { border-color: var(--primary); background: #f1f6fd; }
 .dropzone input[type="file"] { max-width: 100%; }
+.dropzone.uploading, .dropzone.uploading:hover { cursor: progress; opacity: 0.6; border-color: var(--border); background: #fafbfc; }
 .dropzone-text { font-weight: 600; }
 .format-help { margin-top: 16px; }
 .format-help summary { cursor: pointer; color: var(--muted); }

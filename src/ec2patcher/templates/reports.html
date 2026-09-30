@@ -4,16 +4,18 @@
 {% block content %}
 <div class="card">
   <h2>Upload Security CVE Report</h2>
-  <form method="post" action="/reports/upload" enctype="multipart/form-data" class="upload-form">
+  <form method="post" action="/reports/upload" enctype="multipart/form-data" class="upload-form" id="upload-form">
     <label class="dropzone" id="dropzone">
       <input type="file" name="report_file" id="report_file" accept=".json,application/json" required>
       <span class="dropzone-text" id="dropzone-text">Choose a JSON file or drag it here</span>
       <span class="muted small">JSON only, up to {{ max_kib }} KiB</span>
     </label>
-    <div class="form-actions">
-      <span class="spacer"></span>
-      <button type="submit" class="btn btn-primary">Upload Report</button>
-    </div>
+    <noscript>
+      <div class="form-actions">
+        <span class="spacer"></span>
+        <button type="submit" class="btn btn-primary">Upload Report</button>
+      </div>
+    </noscript>
   </form>
   <details class="format-help">
     <summary>Expected format</summary>

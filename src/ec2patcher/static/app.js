@@ -36,18 +36,44 @@
     });
   }
 
-  // Report upload: show chosen file name and support drag & drop.
+  // Report upload: submit as soon as a file is picked or dropped (the <noscript>
+  // button covers the no-JS case). The dropzone is locked while uploading so the
+  // report cannot be submitted twice.
+  var uploadForm = document.getElementById("upload-form");
   var dropzone = document.getElementById("dropzone");
   var fileInput = document.getElementById("report_file");
   var label = document.getElementById("dropzone-text");
-  if (dropzone && fileInput && label) {
-    fileInput.addEventListener("change", function () {
-      if (fileInput.files.length) { label.textContent = fileInput.files[0].name; }
+  if (uploadForm && dropzone && fileInput && label) {
+    var uploading = false;
+    function submitUpload() {
+      if (uploading || !fileInput.files.length) { return; }
+      uploading = true;
+      label.textContent = "Uploading… " + fileInput.files[0].name;
+      dropzone.classList.add("uploading");
+      dropzone.setAttribute("aria-disabled", "true");
+      dropzone.setAttribute("aria-busy", "true");
+      // The input stays enabled: a disabled file input is left out of the form data.
+      uploadForm.submit();
+    }
+    // Returning via the back button restores the page from cache; unlock it.
+    window.addEventListener("pageshow", function (event) {
+      if (event.persisted) {
+        uploading = false;
+        uploadForm.reset();
+        label.textContent = "Choose a JSON file or drag it here";
+        dropzone.classList.remove("uploading");
+        dropzone.removeAttribute("aria-disabled");
+        dropzone.removeAttribute("aria-busy");
+      }
     });
+    fileInput.addEventListener("click", function (event) {
+      if (uploading) { event.preventDefault(); }
+    });
+    fileInput.addEventListener("change", submitUpload);
     ["dragenter", "dragover"].forEach(function (name) {
       dropzone.addEventListener(name, function (event) {
         event.preventDefault();
-        dropzone.classList.add("dragover");
+        if (!uploading) { dropzone.classList.add("dragover"); }
       });
     });
     ["dragleave", "drop"].forEach(function (name) {
@@ -55,9 +81,10 @@
     });
     dropzone.addEventListener("drop", function (event) {
       event.preventDefault();
+      if (uploading) { return; }
       if (event.dataTransfer && event.dataTransfer.files.length) {
         fileInput.files = event.dataTransfer.files;
-        label.textContent = event.dataTransfer.files[0].name;
+        submitUpload();
       }
     });
   }

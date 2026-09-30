@@ -558,8 +558,12 @@ def test_analyze_button_only_after_valid_report(web, pem_file):
         assert "Pre-Patch Analysis" in page and "Upload a valid report to enable analysis." in page
         assert 'action="/reports/analyze"' not in page
         assert "Canonical security data is queried online per CVE" in page
-        assert "Upload Report" in page and "Upload &amp; Validate" not in page
-        assert ">Validate</button>" not in page
+        assert "Upload &amp; Validate" not in page and ">Validate</button>" not in page
+        # The upload auto-submits via app.js; the button is only a no-JS fallback.
+        noscript = re.search(r"<noscript>(.*?)</noscript>", page, re.S)
+        assert noscript and ">Upload Report</button>" in noscript.group(1)
+        assert page.count(">Upload Report</button>") == 1
+        assert 'id="upload-form"' in page and 'id="report_file"' in page
         add_servers(c, pem_file)
         upload(c, REAL_REPORT)
         page = c.get("/reports").text
@@ -605,6 +609,20 @@ def test_report_subset_only_analyzes_named_inventory_servers(web, pem_file, db_p
     run = db.get_latest_analysis_run()
     assert [server.server_name for server in run.servers] == list(included)
     assert db.get_server_by_name(omitted) is not None
+
+
+def test_one_of_many_inventory_servers_is_valid_and_only_it_is_analyzed(web, pem_file, db_path):
+    ssh = ScriptedSSH()
+    c = web(ssh=ssh)
+    add_servers(c, pem_file)
+    save(c, "inventory-only", "192.0.2.216", pem_file)
+    r = upload(c, {GOOD: ["CVE-2026-63076"]})
+    assert r.status_code == 200 and "VALIDATION FAILED" not in r.text
+    assert re.search(r"<dt>Servers in report</dt><dd>1</dd>", r.text)
+    assert c.post("/reports/analyze", follow_redirects=False).status_code == 303
+    run = Database(db_path).get_latest_analysis_run()
+    assert [s.server_name for s in run.servers] == [GOOD]
+    assert [args[-2] for args in ssh.calls] == [f"ubuntu@{GOOD_IP}"]
 
 
 def test_settings_cache_and_database_controls_are_independent(web, pem_file, db_path):
