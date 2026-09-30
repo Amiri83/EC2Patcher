@@ -23,6 +23,17 @@ from ec2patcher.models import (
 
 SCHEMA_VERSION = 7
 
+# Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
+# Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
+# databases that reached v7 before the table was added to that migration.
+_CVE_METADATA_CACHE = """
+    CREATE TABLE IF NOT EXISTS cve_metadata_cache (
+        cve         TEXT PRIMARY KEY,
+        document    TEXT,
+        fetched_at  TEXT NOT NULL
+    );
+"""
+
 _MIGRATIONS = {
     1: """
         CREATE TABLE servers (
@@ -244,10 +255,12 @@ _MIGRATIONS = {
         ALTER TABLE cve_findings ADD COLUMN canonical_status TEXT;
     """,
     # Canonical lookup outcome per unique CVE of a run ({"CVE-...": "ok|cached|failed"}),
-    # tallied in the status panel and used to retry only the failed lookups.
+    # tallied in the status panel and used to retry only the failed lookups; plus the
+    # Canonical CVE document cache (see _CVE_METADATA_CACHE).
     7: """
         ALTER TABLE analysis_runs ADD COLUMN metadata_lookups TEXT NOT NULL DEFAULT '{}';
-    """,
+    """
+    + _CVE_METADATA_CACHE,
 }
 
 
@@ -426,6 +439,8 @@ class Database:
             for target in range(version + 1, SCHEMA_VERSION + 1):
                 conn.executescript(_MIGRATIONS[target])
                 conn.execute(f"PRAGMA user_version = {int(target)}")
+            if version == SCHEMA_VERSION:
+                conn.executescript(_CVE_METADATA_CACHE)
 
     def reset(self) -> bool:
         """Remove all stored data and recreate the current schema."""
@@ -812,6 +827,29 @@ class Database:
                     )
                 ]
             analysis.plan = plans
+
+    # --- Canonical CVE metadata cache ---------------------------------------------
+
+    def get_cve_metadata(self, cve: str) -> tuple[str | None, str] | None:
+        """(document JSON or None for a confirmed 404, fetched_at), or None if not cached."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT document, fetched_at FROM cve_metadata_cache WHERE cve = ?", (cve,)
+            ).fetchone()
+        return (row["document"], row["fetched_at"]) if row else None
+
+    def put_cve_metadata(self, cve: str, document: str | None, fetched_at: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO cve_metadata_cache (cve, document, fetched_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(cve) DO UPDATE SET "
+                "document = excluded.document, fetched_at = excluded.fetched_at",
+                (cve, document, fetched_at),
+            )
+
+    def clear_cve_metadata(self) -> int:
+        with self.connect() as conn:
+            return conn.execute("DELETE FROM cve_metadata_cache").rowcount
 
     def get_latest_report(self) -> StoredReport | None:
         with self.connect() as conn:

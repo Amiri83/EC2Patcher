@@ -22,8 +22,10 @@ def isolated_metadata_cache(tmp_path: Path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_retry_backoff(monkeypatch):
-    """Canonical retries do not really sleep in tests (pass ``backoff`` to test the delays)."""
+    """Canonical retries and request pacing do not really sleep in tests (pass ``backoff`` /
+    ``pace`` to test the delays)."""
     monkeypatch.setattr(security_metadata, "BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(security_metadata, "PACE_SECONDS", 0)
 
 
 @pytest.fixture(autouse=True)
