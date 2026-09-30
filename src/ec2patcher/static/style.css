@@ -152,6 +152,7 @@ input[type="text"]:focus { outline: 2px solid #9cc3f5; border-color: var(--prima
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0 0 12px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; font-weight: 500; word-break: break-word; }
+.inline-form { margin: 6px 0 2px; }
 
 /* Tables */
 .table { width: 100%; border-collapse: collapse; }

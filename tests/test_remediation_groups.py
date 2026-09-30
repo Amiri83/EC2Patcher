@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from ec2patcher.formatting import format_size, format_timestamp
-from ec2patcher.models import CveFindingRow, ServerAnalysis
+from ec2patcher.models import CveFindingRow, LookupTally, ServerAnalysis
 from ec2patcher.services import cve_resolver as cr
 from ec2patcher.services import nvd
 from ec2patcher.services.analysis_service import (
@@ -227,6 +227,7 @@ def render_report(rows, **context):
         metadata_updated_at=None,
         metadata_stale=False,
         metadata_source=None,
+        lookup_tally=LookupTally(),
     )
     analysis = server_analysis(rows)
     template = template_env().get_template("server_report.html")
@@ -297,7 +298,7 @@ def render_run_page(rows):
         id=1, is_running=False, status="complete", report_filename="perl.json",
         report_uploaded_at=None, started_at=None, completed_at=None, metadata_updated_at=None,
         metadata_stale=False, progress_message=None, metadata_warning=None, error=None,
-        servers=[analysis],
+        servers=[analysis], lookup_tally=LookupTally(), failed_lookups=[],
     )  # fmt: skip
     template = template_env().get_template("analysis_run.html")
     return template.render(

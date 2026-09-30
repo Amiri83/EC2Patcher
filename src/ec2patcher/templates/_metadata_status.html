@@ -1,0 +1,8 @@
+{% set tally = run.lookup_tally %}
+{% if not run.metadata_updated_at %}<span class="muted">not available</span>
+{% elif tally.total %}{{ tally.state }} per-CVE lookup &middot; <span class="lookup-tally">{{ tally.label }}</span> &middot; checked {{ run.metadata_checked_at|timestamp }}
+  {% if tally.state == "Online" %}<span class="badge badge-success">ONLINE</span>{% elif tally.state == "Degraded" %}<span class="badge badge-warning">DEGRADED</span>{% else %}<span class="badge badge-danger">UNAVAILABLE</span>{% endif %}
+{% else %}Online per-CVE lookup &middot; checked {{ run.metadata_checked_at|timestamp }}
+{% endif %}
+{% if run.metadata_stale %}<span class="badge badge-warning">STALE</span>{% endif %}
+{% if tally.cached %}<div class="muted small">{{ tally.cached }} CVE{{ "" if tally.cached == 1 else "s" }} resolved from cached Canonical data because ubuntu.com could not be reached.</div>{% endif %}

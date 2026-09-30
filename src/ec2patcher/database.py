@@ -21,7 +21,7 @@ from ec2patcher.models import (
     Tag,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _MIGRATIONS = {
     1: """
@@ -243,6 +243,11 @@ _MIGRATIONS = {
         ALTER TABLE cve_findings ADD COLUMN apt_candidate TEXT;
         ALTER TABLE cve_findings ADD COLUMN canonical_status TEXT;
     """,
+    # Canonical lookup outcome per unique CVE of a run ({"CVE-...": "ok|cached|failed"}),
+    # tallied in the status panel and used to retry only the failed lookups.
+    7: """
+        ALTER TABLE analysis_runs ADD COLUMN metadata_lookups TEXT NOT NULL DEFAULT '{}';
+    """,
 }
 
 
@@ -275,7 +280,7 @@ def _row_to_server(row: sqlite3.Row) -> Server:
 
 _RUN_COLUMNS = {
     "completed_at", "status", "progress_message", "metadata_source", "metadata_updated_at",
-    "metadata_checked_at", "metadata_stale", "metadata_warning", "error",
+    "metadata_checked_at", "metadata_stale", "metadata_warning", "error", "metadata_lookups",
 }  # fmt: skip
 _SERVER_ANALYSIS_COLUMNS = {
     "status", "error", "started_at", "completed_at", "remote_hostname", "os_pretty_name",
@@ -306,6 +311,7 @@ def _row_to_run(row: sqlite3.Row) -> AnalysisRun:
         metadata_stale=bool(row["metadata_stale"]),
         metadata_warning=row["metadata_warning"],
         error=row["error"],
+        metadata_lookups=json.loads(row["metadata_lookups"] or "{}"),
     )
 
 
@@ -652,7 +658,7 @@ class Database:
         if unknown:
             raise ValueError(f"Unknown column(s) for {table}: {sorted(unknown)}")
         values = [
-            json.dumps(v) if isinstance(v, list) else (int(v) if isinstance(v, bool) else v)
+            json.dumps(v) if isinstance(v, list | dict) else (int(v) if isinstance(v, bool) else v)
             for v in fields.values()
         ]
         assignments = ", ".join(f"{column} = ?" for column in fields)

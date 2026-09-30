@@ -8,7 +8,7 @@ from phase2_fixtures import FakeApt
 from ec2patcher import config
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
-from ec2patcher.services import local_apt, nvd
+from ec2patcher.services import local_apt, nvd, security_metadata
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +18,12 @@ def isolated_metadata_cache(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(config.DATA_DIR_ENV, str(tmp_path / "appdata"))
     monkeypatch.delenv(config.APT_STATE_DIR_ENV, raising=False)
     monkeypatch.delenv(config.APT_MAX_AGE_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_retry_backoff(monkeypatch):
+    """Canonical retries do not really sleep in tests (pass ``backoff`` to test the delays)."""
+    monkeypatch.setattr(security_metadata, "BACKOFF_SECONDS", 0)
 
 
 @pytest.fixture(autouse=True)
