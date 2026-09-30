@@ -237,7 +237,10 @@ def test_simulation_never_accepts_incomplete_output():
 
 
 @pytest.fixture
-def web(db_path, tmp_path):
+def web(db_path, tmp_path, fake_apt):
+    # Analysis resolves the plan with the workstation's private APT state, so the plan whose
+    # URIs/sizes/checksums match FakeFetcher's content must come from the local APT backend.
+    fake_apt.plan = analysis_plan_output()
     state = {"fake": FakeUbuntu(plan_output=analysis_plan_output()), "fetcher": FakeFetcher()}
 
     def factory():
@@ -318,7 +321,7 @@ def test_full_web_flow_real_analysis_then_patch(web, pem_file, tmp_path, monkeyp
         upload(c, {SERVER: ["CVE-2026-63076"]})
         run_url = c.post("/reports/analyze", follow_redirects=False).headers["location"]
         run_page = c.get(run_url).text
-        assert "0 patch available" in run_page
+        assert "Action required: 0</span>" in run_page and "0 packages to update" in run_page
         assert c.get(report_url).status_code == 200
 
 
