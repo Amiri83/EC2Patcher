@@ -1,8 +1,9 @@
 """Phase 2 orchestration: analyze the latest report, server by server, and persist results.
 
-Read-only by design. For each server the analyzer runs three fixed ssh commands as the
-unprivileged ``ubuntu`` user (no sudo): collect facts (dpkg-query, os-release, uname, ...),
-query APT candidates (apt-cache), and plan the upgrade (apt-get -s / --print-uris). Nothing
+Read-only by design. Each server receives exactly one fixed ssh command as the unprivileged
+``ubuntu`` user (no sudo) that collects facts (dpkg-query, os-release, uname, ...). APT
+candidates and the upgrade plan (apt-get -s / --print-uris) are resolved on the workstation
+against a private APT state for the server's release and architecture (local_apt). Nothing
 is downloaded, copied, installed or restarted.
 
 Canonical's metadata alone decides applicability, fixed versions and statuses. NVD is only
@@ -21,24 +22,25 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from ec2patcher import config
 from ec2patcher.database import Database
 from ec2patcher.models import ServerAnalysis, StoredReport
 from ec2patcher.services import (
     apt_planner,
     cve_resolver,
     debversion,
+    local_apt,
     nvd,
     server_state,
     ssh_service,
 )
-from ec2patcher.services.security_metadata import SecurityMetadata
+from ec2patcher.services.security_metadata import FAILED as FAILED_LOOKUP
+from ec2patcher.services.security_metadata import MetadataUnreachable, SecurityMetadata
 from ec2patcher.services.severity import SEVERITIES, UNKNOWN, normalize_severity
 
 logger = logging.getLogger(__name__)
 
 FACTS_TIMEOUT_SECONDS = 90
-CANDIDATE_TIMEOUT_SECONDS = 90
-PLAN_TIMEOUT_SECONDS = 180
 DISPLAY_NAME_TAG = "display_name"
 
 Starter = Callable[[Callable[[], None]], None]
@@ -48,8 +50,12 @@ def thread_starter(target: Callable[[], None]) -> None:
     threading.Thread(target=target, name="ec2patcher-analysis", daemon=True).start()
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
 def _now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return _utcnow().isoformat()
 
 
 class AnalysisService:
@@ -60,10 +66,14 @@ class AnalysisService:
         runner: ssh_service.Runner = subprocess.run,
         starter: Starter = thread_starter,
         nvd_client: nvd.NvdClient | None = None,
+        apt: local_apt.LocalApt | None = None,
     ):
         self.db = db
         self.metadata = metadata
         self.nvd = nvd_client or nvd.NvdClient()
+        self.apt = apt or local_apt.LocalApt(
+            config.get_apt_state_dir(config.get_data_dir()), config.get_apt_max_age()
+        )
         self.runner = runner
         self.starter = starter
         self._lock = threading.Lock()
@@ -144,12 +154,15 @@ class AnalysisService:
         )
 
         self.nvd.start_run()
+        self.apt.start_run()
         failures = 0
         for index, analysis in enumerate(run.servers, start=1):
             label = f"{analysis.server_name} ({index} of {len(run.servers)})"
             progress(f"Analyzing {label}")
             if not self.analyze_server(analysis, lambda m, label=label: progress(f"{label}: {m}")):
                 failures += 1
+            # Tallies after every server, so the status panel follows the run.
+            self.db.update_analysis_run(run_id, metadata_lookups=self.metadata.run_outcomes())
         self.db.update_analysis_run(
             run_id,
             status="completed_with_errors" if failures else "completed",
@@ -157,6 +170,192 @@ class AnalysisService:
             progress_message=None,
         )
         logger.info("Analysis run %s finished (%d server failure(s))", run_id, failures)
+
+    # --- follow-up actions on a finished run -----------------------------------------
+    # Retry failed lookups (whole run), Retry these CVEs (Investigate bucket of one server)
+    # and Re-analyze (one server) run in the background with the run marked as running, and
+    # force-refresh their CVEs from ubuntu.com (bypassing the memo and the cache).
+
+    def _start_followup(self, run_id: int, message: str, job: Callable[[str], None]) -> bool:
+        """Run ``job(previous_status)`` in the background; False if an analysis is running."""
+        with self._lock:
+            if self._running:
+                return False
+            run = self.db.get_analysis_run(run_id, details=False)
+            if run is None or run.is_running:
+                return False
+            self._running = True
+        try:
+            self.db.update_analysis_run(run_id, status="running", progress_message=message)
+            self.starter(lambda: self._followup_safely(run_id, run.status, job))
+        except Exception:
+            self._running = False
+            self.db.update_analysis_run(run_id, status=run.status, progress_message=None)
+            raise
+        return True
+
+    def _followup_safely(self, run_id: int, previous_status: str, job) -> None:
+        try:
+            job(previous_status)
+        except Exception:
+            logger.exception("Follow-up action on run %s crashed", run_id)
+            self.db.update_analysis_run(run_id, status=previous_status, progress_message=None)
+        finally:
+            self._running = False
+
+    def retry_failed_lookups(self, run_id: int) -> int | None:
+        """Re-resolve the CVEs of ``run_id`` whose Canonical lookup failed, in the background.
+
+        Returns the number of CVEs retried (0 = nothing to retry), or None if an analysis
+        is already running. Only the failed CVEs are requested from ubuntu.com again."""
+        run = self.db.get_analysis_run(run_id, details=False)
+        failed = set(run.failed_lookups) if run else set()
+        return self.retry_cves(run_id, failed, message="Retrying failed Canonical lookups")
+
+    def retry_cves(
+        self,
+        run_id: int,
+        cves: set[str],
+        analysis_ids: set[int] | None = None,
+        message: str = "Retrying Canonical lookups",
+    ) -> int | None:
+        """Force-refresh ``cves`` from ubuntu.com and re-analyze the completed servers (all,
+        or ``analysis_ids``) that reported them. Returns the number of CVEs retried (0 =
+        nothing to retry), or None if an analysis is already running."""
+        cves = {c.strip().upper() for c in cves}
+        if not cves:
+            return 0
+
+        def job(previous_status: str) -> None:
+            self.retry_lookups(run_id, cves, previous_status, analysis_ids)
+
+        if not self._start_followup(run_id, message, job):
+            return None
+        logger.info("Retrying %d Canonical lookup(s) of run %s", len(cves), run_id)
+        return len(cves)
+
+    def retry_lookups(
+        self,
+        run_id: int,
+        failed: set[str],
+        previous_status: str,
+        analysis_ids: set[int] | None = None,
+    ) -> None:
+        """Re-analyze the completed servers that reported a CVE in ``failed``.
+
+        Canonical is queried again (force refresh) for ``failed`` only; every other CVE is
+        resolved from the memo / cache (network only if it is missing there, e.g. after
+        Clear Security Cache). A server that cannot be re-analyzed keeps its previous
+        results, and its failed CVEs stay failed."""
+        run = self.db.get_analysis_run(run_id, details=True)
+        self.metadata.start_run(force_refresh=True, cves=failed)
+        self.nvd.start_run()
+        self.apt.start_run()
+
+        def lookup(cve: str):
+            if cve.strip().upper() in failed:
+                return self.metadata.lookup(cve)
+            try:
+                return self.metadata.lookup(cve, network=False)
+            except MetadataUnreachable:
+                return self.metadata.lookup(cve)
+
+        affected = [
+            s for s in run.servers
+            if s.status == "complete" and failed.intersection(s.reported_cves)
+            and (analysis_ids is None or s.id in analysis_ids)
+        ]  # fmt: skip
+        still_failed: set[str] = set()
+        for index, analysis in enumerate(affected, start=1):
+            label = f"{analysis.server_name} ({index} of {len(affected)})"
+            self.db.update_analysis_run(run_id, progress_message=f"Retrying lookups for {label}")
+            try:
+                error = self._analyze(analysis, lambda m: None, lookup)
+            except Exception as exc:
+                logger.exception("Retry for %s failed unexpectedly", analysis.server_name)
+                error = f"Unexpected error: {exc}"
+            if error:  # previous results are still stored and remain valid
+                logger.warning("Retry for %s failed: %s", analysis.server_name, error)
+                still_failed |= failed.intersection(analysis.reported_cves)
+
+        lookups = dict(run.metadata_lookups)
+        lookups.update(self.metadata.run_outcomes())
+        lookups.update(dict.fromkeys(still_failed, FAILED_LOOKUP))
+        self.db.update_analysis_run(
+            run_id,
+            status=previous_status,
+            progress_message=None,
+            metadata_checked_at=_now(),
+            metadata_lookups=lookups,
+        )
+        logger.info(
+            "Retried lookups of run %s: %d of %d still failed", run_id,
+            sum(1 for cve in failed if lookups.get(cve) == FAILED_LOOKUP), len(failed),
+        )  # fmt: skip
+
+    def reanalyze_server(self, run_id: int, analysis_id: int) -> bool:
+        """Re-analyze one server of ``run_id`` in the background, force-refreshing all of
+        its CVEs from ubuntu.com. False if an analysis is running (or the server is not
+        part of the run)."""
+        analysis = self.db.get_server_analysis(analysis_id)
+        if analysis is None or analysis.run_id != run_id:
+            return False
+
+        def job(previous_status: str) -> None:
+            self.reanalyze(run_id, analysis_id, previous_status)
+
+        message = f"Re-analyzing {analysis.server_name}"
+        if not self._start_followup(run_id, message, job):
+            return False
+        logger.info("Re-analyzing %s of run %s", analysis.server_name, run_id)
+        return True
+
+    def reanalyze(self, run_id: int, analysis_id: int, previous_status: str) -> None:
+        """Re-collect facts and re-resolve every CVE of one server (read-only, as a run).
+
+        A server that was complete keeps its previous results if the re-analysis fails."""
+        analysis = self.db.get_server_analysis(analysis_id)
+        run = self.db.get_analysis_run(run_id, details=False)
+        self.metadata.start_run(force_refresh=True)
+        self.nvd.start_run()
+        self.apt.start_run()
+        label = analysis.server_name
+
+        def progress(message: str) -> None:
+            self.db.update_analysis_run(run_id, progress_message=f"Re-analyzing {label}: {message}")
+
+        try:
+            error = self._analyze(analysis, progress)
+        except Exception as exc:
+            logger.exception("Re-analysis of %s failed unexpectedly", label)
+            error = f"Unexpected error: {exc}"
+        if not error:
+            self.db.update_server_analysis(analysis_id, error=None)
+        elif analysis.status == "complete":  # the previous results are still stored
+            logger.warning("Re-analysis of %s failed: %s", label, error)
+            self.db.update_server_analysis(
+                analysis_id,
+                warnings=[*analysis.warnings, f"Re-analysis at {_now()} failed: {error}"],
+            )
+        else:
+            logger.warning("Re-analysis of %s failed: %s", label, error)
+            self.db.update_server_analysis(
+                analysis_id, status="failed", completed_at=_now(), error=error
+            )
+
+        status = previous_status
+        if previous_status in ("completed", "completed_with_errors"):
+            servers = self.db.get_analysis_run(run_id, details=False).servers
+            failed = any(s.status == "failed" for s in servers)
+            status = "completed_with_errors" if failed else "completed"
+        lookups = {**run.metadata_lookups, **self.metadata.run_outcomes()}
+        self.db.update_analysis_run(
+            run_id,
+            status=status,
+            progress_message=None,
+            metadata_checked_at=_now(),
+            metadata_lookups=lookups,
+        )
 
     # --- one server -----------------------------------------------------------------
 
@@ -183,8 +382,15 @@ class AnalysisService:
             server.ip_address, server.pem_path, command, runner=self.runner, timeout=timeout
         )
 
-    def _analyze(self, analysis: ServerAnalysis, progress: Callable[[str], None]) -> str | None:
-        """Analyze one server; return an error message if the whole server failed."""
+    def _analyze(
+        self,
+        analysis: ServerAnalysis,
+        progress: Callable[[str], None],
+        lookup: Callable[[str], object] | None = None,
+    ) -> str | None:
+        """Analyze one server; return an error message if the whole server failed.
+
+        ``lookup`` replaces the Canonical lookup (used to retry only the failed CVEs)."""
         server = self.db.get_server(analysis.server_id) if analysis.server_id else None
         if server is None:
             return "This server is no longer configured in EC2Patcher."
@@ -206,8 +412,6 @@ class AnalysisService:
             running_kernel=facts.kernel,
             current_reboot_required=facts.reboot_required,
             reboot_required_packages=facts.reboot_required_pkgs,
-            apt_updated_at=facts.apt_updated_at,
-            apt_age_hours=facts.apt_age_hours,
         )
         unsupported = server_state.check_supported(facts)
         if unsupported:
@@ -215,7 +419,10 @@ class AnalysisService:
 
         warnings = list(facts.warnings)
         metadata_status = self.metadata.status()
-        lookup = self.metadata.lookup if metadata_status.available else (lambda _cve: None)
+        if not metadata_status.available:
+            lookup = lambda _cve: None  # noqa: E731
+        elif lookup is None:
+            lookup = self.metadata.lookup
         findings = cve_resolver.resolve_all(analysis.reported_cves, lookup, facts)
         if not metadata_status.available:
             warning = f"Canonical security metadata is unavailable: {metadata_status.error}"
@@ -229,16 +436,20 @@ class AnalysisService:
             warnings.append("Some CVEs have no usable Canonical statement for this Ubuntu release.")
         candidates: dict[str, apt_planner.Candidate] = {}
         requests: list[tuple[str, str]] = []
+        state: local_apt.AptState | None = None
         query = cve_resolver.candidate_query_packages(findings, facts)
         if query:
-            result = self._remote(
-                server, apt_planner.build_candidate_command(query), CANDIDATE_TIMEOUT_SECONDS
-            )
+            progress(f"Resolving APT candidates locally ({facts.codename}/{facts.architecture})")
             try:
-                if not result.ok:
-                    raise ValueError(result.error)
-                candidates = apt_planner.parse_candidates(result.stdout, query)
-            except ValueError as exc:
+                state = self.apt.prepare(facts.codename, facts.architecture)
+                self.db.update_server_analysis(
+                    analysis.id,
+                    apt_updated_at=state.updated_at.isoformat(),
+                    apt_age_hours=max(0.0, (_utcnow() - state.updated_at).total_seconds() / 3600),
+                )
+                candidates = self.apt.candidates(state, facts, query)
+            except (local_apt.AptResolutionError, ValueError) as exc:
+                warnings.append(f"Local APT resolution failed: {exc}")
                 for f in findings:
                     if cve_resolver.needs_candidate_check(f):
                         f.status = cve_resolver.ANALYSIS_ERROR
@@ -248,8 +459,8 @@ class AnalysisService:
 
         plan: list[cve_resolver.PlanEntry] = []
         apt_arguments: list[str] = []
-        if requests:
-            download = self._plan(server, requests)
+        if requests and state is not None:
+            download = self.apt.plan(state, facts, requests)
             apt_arguments = download.apt_arguments
             if download.removals:
                 warnings.append(
@@ -286,20 +497,6 @@ class AnalysisService:
             for f in findings:
                 if f.cve == cve:
                     f.cvss = result
-
-    def _plan(self, server, requests) -> apt_planner.DownloadPlan:
-        try:
-            command = apt_planner.build_plan_command(requests)
-        except apt_planner.UnsafeArgumentError as exc:
-            return apt_planner.DownloadPlan(ok=False, error=str(exc))
-        result = self._remote(server, command, PLAN_TIMEOUT_SECONDS)
-        if not result.ok:
-            return apt_planner.DownloadPlan(
-                ok=False,
-                apt_arguments=["install", *apt_planner.plan_arguments(requests)],
-                error=result.error,
-            )
-        return apt_planner.parse_plan(result.stdout, requests)
 
     @staticmethod
     def _unresolved_plan(findings, requests, candidates, facts, error) -> list:
@@ -356,12 +553,18 @@ class RemediationGroup:
 
 
 def remediation_groups(findings: list) -> list[RemediationGroup]:
-    """Collapse findings with the same source and fix for report presentation only."""
-    grouped: dict[tuple[str, str], list] = {}
+    """Collapse findings with the same source, fix and status for report presentation only.
+
+    The status is part of the key so a group only ever counts CVEs that share one remediation
+    outcome: rows that are already fixed / not affected / not installed never inflate the CVE
+    count or raise the severity of an actionable group with the same source and fix.
+    """
+    grouped: dict[tuple[str, str, str], list] = {}
     ungrouped = []
     for finding in findings:
         if finding.source_package and finding.fixed_version:
-            grouped.setdefault((finding.source_package, finding.fixed_version), []).append(finding)
+            key = (finding.source_package, finding.fixed_version, finding.status)
+            grouped.setdefault(key, []).append(finding)
         else:
             ungrouped.append([finding])
 
@@ -406,6 +609,80 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
     return result
 
 
+ACTION_REQUIRED = "action"
+INVESTIGATE = "investigate"
+NO_ACTION = "no_action"
+
+BUCKETS = (
+    (
+        ACTION_REQUIRED,
+        "Action required",
+        (
+            cve_resolver.PATCH_AVAILABLE,
+            cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS,
+            cve_resolver.PRO_OR_ESM_REQUIRED,
+        ),
+    ),
+    (
+        INVESTIGATE,
+        "Investigate",
+        (
+            cve_resolver.UNKNOWN,
+            cve_resolver.METADATA_UNAVAILABLE,
+            cve_resolver.ANALYSIS_ERROR,
+            cve_resolver.PENDING_OR_DEFERRED,
+            cve_resolver.NO_FIX_PUBLISHED,
+        ),
+    ),
+    (
+        NO_ACTION,
+        "No action",
+        (
+            cve_resolver.ALREADY_FIXED,
+            cve_resolver.NOT_AFFECTED,
+            cve_resolver.PACKAGE_NOT_INSTALLED,
+        ),
+    ),
+)
+_BUCKET_OF_STATUS = {status: key for key, _, statuses in BUCKETS for status in statuses}
+
+
+@dataclass
+class FindingBucket:
+    key: str
+    title: str
+    groups: list[RemediationGroup]
+
+    @property
+    def count(self) -> int:
+        return len(self.groups)
+
+    @property
+    def cve_count(self) -> int:
+        return len({cve for g in self.groups for cve in g.cves})
+
+
+def bucket_for_status(status: str | None) -> str:
+    """Report bucket of a remediation status. Unrecognised statuses need investigation."""
+    return _BUCKET_OF_STATUS.get(cve_resolver.current_status(status or ""), INVESTIGATE)
+
+
+def bucket_groups(groups: list[RemediationGroup]) -> list[FindingBucket]:
+    """Split remediation groups into the three report buckets (always all three, in order).
+
+    Presentation only: statuses are read, never changed."""
+    buckets = {key: FindingBucket(key, title, []) for key, title, _ in BUCKETS}
+    for group in groups:
+        buckets[bucket_for_status(group.status)].groups.append(group)
+    return list(buckets.values())
+
+
+def investigate_cves(analysis: ServerAnalysis) -> set[str]:
+    """CVEs listed in the Investigate bucket of a server report ('Retry these CVEs')."""
+    groups = remediation_groups(analysis.findings)
+    return {cve for g in groups if bucket_for_status(g.status) == INVESTIGATE for cve in g.cves}
+
+
 @dataclass
 class ServerSummary:
     reported: int
@@ -416,9 +693,15 @@ class ServerSummary:
     unresolved: int
     download_bytes: int
     by_severity: dict[str, int]  # per reported CVE; independent of the patch status
+    by_bucket: dict[str, int]  # reported CVEs per report bucket (bucket_for_status of cve_status)
 
     def count(self, *statuses: str) -> int:
         return sum(self.by_status.get(s, 0) for s in statuses)
+
+    @property
+    def buckets(self) -> list[tuple[str, str, int]]:
+        """(key, title, CVE count) for every report bucket, in report order."""
+        return [(key, title, self.by_bucket[key]) for key, title, _ in BUCKETS]
 
 
 @dataclass
@@ -463,6 +746,9 @@ def summarize(analysis: ServerAnalysis) -> ServerSummary:
     by_severity = dict.fromkeys(SEVERITIES, 0)
     for cve in cve_status:
         by_severity[severity.get(cve, UNKNOWN)] += 1
+    by_bucket = {key: 0 for key, _, _ in BUCKETS}
+    for status in cve_status.values():
+        by_bucket[bucket_for_status(status)] += 1
     return ServerSummary(
         reported=len(analysis.reported_cves),
         by_status=dict(Counter(cve_status.values())),
@@ -472,4 +758,5 @@ def summarize(analysis: ServerAnalysis) -> ServerSummary:
         unresolved=sum(1 for p in analysis.plan if p.status != "planned"),
         download_bytes=sum(p.size or 0 for p in analysis.plan if p.deb_filename),
         by_severity=by_severity,
+        by_bucket=by_bucket,
     )

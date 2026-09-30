@@ -151,7 +151,48 @@ class AnalysisRun:
     metadata_warning: str | None
     error: str | None
     servers: list[ServerAnalysis] = field(default_factory=list)
+    # Canonical lookup outcome per unique CVE of the run: ok / cached / failed.
+    metadata_lookups: dict[str, str] = field(default_factory=dict)
 
     @property
     def is_running(self) -> bool:
         return self.status == "running"
+
+    @property
+    def lookup_tally(self) -> "LookupTally":
+        return LookupTally.from_outcomes(self.metadata_lookups)
+
+    @property
+    def failed_lookups(self) -> list[str]:
+        return sorted(cve for cve, outcome in self.metadata_lookups.items() if outcome == "failed")
+
+
+@dataclass
+class LookupTally:
+    ok: int = 0
+    cached: int = 0
+    failed: int = 0
+
+    @classmethod
+    def from_outcomes(cls, outcomes: dict[str, str]) -> "LookupTally":
+        values = list(outcomes.values())
+        return cls(values.count("ok"), values.count("cached"), values.count("failed"))
+
+    @property
+    def total(self) -> int:
+        return self.ok + self.cached + self.failed
+
+    @property
+    def label(self) -> str:
+        return f"{self.ok} ok / {self.cached} cached / {self.failed} failed"
+
+    @property
+    def state(self) -> str:
+        """Online / Degraded / Unavailable, for the status panel headline."""
+        if not self.total:
+            return "Not recorded"
+        if self.failed == self.total:
+            return "Unavailable"
+        if self.failed or self.cached:
+            return "Degraded"
+        return "Online"
