@@ -73,11 +73,17 @@
     {% if latest_queue_id %}<a href="/patch-all/{{ latest_queue_id }}" class="btn btn-secondary btn-sm">Last Patch All Run</a>{% endif %}
   </div>
   <p class="muted small">Patches every eligible server of this analysis one at a time with the same approve &rarr; revalidate &rarr; simulate &rarr; install &rarr; verify &rarr; cleanup pipeline as a single server, then reboots it if <code>/run/reboot-required</code> exists (unless Skip reboot is checked). The queue stops at the first failure. You confirm the server list on the next page; servers that are not eligible are skipped.</p>
+  {% if eligible_count %}
   <form method="get" action="/analysis/{{ run.id }}/patch-all" class="form-actions">
     <label class="check-label"><input type="checkbox" name="skip_reboot" value="1"> Skip reboot</label>
     <button type="submit" class="btn btn-danger"{% if patch_running %} disabled{% endif %}>Patch All</button>
     {% if patch_running %}<span class="muted small">A patch execution is running.</span>{% endif %}
   </form>
+  {% elif patch_running %}
+  <p class="muted">A patch execution is running.</p>
+  {% else %}
+  <p class="muted" id="patch-all-nothing">Nothing to patch</p>
+  {% endif %}
 </div>
 {% endif %}
 {% endblock %}
