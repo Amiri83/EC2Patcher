@@ -40,8 +40,11 @@ FACTS_COMMAND = (
     f"echo '{MARK}reboot-hooks'; "
     "grep -l -s notify-reboot-required /var/lib/dpkg/info/*.postinst; "
     f"echo '{MARK}dpkg'; dpkg-query -W -f='{DPKG_FORMAT}'; "
+    f"echo '{MARK}audit'; dpkg --audit 2>&1; echo '{MARK}audit-rc'; echo $?; "
     f"echo '{MARK}end'"
 )
+
+DPKG_BLOCKER = "Server has unconfigured packages: run sudo dpkg --configure -a"
 
 # Ubuntu releases the analyzer understands (VERSION_ID -> codename). LTS releases on EC2.
 SUPPORTED_RELEASES = {
@@ -87,6 +90,7 @@ class ServerFacts:
     reboot_hooks: set[str] = field(default_factory=set)  # postinst calls notify-reboot-required
     packages: list[InstalledPackage] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    dpkg_audit: list[str] = field(default_factory=list)  # dpkg --audit problems (empty: healthy)
 
     @property
     def release_label(self) -> str:
@@ -200,10 +204,40 @@ def parse_facts(stdout: str) -> ServerFacts:
             if line.strip().endswith(".postinst")
         },
         packages=packages,
+        dpkg_audit=parse_audit(sections),
     )
     if malformed:
         facts.warnings.append(f"{malformed} package inventory row(s) could not be parsed.")
     return facts
+
+
+def parse_audit(sections: dict[str, list[str]]) -> list[str]:
+    """``dpkg --audit`` problems; empty when dpkg is healthy (or the section is absent)."""
+    if "audit" not in sections:
+        return []
+    lines = [ln.rstrip() for ln in sections["audit"] if ln.strip()]
+    rc = next((ln.strip() for ln in sections.get("audit-rc", []) if ln.strip()), "0")
+    if rc != "0" and not lines:
+        return [f"dpkg --audit exit status {rc}"]
+    return lines
+
+
+def audit_packages(audit: list[str]) -> list[str]:
+    """Package names listed by ``dpkg --audit`` (indented lines under each problem header)."""
+    names = []
+    for line in audit:
+        if line[:1].isspace() and _PKG_NAME_RE.match(line.split()[0]):
+            names.append(line.split()[0])
+    return sorted(set(names))
+
+
+def dpkg_blocker(facts: ServerFacts) -> str | None:
+    """Return a blocker message if dpkg reports half-installed or unconfigured packages."""
+    if not facts.dpkg_audit:
+        return None
+    names = audit_packages(facts.dpkg_audit)
+    detail = ", ".join(names) if names else "; ".join(facts.dpkg_audit)[:500]
+    return f"{DPKG_BLOCKER} on the server, then re-analyze it. dpkg --audit reports: {detail}."
 
 
 def check_supported(facts: ServerFacts) -> str | None:

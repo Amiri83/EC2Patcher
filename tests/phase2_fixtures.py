@@ -300,7 +300,9 @@ def facts_output(
     reboot_pkgs=(),
     reboot_hooks=("libssl3t64:amd64",),
     motd=True,
+    audit=(),
 ) -> str:
+    """``audit``: ``dpkg --audit`` output lines (empty: healthy, exit status 0)."""
     packages = NOBLE_PACKAGES if packages is None else packages
     lines = []
     if motd:
@@ -308,8 +310,31 @@ def facts_output(
     lines += ["@@EC2P hostname", "ip-10-143-76-245", "@@EC2P os-release", os_release]
     lines += ["@@EC2P arch", arch, "@@EC2P kernel", kernel, "@@EC2P reboot", reboot, *reboot_pkgs]
     lines += ["@@EC2P reboot-hooks"] + [f"/var/lib/dpkg/info/{n}.postinst" for n in reboot_hooks]
-    lines += ["@@EC2P dpkg"] + ["\t".join(p) for p in packages] + ["@@EC2P end"]
+    lines += ["@@EC2P dpkg"] + ["\t".join(p) for p in packages]
+    lines += ["@@EC2P audit", *audit, "@@EC2P audit-rc", "1" if audit else "0", "@@EC2P end"]
     return "\n".join(lines) + "\n"
+
+
+UNPACKED_HEADER = [
+    "The following packages have been unpacked but not yet configured.",
+    "They must be configured using dpkg --configure or the configure",
+    "menu option in dselect for them to work:",
+]
+HALF_CONFIGURED_HEADER = [
+    "The following packages are only half configured, probably due to problems",
+    "configuring them the first time.  The configuration should be retried using",
+    "dpkg --configure <package> or the configure menu option in dselect:",
+]
+
+
+def dpkg_audit_output(packages) -> list[str]:
+    """Real ``dpkg --audit`` text for rows that are unpacked ('iU') or half-configured ('iF')."""
+    lines = []
+    for status, header in (("iU", UNPACKED_HEADER), ("iF", HALF_CONFIGURED_HEADER)):
+        names = [p[0].split(":", 1)[0] for p in packages if p[5].startswith(status)]
+        if names:
+            lines += [*header, *(f" {n:<20} package description" for n in names), ""]
+    return lines
 
 
 def _policy(name, installed, candidate, origin):

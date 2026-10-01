@@ -56,7 +56,10 @@ the same SSH connection settings as the SSH test (`ubuntu@<ip>` with the configu
 unprivileged `ubuntu` user, **without sudo**. It collects the facts: hostname,
 `/etc/os-release`, `dpkg --print-architecture`, `uname -r`, `/run/reboot-required(.pkgs)`,
 which installed maintainer scripts request a reboot, and `dpkg-query` (binary package, version,
-**source package**, source version, architecture and dependency fields).
+**source package**, source version, architecture and dependency fields) and `dpkg --audit`.
+If `dpkg --audit` reports half-installed or unconfigured packages, the server gets a blocker
+("Server has unconfigured packages: run sudo dpkg --configure -a") instead of a plan. A
+package whose installed version already equals its target version is never planned.
 
 The server is never asked for APT candidates or plans. Those are resolved **on the
 workstation** against a private APT state per Ubuntu release and architecture
