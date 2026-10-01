@@ -78,7 +78,7 @@ class AnalysisService:
     ):
         self.db = db
         self.metadata = metadata
-        self.nvd = nvd_client or nvd.NvdClient()
+        self.nvd = nvd_client or nvd.NvdClient(db)
         self.apt = apt or local_apt.LocalApt(
             config.get_apt_state_dir(config.get_data_dir()), config.get_apt_max_age()
         )
