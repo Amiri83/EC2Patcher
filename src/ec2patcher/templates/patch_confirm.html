@@ -15,6 +15,7 @@
     <dt>Local Staging Path</dt><dd><code>{{ patch.local_path }}</code></dd>
     <dt>Remote Staging Path</dt><dd><code>{{ patch.remote_path }}</code></dd>
   </dl>
+  {% if patch.excluded_warning %}<div class="alert alert-warning excluded-warning">{{ patch.excluded_warning }}</div>{% endif %}
   <div class="table-scroll">
   <table class="table small">
     <thead><tr><th>Binary Package</th><th>Current</th><th>Target</th><th>.deb</th></tr></thead>

@@ -1254,9 +1254,10 @@ class Database:
         ]
 
     def mark_interrupted_executions(self) -> int:
-        """Executions still active at startup were cut short by a restart.
+        """Executions still active without a live worker (app restart, crashed worker thread)
+        were cut short.
 
-        Before installing nothing on the server's packages changed -> FAILED. Once the
+        Before installing nothing on the server's packages changed -> INTERRUPTED. Once the
         install may have started the outcome is not provable -> UNKNOWN. Staging files are
         preserved either way. Returns the number of executions updated.
         """
@@ -1281,15 +1282,15 @@ class Database:
                     target, title = patch_state.UNKNOWN, "EXECUTION STATE UNKNOWN"
                     fields = {"partial_state_possible": 1, "cleanup_status": "PRESERVED"}
                 else:
-                    target, title = patch_state.FAILED, "PATCH FAILED"
+                    target, title = patch_state.INTERRUPTED, "PATCH INTERRUPTED"
                     fields = {"cleanup_status": "PRESERVED"}
                 if title:
                     fields.update(
                         error_title=title,
                         failure_stage=state,
-                        error_summary="The application stopped while the patch was running "
-                        f"(stage: {patch_state.LABELS[state]}). Run a new analysis before "
-                        "retrying.",
+                        error_summary="The patch stopped without finishing (application "
+                        f"restarted or its worker stopped) at stage: {patch_state.LABELS[state]}. "
+                        "Run a new analysis before retrying.",
                     )
                 if row["reboot_status"] == patch_state.REBOOT_PENDING:
                     fields["reboot_status"] = patch_state.REBOOT_NOT_RUN

@@ -13,7 +13,7 @@
     <thead><tr><th>#</th><th>Server</th><th>Display Name</th><th>IP</th><th>Packages</th><th>Download</th><th>Expected Reboot</th></tr></thead>
     <tbody>
       {% for a, c in eligible %}
-      <tr><td class="num">{{ loop.index }}</td><td><strong>{{ a.server_name }}</strong>{% if c.superseded %}<div class="muted small latest-analysis">Patched from its <a href="/analysis/{{ a.run_id }}/servers/{{ a.id }}">latest analysis #{{ a.run_id }}</a> (this run's report is older).</div>{% endif %}</td><td>{{ a.display_name or "-" }}</td>
+      <tr><td class="num">{{ loop.index }}</td><td><strong>{{ a.server_name }}</strong>{% if c.superseded %}<div class="muted small latest-analysis">Patched from its <a href="/analysis/{{ a.run_id }}/servers/{{ a.id }}">latest analysis #{{ a.run_id }}</a> (this run's report is older).</div>{% endif %}{% if c.excluded_warning %}<div class="muted small excluded-warning">{{ c.excluded_warning }}</div>{% endif %}</td><td>{{ a.display_name or "-" }}</td>
           <td><code>{{ a.ip_address }}</code></td><td>{{ c.packages }}</td><td>{{ c.download_bytes|filesize }}</td>
           <td>{% if a.expected_reboot %}YES EXPECTED{% else %}NO{% endif %}</td></tr>
       {% endfor %}
