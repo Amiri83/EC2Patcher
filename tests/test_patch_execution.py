@@ -266,8 +266,7 @@ def _plan(**changes):
         ({"plan": _plan(architecture="arm64")}, "architecture"),
         ({"plan": _plan(target_version="not a version")}, "target version is unresolved"),
         ({"plan": _plan(deb_filename="openssl_9.9_amd64.deb")}, "inconsistent"),
-        ({"plan": _plan(target_version="3.0.13-0ubuntu3.4",
-                        deb_filename=deb_name("openssl", "3.0.13-0ubuntu3.4"))}, "not newer"),
+        # A row already at target is excluded, not a blocker (see test_stale_state.py).
         ({"plan": []}, "no package updates"),
         ({"plan": [e for e in plan_entries() if "CVE-2026-54874" not in e.cves]},
          "CVE-2026-54874: patch required but there is no exact package plan"),
@@ -355,11 +354,13 @@ def test_revalidation_package_version_changed_aborts(h):
     assert patch_service.DRIFT_MESSAGE in ex.error_summary and "openssl" in ex.error_summary
 
 
-def test_revalidation_new_dependency_already_installed_aborts(h):
+def test_revalidation_new_dependency_installed_at_other_version_aborts(h):
+    # At the exact target version it would be dropped (see test_patch_resilience.py); any
+    # other version is drift.
     h.fake.packages[(IMAGE, "amd64")] = [
-        "6.8.0-1024.26",
+        "6.8.0-1023.25",
         "linux-signed-aws",
-        "6.8.0-1024.26",
+        "6.8.0-1023.25",
         "ii ",
     ]
     assert_aborted_before_download(h, h.approve())
@@ -500,9 +501,10 @@ def test_transfer_failure_blocks_install(h):
     ex = h.approve()
     assert ex.state == ps.FAILED and ex.failure_stage == ps.TRANSFERRING
     assert not {"simulate", "install"} & set(h.fake.ops)
-    assert ex.cleanup_status == "PRESERVED"
-    assert str(h.local) in ex.cleanup_detail and REMOTE in ex.cleanup_detail
-    assert (h.local / OPENSSL_DEB).exists()
+    # A failed copy is retried once, then both staging directories are cleaned up.
+    assert h.fake.ops.count("scp") == patch_service.SCP_ATTEMPTS
+    assert ex.cleanup_status == "DELETED"
+    assert not (h.local / OPENSSL_DEB).exists() and REMOTE not in h.fake.dirs
 
 
 def test_remote_checksum_mismatch_blocks_install(h):
@@ -793,7 +795,7 @@ def test_database_enforces_transitions(h):
 @pytest.mark.parametrize(
     ("state", "expected"),
     [
-        (ps.DOWNLOADING, ps.FAILED),
+        (ps.DOWNLOADING, ps.INTERRUPTED),
         (ps.INSTALLING, ps.UNKNOWN),
         (ps.VERIFYING_INSTALL, ps.UNKNOWN),
         (ps.CLEANING_UP, ps.SUCCESS_WITH_CLEANUP_WARNING),

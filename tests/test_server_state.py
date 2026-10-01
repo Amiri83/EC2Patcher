@@ -89,7 +89,7 @@ def test_malformed_inventory_rows_counted():
     packages, malformed = st.parse_dpkg_inventory(rows)
     assert len(packages) == 1 and malformed == 2
     facts = st.parse_facts(
-        facts_output(packages=[NOBLE_PACKAGES[0]]).replace("@@EC2P end", "junk\n@@EC2P end")
+        facts_output(packages=[NOBLE_PACKAGES[0]]).replace("@@EC2P audit\n", "junk\n@@EC2P audit\n")
     )
     assert "1 package inventory row(s) could not be parsed." in facts.warnings
 

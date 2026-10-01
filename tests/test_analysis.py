@@ -817,7 +817,9 @@ def test_running_analysis_page_auto_refreshes(web, pem_file, db_path):
         first, second = db.get_analysis_run(run_id).servers
         db.update_analysis_run(run_id, progress_message="Analyzing ip-10-143-76-245 (1 of 2)")
         db.update_server_analysis(first.id, status="analyzing")
+        c.app.state.analyzer._running = True  # a live worker owns the run
         page = c.get(f"/analysis/{run_id}").text
+        c.app.state.analyzer._running = False
     assert '<meta http-equiv="refresh" content="3">' in page
     assert "RUNNING" in page and "Analyzing ip-10-143-76-245 (1 of 2)" in page
     assert "&#9679;" in page and "&#9675;" in page  # analyzing + waiting markers

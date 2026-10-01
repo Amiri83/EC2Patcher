@@ -17,6 +17,7 @@ never aborts the others.
 import logging
 import subprocess
 import threading
+import weakref
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,11 +44,14 @@ logger = logging.getLogger(__name__)
 FACTS_TIMEOUT_SECONDS = 90
 DISPLAY_NAME_TAG = "display_name"
 
-Starter = Callable[[Callable[[], None]], None]
+# Runs the job in the background; may return the worker thread so liveness can be checked.
+Starter = Callable[[Callable[[], None]], threading.Thread | None]
 
 
-def thread_starter(target: Callable[[], None]) -> None:
-    threading.Thread(target=target, name="ec2patcher-analysis", daemon=True).start()
+def thread_starter(target: Callable[[], None]) -> threading.Thread:
+    worker = threading.Thread(target=target, name="ec2patcher-analysis", daemon=True)
+    worker.start()
+    return worker
 
 
 def _utcnow() -> datetime:
@@ -56,6 +60,10 @@ def _utcnow() -> datetime:
 
 def _now() -> str:
     return _utcnow().isoformat()
+
+
+# Every AnalysisService of this process: a worker of one counts as live for all on that database.
+_SERVICES: "weakref.WeakSet[AnalysisService]" = weakref.WeakSet()
 
 
 class AnalysisService:
@@ -78,10 +86,40 @@ class AnalysisService:
         self.starter = starter
         self._lock = threading.Lock()
         self._running = False
+        self._worker: threading.Thread | None = None
+        _SERVICES.add(self)
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        """True only while a worker of this process is alive. A run whose database status
+        still says 'running' without one is stale (see ``reconcile``)."""
+        if not self._running:
+            return False
+        worker = self._worker
+        return not isinstance(worker, threading.Thread) or worker.is_alive()
+
+    def _launch(self, job: Callable[[], None]) -> None:
+        worker = self.starter(job)
+        if isinstance(worker, threading.Thread) and self._running:
+            self._worker = worker
+
+    def _clear_stale(self) -> int:
+        """Caller holds ``self._lock``. Mark runs the database still shows as running while no
+        worker is alive (the worker crashed or the app restarted) as interrupted."""
+        if self.is_running:
+            return 0
+        self._running, self._worker = False, None
+        if any(s.is_running for s in list(_SERVICES) if s.db.path == self.db.path):
+            return 0  # another service of this process (same database) is analyzing
+        count = self.db.mark_interrupted_runs()
+        if count:
+            logger.warning("Marked %d analysis run(s) without a live worker as interrupted", count)
+        return count
+
+    def reconcile(self) -> int:
+        """Clear a stale 'running' state so Analyze / Re-analyze are never left disabled."""
+        with self._lock:
+            return self._clear_stale()
 
     def start(self, report: StoredReport) -> int | None:
         """Create a new run for ``report`` and analyze it in the background.
@@ -89,9 +127,10 @@ class AnalysisService:
         Returns the run id, or None if another analysis is still running.
         """
         with self._lock:
+            self._clear_stale()
             if self._running:
                 return None
-            self._running = True
+            self._running, self._worker = True, None
         try:
             servers = []
             for name in report.servers:
@@ -111,7 +150,7 @@ class AnalysisService:
             raise
         logger.info("Analysis run %s started for report %s", run_id, report.filename)
         try:
-            self.starter(lambda: self._run_safely(run_id))
+            self._launch(lambda: self._run_safely(run_id))
         except Exception:
             self._running = False
             self.db.update_analysis_run(
@@ -179,15 +218,16 @@ class AnalysisService:
     def _start_followup(self, run_id: int, message: str, job: Callable[[str], None]) -> bool:
         """Run ``job(previous_status)`` in the background; False if an analysis is running."""
         with self._lock:
+            self._clear_stale()  # a stale 'running' run must not refuse the action forever
             if self._running:
                 return False
             run = self.db.get_analysis_run(run_id, details=False)
             if run is None or run.is_running:
                 return False
-            self._running = True
+            self._running, self._worker = True, None
         try:
             self.db.update_analysis_run(run_id, status="running", progress_message=message)
-            self.starter(lambda: self._followup_safely(run_id, run.status, job))
+            self._launch(lambda: self._followup_safely(run_id, run.status, job))
         except Exception:
             self._running = False
             self.db.update_analysis_run(run_id, status=run.status, progress_message=None)
@@ -331,7 +371,8 @@ class AnalysisService:
             error = f"Unexpected error: {exc}"
         if not error:
             self.db.update_server_analysis(analysis_id, error=None)
-        elif analysis.status == "complete":  # the previous results are still stored
+        elif analysis.status == "complete" and not error.startswith(server_state.DPKG_BLOCKER):
+            # the previous results are still stored (a dpkg blocker invalidates their plan)
             logger.warning("Re-analysis of %s failed: %s", label, error)
             self.db.update_server_analysis(
                 analysis_id,
@@ -416,6 +457,9 @@ class AnalysisService:
         unsupported = server_state.check_supported(facts)
         if unsupported:
             return unsupported
+        blocker = server_state.dpkg_blocker(facts)
+        if blocker:  # no plan: apt cannot upgrade anything until dpkg is repaired
+            return blocker
 
         warnings = list(facts.warnings)
         metadata_status = self.metadata.status()
@@ -468,6 +512,12 @@ class AnalysisService:
                     + ", ".join(download.removals)
                 )
             warnings.extend(f"APT: {m}" for m in download.messages[:10])
+            same = cve_resolver.already_at_target(download)
+            if same:
+                warnings.append(
+                    "Excluded from the plan (already at target: installed version is equal to "
+                    "or newer than the target version): " + ", ".join(same)
+                )
             if download.ok:
                 plan = cve_resolver.build_plan(findings, download, candidates, facts)
             else:

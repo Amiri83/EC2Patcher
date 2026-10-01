@@ -8,7 +8,7 @@ import hashlib
 import re
 import subprocess
 
-from phase2_fixtures import NOBLE_OS_RELEASE, candidates_output, facts_output
+from phase2_fixtures import NOBLE_OS_RELEASE, candidates_output, dpkg_audit_output, facts_output
 
 from ec2patcher.models import Server
 from ec2patcher.services import cve_resolver as cr
@@ -121,6 +121,26 @@ def make_analysis(db, server: Server, plan=None, finding_list=None, display="Bil
     report = db.get_latest_report()
     run_id = db.create_analysis_run(report, [(server.name, server, display)])
     analysis = db.get_analysis_run(run_id).servers[0]
+    _save_results(db, analysis.id, plan, finding_list, **extra)
+    return db.get_server_analysis(analysis.id)
+
+
+def make_run(db, servers: list[Server], overrides: dict | None = None):
+    """One analysis run over several servers (queue order = list order), stored directly.
+
+    ``overrides``: server name -> make_analysis-style keyword arguments (plan, finding_list,
+    status, ...) for that server.
+    """
+    overrides = overrides or {}
+    db.save_report("report.json", {s.name: ["CVE-2026-63076"] for s in servers}, "VALID")
+    run_id = db.create_analysis_run(db.get_latest_report(), [(s.name, s, None) for s in servers])
+    for analysis in db.get_analysis_run(run_id).servers:
+        _save_results(db, analysis.id, **overrides.get(analysis.server_name, {}))
+    db.update_analysis_run(run_id, status="completed", completed_at="2026-09-27T10:05:00+00:00")
+    return db.get_analysis_run(run_id, details=True)
+
+
+def _save_results(db, analysis_id, plan=None, finding_list=None, **extra):
     fields = {
         "status": "complete",
         "completed_at": "2026-09-27T10:00:00+00:00",
@@ -135,12 +155,11 @@ def make_analysis(db, server: Server, plan=None, finding_list=None, display="Bil
         **extra,
     }
     db.save_server_results(
-        analysis.id,
+        analysis_id,
         findings() if finding_list is None else finding_list,
         plan_entries() if plan is None else plan,
         **fields,
     )
-    return db.get_server_analysis(analysis.id)
 
 
 class FakeFetcher:
@@ -190,6 +209,7 @@ class FakeUbuntu:
         # behaviour knobs
         self.unreachable = False
         self.scp_fail = False
+        self.scp_failures = 0  # the next N scp calls die mid-copy (truncated remote file)
         self.corrupt_transfer = False
         self.sim_rc = 0
         self.sim_extra: list[str] = []
@@ -203,6 +223,14 @@ class FakeUbuntu:
         self.install_versions: dict[str, str] = {}  # package -> version actually installed
         self.cleanup_fail = False
         self.skip: set[str] = set()  # packages apt 'installs' without effect
+        # reboot: ok | refused (sudo denied) | never-returns (SSH stays down) | ignored
+        # (command accepted but the server keeps running on the same boot)
+        self.reboot_mode = "ok"
+        self.down_polls = 2  # SSH attempts that fail while the server restarts
+        self.boot_id = "boot-1"
+        self.kernel = "6.8.0-1021-aws"
+        self.uptime = "up 3 weeks, 2 days"
+        self._down = 0
 
     # --- helpers -------------------------------------------------------------------------
 
@@ -215,11 +243,22 @@ class FakeUbuntu:
         for (name, arch), (version, source, sv, status) in sorted(self.packages.items()):
             full = f"{name}:{arch}" if name.startswith("lib") else name
             rows.append((full, version, source, sv, arch, status))
-        return facts_output(packages=rows, os_release=self.os_release, arch=self.arch)
+        return facts_output(
+            packages=rows,
+            os_release=self.os_release,
+            arch=self.arch,
+            audit=dpkg_audit_output(rows),
+        )
 
     def installed(self, name, arch="amd64"):
         row = self.packages.get((name, arch))
         return row[0] if row else None
+
+    def preinstall(self, names=None):
+        """Install PLAN packages (all, or ``names``) at their target version out of band."""
+        for package, arch, _, target, source, sv, _, _, _ in PLAN:
+            if names is None or package in names:
+                self.packages[(package, arch)] = [target, source, sv, "ii "]
 
     # --- dispatch ------------------------------------------------------------------------
 
@@ -235,6 +274,9 @@ class FakeUbuntu:
         if op == "dpkg":
             op = "post"
         self.calls.append((op, command))
+        if self._down:  # rebooting
+            self._down -= 1
+            return _done(args, rc=255, stderr="ssh: connect to host port 22: Connection refused")
         if self.unreachable:
             return _done(
                 args, rc=255, stderr="ssh: connect to host 10.143.76.245 port 22: timed out"
@@ -290,6 +332,13 @@ class FakeUbuntu:
         split = args.index("--")
         files, dest = args[split + 1 : -1], args[-1]
         d = dest.split(":", 1)[1].rstrip("/")
+        if self.scp_failures:
+            self.scp_failures -= 1
+            for path in files:
+                with open(path, "rb") as fh:
+                    self.dirs[d][path.rsplit("/", 1)[1]] = fh.read()[:10]
+            stderr = "client_loop: send disconnect: Broken pipe\nlost connection"
+            return _done(args, rc=1, stderr=stderr)
         for path in files:
             with open(path, "rb") as fh:
                 data = fh.read()
@@ -382,6 +431,38 @@ class FakeUbuntu:
         ]  # fmt: skip
         return _done(args, "\n".join(out) + "\n")
 
+    @property
+    def reboots(self) -> int:
+        return self.ops.count("reboot-now")
+
+    def _op_reboot_check(self, args, command):
+        flag = "yes" if self.reboot_required else "no"
+        out = f"@@EC2P reboot-check\n{flag}\n@@EC2P boot-id\n{self.boot_id}\n@@EC2P end\n"
+        return _done(args, out)
+
+    def _op_reboot_now(self, args, command):
+        assert "sudo -n reboot" in command
+        if self.reboot_mode == "refused":
+            out = "@@EC2P reboot-now\nsudo: a password is required\n@@EC2P rc\n1\n@@EC2P end\n"
+            return _done(args, out)
+        if self.reboot_mode == "ok":
+            self.boot_id = f"boot-{self.reboots + 1}"
+            self.reboot_required, self.reboot_pkgs = False, []
+            if (IMAGE, "amd64") in self.packages:
+                self.kernel = "6.8.0-1024-aws"
+            self.uptime = "up 1 minute"
+            self._down = self.down_polls
+        elif self.reboot_mode == "never-returns":
+            self._down = 10**9
+        return _done(args, "@@EC2P reboot-now\n", 255, "Connection to 10.143.76.245 closed.")
+
+    def _op_boot_state(self, args, command):
+        out = (
+            f"@@EC2P boot-state\n{self.boot_id}\n@@EC2P uptime\n{self.uptime}\n"
+            f"@@EC2P kernel\n{self.kernel}\n@@EC2P end\n"
+        )
+        return _done(args, out)
+
     def _op_cleanup(self, args, command):
         if self.cleanup_fail:
             return _done(args, rc=255, stderr="Connection closed by remote host")
@@ -395,6 +476,48 @@ class FakeUbuntu:
                 return _done(args, f"@@EC2P cleanup\nkept\n{entries}\n@@EC2P end\n")
             del self.dirs[d]
         return _done(args, "@@EC2P cleanup\nremoved\n@@EC2P end\n")
+
+
+class FakeClock:
+    """Monotonic clock + sleep for the reboot wait: sleeping only advances fake time."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class Fleet:
+    """Several FakeUbuntu servers behind one ssh/scp runner, routed by ``ubuntu@<ip>``.
+
+    ``log`` records (ip, op) across all servers in call order.
+    """
+
+    def __init__(self, ips):
+        self.servers = {ip: FakeUbuntu() for ip in ips}
+        self.log: list[tuple[str, str]] = []
+
+    def __getitem__(self, ip) -> FakeUbuntu:
+        return self.servers[ip]
+
+    def __call__(self, args, **kwargs):
+        target = next(a for a in args if a.startswith("ubuntu@"))
+        ip = target.split("@", 1)[1].split(":", 1)[0]
+        fake = self.servers[ip]
+        before = len(fake.calls)
+        result = fake(args, **kwargs)
+        self.log += [(ip, op) for op, _ in fake.calls[before:]]
+        return result
+
+    def ips_in_order(self) -> list[str]:
+        """Servers in the order they were first contacted."""
+        return list(dict.fromkeys(ip for ip, _ in self.log))
 
 
 def analysis_plan_output() -> str:

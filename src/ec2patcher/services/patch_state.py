@@ -22,6 +22,11 @@ SUCCESS = "SUCCESS"
 SUCCESS_WITH_CLEANUP_WARNING = "SUCCESS_WITH_CLEANUP_WARNING"
 FAILED = "FAILED"
 UNKNOWN = "UNKNOWN"
+# Revalidation found every approved package already at its target version: nothing to do.
+ALREADY_PATCHED = "ALREADY_PATCHED"
+# The worker stopped (app restart / crashed thread) before the install could have started:
+# the server's packages are unchanged. Later stages end as UNKNOWN instead (not provable).
+INTERRUPTED = "INTERRUPTED"
 
 # Pipeline order (used for progress display).
 PIPELINE = [
@@ -39,13 +44,13 @@ PIPELINE = [
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     PENDING_REVIEW: frozenset({APPROVED, REJECTED}),
-    APPROVED: frozenset({REVALIDATING, FAILED}),
-    REVALIDATING: frozenset({DOWNLOADING, FAILED}),
-    DOWNLOADING: frozenset({VERIFYING_DOWNLOADS, FAILED}),
-    VERIFYING_DOWNLOADS: frozenset({TRANSFERRING, FAILED}),
-    TRANSFERRING: frozenset({VERIFYING_TRANSFER, FAILED}),
-    VERIFYING_TRANSFER: frozenset({SIMULATING_INSTALL, FAILED}),
-    SIMULATING_INSTALL: frozenset({INSTALLING, FAILED}),
+    APPROVED: frozenset({REVALIDATING, FAILED, INTERRUPTED}),
+    REVALIDATING: frozenset({DOWNLOADING, FAILED, ALREADY_PATCHED, INTERRUPTED}),
+    DOWNLOADING: frozenset({VERIFYING_DOWNLOADS, FAILED, INTERRUPTED}),
+    VERIFYING_DOWNLOADS: frozenset({TRANSFERRING, FAILED, INTERRUPTED}),
+    TRANSFERRING: frozenset({VERIFYING_TRANSFER, FAILED, INTERRUPTED}),
+    VERIFYING_TRANSFER: frozenset({SIMULATING_INSTALL, FAILED, INTERRUPTED}),
+    SIMULATING_INSTALL: frozenset({INSTALLING, FAILED, INTERRUPTED}),
     # From here on packages may have changed: an unprovable outcome is UNKNOWN, never FAILED
     # or SUCCESS by assumption.
     INSTALLING: frozenset({VERIFYING_INSTALL, FAILED, UNKNOWN}),
@@ -56,11 +61,15 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     SUCCESS_WITH_CLEANUP_WARNING: frozenset(),
     FAILED: frozenset(),
     UNKNOWN: frozenset(),
+    ALREADY_PATCHED: frozenset(),
+    INTERRUPTED: frozenset(),
 }
 
 TERMINAL = frozenset(s for s, targets in ALLOWED_TRANSITIONS.items() if not targets)
 ACTIVE = frozenset(PIPELINE)  # an approved execution that has not finished
 SUCCESSFUL = frozenset({SUCCESS, SUCCESS_WITH_CLEANUP_WARNING})
+# The server ends at the approved versions: a "Patch All" queue moves on to the next one.
+DONE = SUCCESSFUL | {ALREADY_PATCHED}
 # States in which remote packages may already have been modified.
 POST_INSTALL = frozenset({INSTALLING, VERIFYING_INSTALL, CLEANING_UP})
 
@@ -81,14 +90,71 @@ LABELS = {
     SUCCESS_WITH_CLEANUP_WARNING: "PATCH SUCCESSFUL (cleanup warning)",
     FAILED: "PATCH FAILED",
     UNKNOWN: "EXECUTION STATE UNKNOWN",
+    ALREADY_PATCHED: "ALREADY PATCHED",
+    INTERRUPTED: "INTERRUPTED",
 }
 
 BADGES = {
+    INTERRUPTED: "badge-danger",
     REJECTED: "badge-neutral",
     SUCCESS: "badge-success",
     SUCCESS_WITH_CLEANUP_WARNING: "badge-success",
     FAILED: "badge-danger",
     UNKNOWN: "badge-danger",
+    ALREADY_PATCHED: "badge-success",
+}
+
+
+# --- post-patch reboot (recorded separately; the execution state above is unaffected) ----
+# Set at approval: PENDING (reboot allowed) or SKIPPED (operator chose "Skip reboot").
+# After a verified patch PENDING becomes NOT_REQUIRED (no /run/reboot-required on the
+# server) or REQUESTED (sudo reboot issued, waiting for SSH) -> DONE / FAILED. A patch that
+# fails never reboots: PENDING -> NOT_RUN. Neither does an ALREADY_PATCHED server (nothing was
+# installed by EC2Patcher): PENDING -> NOT_RUN.
+REBOOT_PENDING = "PENDING"
+REBOOT_SKIPPED = "SKIPPED"
+REBOOT_NOT_REQUIRED = "NOT_REQUIRED"
+REBOOT_REQUESTED = "REQUESTED"
+REBOOT_DONE = "DONE"
+REBOOT_FAILED = "FAILED"
+REBOOT_NOT_RUN = "NOT_RUN"
+REBOOT_ACTIVE = frozenset({REBOOT_PENDING, REBOOT_REQUESTED})
+
+REBOOT_LABELS = {
+    REBOOT_PENDING: "Pending (after patch)",
+    REBOOT_SKIPPED: "Skipped (operator choice)",
+    REBOOT_NOT_REQUIRED: "Not required",
+    REBOOT_REQUESTED: "Rebooting (waiting for SSH)",
+    REBOOT_DONE: "Rebooted",
+    REBOOT_FAILED: "REBOOT FAILED",
+    REBOOT_NOT_RUN: "Not run (patch did not succeed)",
+}
+
+REBOOT_BADGES = {
+    REBOOT_DONE: "badge-success",
+    REBOOT_NOT_REQUIRED: "badge-neutral",
+    REBOOT_SKIPPED: "badge-warning",
+    REBOOT_FAILED: "badge-danger",
+    REBOOT_NOT_RUN: "badge-neutral",
+}
+
+# --- "Patch All" queues ------------------------------------------------------------------
+QUEUE_RUNNING = "RUNNING"
+QUEUE_COMPLETED = "COMPLETED"
+QUEUE_STOPPED = "STOPPED"  # a server failed; the remaining servers were not run
+
+ITEM_PENDING = "PENDING"
+ITEM_RUNNING = "RUNNING"
+ITEM_SUCCESS = "SUCCESS"
+ITEM_FAILED = "FAILED"
+ITEM_SKIPPED = "SKIPPED"  # not eligible; never touched
+ITEM_NOT_RUN = "NOT_RUN"  # eligible, but the queue stopped before its turn
+
+ITEM_BADGES = {
+    ITEM_SUCCESS: "badge-success",
+    ITEM_FAILED: "badge-danger",
+    ITEM_SKIPPED: "badge-neutral",
+    ITEM_NOT_RUN: "badge-warning",
 }
 
 
@@ -98,6 +164,11 @@ class InvalidTransitionError(RuntimeError):
 
 def is_allowed(current: str, target: str) -> bool:
     return target in ALLOWED_TRANSITIONS.get(current, frozenset())
+
+
+def in_progress(state: str, reboot_status: str | None) -> bool:
+    """Still in the patch pipeline, or patched and still in the reboot step."""
+    return state in ACTIVE or (state in SUCCESSFUL and reboot_status in REBOOT_ACTIVE)
 
 
 def check_transition(current: str, target: str) -> None:
