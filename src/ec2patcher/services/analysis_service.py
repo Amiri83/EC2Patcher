@@ -331,7 +331,8 @@ class AnalysisService:
             error = f"Unexpected error: {exc}"
         if not error:
             self.db.update_server_analysis(analysis_id, error=None)
-        elif analysis.status == "complete":  # the previous results are still stored
+        elif analysis.status == "complete" and not error.startswith(server_state.DPKG_BLOCKER):
+            # the previous results are still stored (a dpkg blocker invalidates their plan)
             logger.warning("Re-analysis of %s failed: %s", label, error)
             self.db.update_server_analysis(
                 analysis_id,
@@ -416,6 +417,9 @@ class AnalysisService:
         unsupported = server_state.check_supported(facts)
         if unsupported:
             return unsupported
+        blocker = server_state.dpkg_blocker(facts)
+        if blocker:  # no plan: apt cannot upgrade anything until dpkg is repaired
+            return blocker
 
         warnings = list(facts.warnings)
         metadata_status = self.metadata.status()
@@ -468,6 +472,12 @@ class AnalysisService:
                     + ", ".join(download.removals)
                 )
             warnings.extend(f"APT: {m}" for m in download.messages[:10])
+            same = cve_resolver.already_at_target(download)
+            if same:
+                warnings.append(
+                    "Excluded from the plan (installed version equals the target version): "
+                    + ", ".join(same)
+                )
             if download.ok:
                 plan = cve_resolver.build_plan(findings, download, candidates, facts)
             else:
