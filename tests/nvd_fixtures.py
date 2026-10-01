@@ -105,4 +105,9 @@ class FakeNvd:
 
 def make_client(tmp_path: Path, transport, **kwargs) -> nvd.NvdClient:
     kwargs.setdefault("sleep", lambda seconds: None)
-    return nvd.NvdClient(cache_dir=tmp_path / "nvd-cache", transport=transport, **kwargs)
+    return nvd.NvdClient(cache_db=nvd_cache_db(tmp_path), transport=transport, **kwargs)
+
+
+def nvd_cache_db(tmp_path: Path) -> Path:
+    """The SQLite database holding the ``nvd_cache`` table of ``make_client(tmp_path, ...)``."""
+    return tmp_path / "nvd-cache.db"

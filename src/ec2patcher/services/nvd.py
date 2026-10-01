@@ -9,9 +9,11 @@ One request per CVE (``cveId`` query parameter), sequential and rate limited: NV
 5 requests per rolling 30 s without an API key and 50 with one, so requests are spaced 6 s /
 0.6 s apart. The optional ``NVD_API_KEY`` environment variable is sent in the ``apiKey``
 request header, as the 2.0 API requires; it is never stored, logged or exported. Responses
-are cached per CVE on disk (raw ``metrics`` kept, so the selection is recomputed on reuse);
-entries younger than 24 h are used without a request, stale entries are refreshed and used
-as a fallback (marked stale) when NVD cannot be reached.
+are cached per CVE in the application database (table ``nvd_cache``; raw ``metrics`` kept, so
+the selection is recomputed on reuse): entries younger than 30 days are used without a
+request, older entries are refreshed and used as a fallback (marked stale) when NVD cannot be
+reached. Failed lookups are never cached, and a cache error never fails a lookup (it falls
+back to the network). The former on-disk JSON cache is neither read nor written.
 """
 
 import json
@@ -27,8 +29,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from platformdirs import user_cache_dir
-
+from ec2patcher import config
+from ec2patcher.database import Database
 from ec2patcher.services.severity import CRITICAL, HIGH, LOW, MEDIUM
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,7 @@ API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 API_KEY_ENV = "NVD_API_KEY"
 NVD_SOURCE = "nvd@nist.gov"
 REQUEST_TIMEOUT_SECONDS = 20
-CACHE_MAX_AGE = timedelta(hours=24)
+CACHE_MAX_AGE = timedelta(days=30)
 INTERVAL_PUBLIC = 6.0  # 5 requests / 30 s without a key
 INTERVAL_WITH_KEY = 0.6  # 50 requests / 30 s with a key
 MAX_ATTEMPTS = 3  # for 429 / 5xx
@@ -242,12 +244,6 @@ def http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, di
         return exc.code, dict(exc.headers or {}), b""
 
 
-def default_cache_dir() -> Path:
-    override = os.environ.get("EC2PATCHER_CACHE_DIR")
-    base = Path(override).expanduser() if override else Path(user_cache_dir("ec2patcher"))
-    return base / "nvd"
-
-
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -266,7 +262,7 @@ class NvdClient:
 
     def __init__(
         self,
-        cache_dir: Path | None = None,
+        cache_db: Database | Path | None = None,
         transport: Transport | None = None,
         api_key: str | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -274,7 +270,16 @@ class NvdClient:
         now: Callable[[], datetime] = _now,
         max_age: timedelta = CACHE_MAX_AGE,
     ):
-        self.cache_dir = Path(cache_dir) if cache_dir else default_cache_dir()
+        # cache_db: the application Database (or its path); None = the default data dir DB,
+        # opened on first use.
+        if isinstance(cache_db, Database):
+            self._db: Database | None = cache_db
+            self.cache_db_path = cache_db.path
+        else:
+            self._db = None
+            self.cache_db_path = (
+                Path(cache_db) if cache_db else config.get_data_dir() / config.DB_FILENAME
+            )
         self.transport = transport
         self._api_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV) or None
         self.interval = INTERVAL_WITH_KEY if self._api_key else INTERVAL_PUBLIC
@@ -290,39 +295,49 @@ class NvdClient:
 
     # --- cache -------------------------------------------------------------------------
 
-    def _cache_path(self, cve_id: str) -> Path:
-        return self.cache_dir / f"{cve_id}.json"
+    def _cache(self) -> Database:
+        if self._db is None:
+            self._db = Database(self.cache_db_path)
+        return self._db
 
     def _read_cache(self, cve_id: str) -> dict | None:
+        """{"cve": slim cve object or None (unknown to NVD), "fetched", "fetched_at"}, or None
+        when not cached or unreadable (the network is used then)."""
         try:
-            entry = json.loads(self._cache_path(cve_id).read_text())
-            fetched = datetime.fromisoformat(entry["fetched_at"])
-            if entry.get("cve_id") != cve_id or not isinstance(entry.get("cve") or {}, dict):
-                raise ValueError("mismatched cache entry")
-            return {**entry, "fetched": fetched}
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+            entry = self._cache().get_nvd_cache(cve_id)
+            if entry is None:
+                return None
+            metrics, last_modified, fetched_at = entry
+            fetched = datetime.fromisoformat(fetched_at)
+            cve = None
+            if metrics is not None:
+                cve = {"id": cve_id, "lastModified": last_modified, "metrics": json.loads(metrics)}
+                if not isinstance(cve["metrics"], dict):
+                    raise ValueError("cached metrics are not an object")
+            return {"cve": cve, "fetched": fetched, "fetched_at": fetched_at}
+        except Exception as exc:  # noqa: BLE001 - a cache problem must never fail a lookup
             logger.warning("Ignoring unreadable NVD cache entry for %s: %s", cve_id, exc)
             return None
 
     def _write_cache(self, cve_id: str, cve: dict | None) -> None:
-        # Only what later reuse needs: the CVE id, timestamps and the raw metrics.
-        slim = None
-        if cve is not None:
-            slim = {
-                "id": cve_id,
-                "lastModified": cve.get("lastModified"),
-                "metrics": cve.get("metrics"),
-            }
-        entry = {"cve_id": cve_id, "fetched_at": self.now().isoformat(), "cve": slim}
+        # Only what later reuse needs: the raw metrics and lastModified.
         try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp = self._cache_path(cve_id).with_suffix(".tmp")
-            tmp.write_text(json.dumps(entry))
-            tmp.replace(self._cache_path(cve_id))
-        except OSError as exc:
+            metrics = None if cve is None else json.dumps(cve.get("metrics") or {})
+            last_modified = None if cve is None else _text(cve.get("lastModified"))
+            self._cache().put_nvd_cache(cve_id, metrics, last_modified, self.now().isoformat())
+        except Exception as exc:  # noqa: BLE001 - the fetched data is still returned
             logger.warning("Could not write NVD cache entry for %s: %s", cve_id, exc)
+
+    def clear(self) -> bool:
+        """Forget the in-run memo, the breaker and the ``nvd_cache`` table. True if anything
+        was removed."""
+        had_entries = bool(self._memo) or self._unreachable is not None
+        self.start_run()
+        try:
+            had_entries = self._cache().clear_nvd_cache() > 0 or had_entries
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not clear the NVD cache: %s", exc)
+        return had_entries
 
     # --- network -----------------------------------------------------------------------
 

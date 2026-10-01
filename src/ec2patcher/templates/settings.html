@@ -45,7 +45,9 @@
     <dt>Cache TTL</dt><dd>{{ "%g"|format(metadata_status.cache_ttl_hours) }} hours ({{ "%g"|format(metadata_status.investigating_ttl_hours) }} hour{{ "" if metadata_status.investigating_ttl_hours == 1 else "s" }} while a release is under investigation)</dd>
     <dt>Requests</dt><dd>{{ "%g"|format(metadata_status.timeout_seconds) }} s timeout, {{ "%g"|format(metadata_status.pace_seconds) }} s apart, up to {{ metadata_status.attempts }} attempts with backoff; lookups pause for the rest of the run after {{ metadata_status.breaker_threshold }} consecutive failures</dd>
     <dt>Proxy</dt><dd>HTTPS_PROXY / NO_PROXY from the environment</dd>
+    <dt>NVD CVSS cache</dt><dd>table <code>nvd_cache</code> in the same database; entries are reused for {{ nvd_cache_days }} days (failed lookups are never cached)</dd>
   </dl>
+  <p class="muted">Clear Security Cache empties both caches (Canonical and NVD) and the in-memory lookup state.</p>
   <form method="post" action="/settings/clear-cache">
     <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
   </form>
