@@ -8,7 +8,7 @@ import hashlib
 import re
 import subprocess
 
-from phase2_fixtures import NOBLE_OS_RELEASE, candidates_output, facts_output
+from phase2_fixtures import NOBLE_OS_RELEASE, candidates_output, dpkg_audit_output, facts_output
 
 from ec2patcher.models import Server
 from ec2patcher.services import cve_resolver as cr
@@ -243,7 +243,12 @@ class FakeUbuntu:
         for (name, arch), (version, source, sv, status) in sorted(self.packages.items()):
             full = f"{name}:{arch}" if name.startswith("lib") else name
             rows.append((full, version, source, sv, arch, status))
-        return facts_output(packages=rows, os_release=self.os_release, arch=self.arch)
+        return facts_output(
+            packages=rows,
+            os_release=self.os_release,
+            arch=self.arch,
+            audit=dpkg_audit_output(rows),
+        )
 
     def installed(self, name, arch="amd64"):
         row = self.packages.get((name, arch))
