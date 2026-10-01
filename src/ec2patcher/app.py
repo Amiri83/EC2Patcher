@@ -51,7 +51,8 @@ NOTICES = {
     "cleared": "All configured servers were removed ({count} deleted).",
     "not_found": "That server no longer exists.",
     "cache_cleared": (
-        "Security lookup memory and cache cleared. The next analysis will query Canonical again."
+        "Security lookup memory and cache cleared. The next analysis will query Canonical and "
+        "NVD again."
     ),
     "cache_clean": "Security lookup memory and cache are already clear.",
     "lookups_retrying": "Retrying {count} failed Canonical lookup(s).",
@@ -160,6 +161,7 @@ def create_app(
     templates.env.globals["apt_state_dir"] = apt.root
     templates.env.globals["apt_max_age_hours"] = apt.max_age.total_seconds() / 3600
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
+    templates.env.globals["nvd_cache_days"] = analyzer.nvd.max_age.days
     templates.env.globals["patch_labels"] = ps.LABELS
     templates.env.globals["patch_badges"] = ps.BADGES
     templates.env.globals["reboot_labels"] = ps.REBOOT_LABELS
@@ -675,6 +677,7 @@ def create_app(
     @app.post("/settings/clear-cache")
     def clear_security_cache():
         removed = metadata.clear()
+        removed = analyzer.nvd.clear() or removed
         return redirect("/settings", notice="cache_cleared" if removed else "cache_clean")
 
     @app.post("/settings/reset-database", response_class=HTMLResponse)

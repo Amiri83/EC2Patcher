@@ -27,7 +27,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -304,6 +304,17 @@ _MIGRATIONS = {
     # Every scp attempt (exit code + stderr) of an execution, shown on its page.
     9: """
         ALTER TABLE patch_executions ADD COLUMN transfer_attempts TEXT NOT NULL DEFAULT '[]';
+    """,
+    # NVD CVSS data per CVE (replaces the old on-disk JSON cache, which is no longer read):
+    # raw NVD ``metrics`` JSON; metrics NULL = NVD confirmed the CVE is unknown. Failed
+    # lookups are never stored.
+    10: """
+        CREATE TABLE nvd_cache (
+            cve            TEXT PRIMARY KEY,
+            metrics        TEXT,
+            last_modified  TEXT,
+            fetched_at     TEXT NOT NULL
+        );
     """,
 }
 
@@ -1016,6 +1027,32 @@ class Database:
     def clear_cve_metadata(self) -> int:
         with self.connect() as conn:
             return conn.execute("DELETE FROM cve_metadata_cache").rowcount
+
+    # --- NVD CVSS cache ----------------------------------------------------------------
+
+    def get_nvd_cache(self, cve: str) -> tuple[str | None, str | None, str] | None:
+        """(metrics JSON or None for a confirmed unknown CVE, last_modified, fetched_at), or
+        None if not cached."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT metrics, last_modified, fetched_at FROM nvd_cache WHERE cve = ?", (cve,)
+            ).fetchone()
+        return (row["metrics"], row["last_modified"], row["fetched_at"]) if row else None
+
+    def put_nvd_cache(
+        self, cve: str, metrics: str | None, last_modified: str | None, fetched_at: str
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO nvd_cache (cve, metrics, last_modified, fetched_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(cve) DO UPDATE SET metrics = excluded.metrics, "
+                "last_modified = excluded.last_modified, fetched_at = excluded.fetched_at",
+                (cve, metrics, last_modified, fetched_at),
+            )
+
+    def clear_nvd_cache(self) -> int:
+        with self.connect() as conn:
+            return conn.execute("DELETE FROM nvd_cache").rowcount
 
     def get_latest_report(self) -> StoredReport | None:
         with self.connect() as conn:
