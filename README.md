@@ -1,4 +1,4 @@
-export NVD_API_KEY=<your-key>
+
 # EC2 Patcher
 
 A small, local, single-user web GUI for recurring security patching of Ubuntu EC2 servers.
