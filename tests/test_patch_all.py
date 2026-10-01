@@ -443,6 +443,25 @@ def test_web_patch_all_refused_while_patch_running(q, web):
     assert r.status_code == 409 and "Patch All was not started" in r.text
 
 
+def test_web_patch_all_button_hidden_when_nothing_eligible(q, web):
+    run = q.run({n: metadata_unavailable() for n in NAMES})
+    page = web.get(f"/analysis/{run.id}").text
+    assert 'id="patch-all"' in page and "Nothing to patch" in page
+    assert f'action="/analysis/{run.id}/patch-all"' not in page
+    assert 'name="skip_reboot"' not in page and ">Patch All</button>" not in page
+    assert q.fleet.log == [] and q.db.list_executions() == []  # the preview is read-only
+    assert q.db.latest_queue_id(run.id) is None
+
+
+def test_web_patch_all_button_shown_when_one_eligible(q, web):
+    run = q.run({"srv-a": metadata_unavailable(), "srv-c": unresolved_plan()})  # srv-b only
+    page = web.get(f"/analysis/{run.id}").text
+    assert f'action="/analysis/{run.id}/patch-all"' in page and ">Patch All</button>" in page
+    assert '<input type="checkbox" name="skip_reboot" value="1"> Skip reboot' in page
+    assert "Nothing to patch" not in page
+    assert q.fleet.log == [] and q.db.list_executions() == []
+
+
 def test_unknown_queue_and_run_404(web):
     assert web.get("/patch-all/999").status_code == 404
     assert web.get("/analysis/999/patch-all").status_code == 404
