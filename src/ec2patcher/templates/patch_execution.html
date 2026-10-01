@@ -8,7 +8,7 @@
 </div>{% endblock %}
 {% block content %}
 {% set ex = execution %}
-<div class="card {% if ex.state in ('SUCCESS', 'SUCCESS_WITH_CLEANUP_WARNING', 'ALREADY_PATCHED') %}result-ok{% elif ex.state in ('FAILED', 'UNKNOWN') %}result-fail{% endif %}">
+<div class="card {% if ex.state in ('SUCCESS', 'SUCCESS_WITH_CLEANUP_WARNING', 'ALREADY_PATCHED') %}result-ok{% elif ex.state in ('FAILED', 'UNKNOWN', 'INTERRUPTED') %}result-fail{% endif %}">
   <div class="card-header">
     <h2>{% if ex.error_title %}{{ ex.error_title }}{% else %}{{ patch_labels.get(ex.state, ex.state) }}{% endif %}</h2>
     <span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ ex.state }}</span>
@@ -38,7 +38,7 @@
   {% if is_active %}<p class="progress-message">{% if ex.state in patch_labels and ex.state not in ("SUCCESS", "SUCCESS_WITH_CLEANUP_WARNING") %}{{ patch_labels[ex.state] }}{% else %}{{ reboot_labels.get(ex.reboot_status, "Reboot") }}{% endif %}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>{% endif %}
 </div>
 
-{% if ex.state in ("FAILED", "UNKNOWN") %}
+{% if ex.state in ("FAILED", "UNKNOWN", "INTERRUPTED") %}
 <div class="card result-fail patch-failure">
   <h2>{{ ex.error_title or "PATCH FAILED" }}</h2>
   <dl class="kv">

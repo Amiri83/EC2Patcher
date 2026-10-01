@@ -124,7 +124,7 @@ def create_app(
     )
     interrupted = db.mark_interrupted_executions()
     if interrupted:
-        logger.warning("Marked %d unfinished patch execution(s) as failed/unknown", interrupted)
+        logger.warning("Marked %d unfinished patch execution(s) as interrupted", interrupted)
     interrupted = db.mark_interrupted_queues()
     if interrupted:
         logger.warning("Marked %d unfinished Patch All queue(s) as stopped", interrupted)
@@ -375,6 +375,7 @@ def create_app(
     # --- reports -------------------------------------------------------------
 
     def reports_page(request: Request, status_code: int = 200, **ctx):
+        analyzer.reconcile()  # "running" means a live worker, never a leftover status flag
         report = db.get_latest_report()
         missing = []
         if report is not None:
@@ -429,6 +430,8 @@ def create_app(
 
     @app.get("/analysis/{run_id}", response_class=HTMLResponse)
     def analysis_run(request: Request, run_id: int):
+        analyzer.reconcile()
+        patcher.reconcile()
         run = db.get_analysis_run(run_id, details=True)
         if run is None:
             raise StarletteHTTPException(404)
@@ -486,6 +489,7 @@ def create_app(
     def server_report_page(
         request: Request, run_id: int, analysis_id: int, status_code: int = 200, **ctx
     ):
+        analyzer.reconcile()
         run, analysis = stored_server_report(run_id, analysis_id)
         latest = db.get_latest_analysis_run()
         groups = analysis_service.remediation_groups(analysis.findings)
@@ -554,6 +558,7 @@ def create_app(
 
     @app.get("/patch/{execution_id}", response_class=HTMLResponse)
     def patch_execution(request: Request, execution_id: int):
+        patcher.reconcile()
         execution = db.get_execution(execution_id)
         if execution is None:
             raise StarletteHTTPException(404)
@@ -614,6 +619,7 @@ def create_app(
 
     @app.get("/patch-all/{queue_id}", response_class=HTMLResponse)
     def patch_all_queue(request: Request, queue_id: int):
+        patcher.reconcile()
         queue = db.get_patch_queue(queue_id)
         if queue is None:
             raise StarletteHTTPException(404)
@@ -639,6 +645,7 @@ def create_app(
 
     @app.get("/history", response_class=HTMLResponse)
     def history(request: Request):
+        patcher.reconcile()
         return render(request, "history.html", "history", executions=db.list_executions())
 
     def settings_page(request: Request, status_code: int = 200, **ctx):

@@ -424,6 +424,7 @@ def apply_candidates(
         wanted = kernel_meta_version(f.fixed_version) if f.is_kernel else f.fixed_version
         ok: dict[str, str] = {}
         problems: list[str] = []
+        at_target: list[str] = []
         for name in names:
             cand = candidates.get(name)
             if cand and cand.candidate:
@@ -443,7 +444,9 @@ def apply_candidates(
             if good:
                 pkg = installed.get(name) or installed.get(name.split(":", 1)[0])
                 current = pkg.version if pkg else cand.installed  # the server's dpkg decides
-                if not same_version(current, cand.candidate):
+                if at_or_above_target(current, cand.candidate):
+                    at_target.append(f"{name} {current}")
+                else:
                     ok[name] = cand.candidate
             else:
                 problems.append(f"{name}: APT candidate {cand.candidate} is older than {wanted}")
@@ -463,8 +466,14 @@ def apply_candidates(
             f.status = PATCH_AVAILABLE
             f.detail = f"The Ubuntu archive ({archive}) already offers a fixed version."
         if not ok:
-            f.status = ANALYSIS_ERROR
-            f.detail = "APT candidate equals the installed version although a fix is required."
+            # Every binary is already at (or above) a candidate that carries the fix: nothing
+            # to install for this CVE, which must not block the rest of the server's plan.
+            f.status = ALREADY_FIXED
+            f.detail = (
+                "Installed binary package(s) already at or above the fixed APT candidate: "
+                + ", ".join(at_target)
+                + "."
+            )
             continue
         f.status = PATCH_AVAILABLE
         requests.update(ok)
@@ -485,13 +494,25 @@ def same_version(installed: str | None, target: str | None) -> bool:
         return installed == target
 
 
+def at_or_above_target(installed: str | None, target: str | None) -> bool:
+    """True if a package installed at ``installed`` needs no upgrade to ``target`` (equal or
+    newer by Debian comparison). Such a package is excluded from plans, never an error."""
+    if not installed or not target:
+        return False
+    try:
+        return debversion.compare_versions(installed, target) >= 0
+    except debversion.InvalidVersionError:
+        return installed == target
+
+
 def already_at_target(download: DownloadPlan) -> list[str]:
-    """Packages APT listed whose installed version equals the target (excluded from plans)."""
+    """Packages APT listed whose installed version is at or above the target (excluded from
+    plans)."""
     return sorted(
         {
             f"{d.package.split(':', 1)[0]} {d.target_version}"
             for d in download.packages
-            if same_version(d.current_version, d.target_version)
+            if at_or_above_target(d.current_version, d.target_version)
         }
     )
 
@@ -527,7 +548,7 @@ def build_plan(
 
     entries: dict[tuple[str, str], PlanEntry] = {}
     for deb in download.packages:
-        if same_version(deb.current_version, deb.target_version):
+        if at_or_above_target(deb.current_version, deb.target_version):
             continue  # nothing to upgrade: never planned (see already_at_target)
         base = deb.package.split(":", 1)[0]
         inst = installed.get(deb.package) or installed.get(base)

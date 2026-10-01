@@ -24,6 +24,9 @@ FAILED = "FAILED"
 UNKNOWN = "UNKNOWN"
 # Revalidation found every approved package already at its target version: nothing to do.
 ALREADY_PATCHED = "ALREADY_PATCHED"
+# The worker stopped (app restart / crashed thread) before the install could have started:
+# the server's packages are unchanged. Later stages end as UNKNOWN instead (not provable).
+INTERRUPTED = "INTERRUPTED"
 
 # Pipeline order (used for progress display).
 PIPELINE = [
@@ -41,13 +44,13 @@ PIPELINE = [
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     PENDING_REVIEW: frozenset({APPROVED, REJECTED}),
-    APPROVED: frozenset({REVALIDATING, FAILED}),
-    REVALIDATING: frozenset({DOWNLOADING, FAILED, ALREADY_PATCHED}),
-    DOWNLOADING: frozenset({VERIFYING_DOWNLOADS, FAILED}),
-    VERIFYING_DOWNLOADS: frozenset({TRANSFERRING, FAILED}),
-    TRANSFERRING: frozenset({VERIFYING_TRANSFER, FAILED}),
-    VERIFYING_TRANSFER: frozenset({SIMULATING_INSTALL, FAILED}),
-    SIMULATING_INSTALL: frozenset({INSTALLING, FAILED}),
+    APPROVED: frozenset({REVALIDATING, FAILED, INTERRUPTED}),
+    REVALIDATING: frozenset({DOWNLOADING, FAILED, ALREADY_PATCHED, INTERRUPTED}),
+    DOWNLOADING: frozenset({VERIFYING_DOWNLOADS, FAILED, INTERRUPTED}),
+    VERIFYING_DOWNLOADS: frozenset({TRANSFERRING, FAILED, INTERRUPTED}),
+    TRANSFERRING: frozenset({VERIFYING_TRANSFER, FAILED, INTERRUPTED}),
+    VERIFYING_TRANSFER: frozenset({SIMULATING_INSTALL, FAILED, INTERRUPTED}),
+    SIMULATING_INSTALL: frozenset({INSTALLING, FAILED, INTERRUPTED}),
     # From here on packages may have changed: an unprovable outcome is UNKNOWN, never FAILED
     # or SUCCESS by assumption.
     INSTALLING: frozenset({VERIFYING_INSTALL, FAILED, UNKNOWN}),
@@ -59,6 +62,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     FAILED: frozenset(),
     UNKNOWN: frozenset(),
     ALREADY_PATCHED: frozenset(),
+    INTERRUPTED: frozenset(),
 }
 
 TERMINAL = frozenset(s for s, targets in ALLOWED_TRANSITIONS.items() if not targets)
@@ -87,9 +91,11 @@ LABELS = {
     FAILED: "PATCH FAILED",
     UNKNOWN: "EXECUTION STATE UNKNOWN",
     ALREADY_PATCHED: "ALREADY PATCHED",
+    INTERRUPTED: "INTERRUPTED",
 }
 
 BADGES = {
+    INTERRUPTED: "badge-danger",
     REJECTED: "badge-neutral",
     SUCCESS: "badge-success",
     SUCCESS_WITH_CLEANUP_WARNING: "badge-success",

@@ -266,8 +266,7 @@ def _plan(**changes):
         ({"plan": _plan(architecture="arm64")}, "architecture"),
         ({"plan": _plan(target_version="not a version")}, "target version is unresolved"),
         ({"plan": _plan(deb_filename="openssl_9.9_amd64.deb")}, "inconsistent"),
-        ({"plan": _plan(target_version="3.0.13-0ubuntu3.4",
-                        deb_filename=deb_name("openssl", "3.0.13-0ubuntu3.4"))}, "not newer"),
+        # A row already at target is excluded, not a blocker (see test_stale_state.py).
         ({"plan": []}, "no package updates"),
         ({"plan": [e for e in plan_entries() if "CVE-2026-54874" not in e.cves]},
          "CVE-2026-54874: patch required but there is no exact package plan"),
@@ -796,7 +795,7 @@ def test_database_enforces_transitions(h):
 @pytest.mark.parametrize(
     ("state", "expected"),
     [
-        (ps.DOWNLOADING, ps.FAILED),
+        (ps.DOWNLOADING, ps.INTERRUPTED),
         (ps.INSTALLING, ps.UNKNOWN),
         (ps.VERIFYING_INSTALL, ps.UNKNOWN),
         (ps.CLEANING_UP, ps.SUCCESS_WITH_CLEANUP_WARNING),

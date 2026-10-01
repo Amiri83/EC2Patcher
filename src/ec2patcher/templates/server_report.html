@@ -104,6 +104,7 @@
     {% else %}<span class="badge badge-neutral">PENDING REVIEW</span>{% endif %}
   </div>
   {% if patch.not_checked_warning %}<div class="alert alert-warning not-checked-warning">{{ patch.not_checked_warning }}</div>{% endif %}
+  {% if patch.excluded_warning %}<div class="alert alert-warning excluded-warning">{{ patch.excluded_warning }}</div>{% endif %}
   {% if ex and ex.decision == "REJECTED" %}
     <p><strong>Rejected</strong> on {{ ex.decided_at|timestamp }}. No packages were downloaded, copied or installed. The report remains available for reference.</p>
   {% elif ex %}

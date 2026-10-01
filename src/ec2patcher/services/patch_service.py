@@ -9,10 +9,13 @@ Pipeline (one server, one execution at a time; every step must pass before the n
   -> INSTALLING (apt-get install of the explicit local .debs) -> VERIFYING_INSTALL (versions,
   dpkg --audit, Canonical fixed versions, /run/reboot-required) -> CLEANING_UP -> SUCCESS.
 
-Revalidation drops packages that are already installed at their target version (e.g.
-patched by hand since the analysis); when that leaves nothing to install the execution ends
-as ALREADY_PATCHED. Each scp copy is retried once; a copy that still fails ends the pipeline
-after cleaning up both staging directories (exit code and stderr of every attempt are kept).
+A package already installed at (or above) its target version is excluded, never an error:
+plan rows recorded that way are not checked or copied, and revalidation drops packages
+patched since the analysis (e.g. by hand). Only when nothing is left to install is the
+server not patched (not eligible, or ALREADY_PATCHED after revalidation).
+
+Each scp copy is retried once; a copy that still fails ends the pipeline after cleaning up
+both staging directories (exit code and stderr of every attempt are kept).
 
 Any other failure stops the pipeline, preserves local and remote staging files and records why.
 After the install may have started nothing is assumed: the outcome is verified on the
@@ -34,6 +37,7 @@ import logging
 import subprocess
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,11 +81,14 @@ DRIFT_MESSAGE = (
     "Package state changed since this report was analyzed. Run a new analysis before patching."
 )
 
-Starter = Callable[[Callable[[], None]], None]
+# Runs the job in the background; may return the worker thread so liveness can be checked.
+Starter = Callable[[Callable[[], None]], threading.Thread | None]
 
 
-def thread_starter(target: Callable[[], None]) -> None:
-    threading.Thread(target=target, name="ec2patcher-patch", daemon=True).start()
+def thread_starter(target: Callable[[], None]) -> threading.Thread:
+    worker = threading.Thread(target=target, name="ec2patcher-patch", daemon=True)
+    worker.start()
+    return worker
 
 
 def _now() -> str:
@@ -91,15 +98,6 @@ def _now() -> str:
 def _tail(lines: list[str] | str, limit: int = MAX_STORED_OUTPUT) -> str:
     text = lines if isinstance(lines, str) else "\n".join(lines)
     return text if len(text) <= limit else "[... output truncated ...]\n" + text[-limit:]
-
-
-def _same_version(installed: str | None, target: str) -> bool:
-    if not installed:
-        return False
-    try:
-        return debversion.compare_versions(installed, target) == 0
-    except debversion.InvalidVersionError:
-        return installed == target
 
 
 class PatchNotAllowedError(Exception):
@@ -124,10 +122,32 @@ class PatchAbort(Exception):  # noqa: N818 - control flow, not an error in the c
 # --- plan validation -----------------------------------------------------------------
 
 
+def at_target(row) -> bool:
+    """A plan row whose recorded installed version is already at or above its target (e.g.
+    stored before the planner excluded such rows): excluded from patching, never an error."""
+    return cve_resolver.at_or_above_target(row.current_version, row.target_version)
+
+
+def installable(analysis: ServerAnalysis) -> list:
+    """The plan rows that still need installing (``at_target`` rows excluded)."""
+    return [p for p in analysis.plan if not at_target(p)]
+
+
+def excluded_warning(analysis: ServerAnalysis) -> str | None:
+    rows = [p for p in analysis.plan if at_target(p)]
+    if not rows:
+        return None
+    names = ", ".join(
+        f"{p.binary_package} (installed {p.current_version}, target {p.target_version})"
+        for p in rows
+    )
+    return f"{len(rows)} package(s) already at target are excluded and not installed: {names}."
+
+
 def unique_debs(analysis: ServerAnalysis) -> dict[str, list]:
     """deb file name -> plan rows using it (a shared .deb is downloaded once)."""
     debs: dict[str, list] = {}
-    for p in analysis.plan:
+    for p in installable(analysis):
         if p.deb_filename:
             debs.setdefault(p.deb_filename, []).append(p)
     return debs
@@ -167,9 +187,15 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
             + ", ".join(unavailable)
             + ". Run a new analysis once the metadata is reachable."
         )
+    rows = installable(analysis)
     if not analysis.plan:
         reasons.append("There are no package updates to install.")
-    for p in analysis.plan:
+    elif not rows:
+        reasons.append(
+            "There are no package updates to install: every planned package is already at "
+            "(or above) its target version."
+        )
+    for p in rows:
         name = p.binary_package
         if p.status != "planned":
             reasons.append(f"{name}: package download plan is unresolved.")
@@ -198,19 +224,12 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
             reasons.append(f"{name}: plan is inconsistent (URI does not point at {expected}).")
         if not p.is_dependency and not p.current_version:
             reasons.append(f"{name}: plan is inconsistent (installed version unknown).")
-        if p.current_version:
-            try:
-                if debversion.compare_versions(p.target_version, p.current_version) <= 0:
-                    reasons.append(
-                        f"{name}: plan is inconsistent (target {p.target_version} is not newer "
-                        f"than installed {p.current_version})."
-                    )
-            except debversion.InvalidVersionError:
-                reasons.append(f"{name}: installed version is invalid.")
-    for filename, rows in unique_debs(analysis).items():
-        if len({(r.uri, r.checksum, r.size) for r in rows}) > 1:
+        if p.current_version and not debversion.is_valid_version(p.current_version):
+            reasons.append(f"{name}: installed version is invalid.")
+    for filename, debs in unique_debs(analysis).items():
+        if len({(r.uri, r.checksum, r.size) for r in debs}) > 1:
             reasons.append(f"{filename}: plan is inconsistent (conflicting URI/checksum/size).")
-    covered = {cve for p in analysis.plan for cve in p.cves}
+    covered = {cve for p in analysis.plan for cve in p.cves}  # at-target rows cover theirs
     for f in analysis.findings:
         if f.status != cve_resolver.PATCH_AVAILABLE:
             continue
@@ -257,6 +276,7 @@ class Eligibility:
     download_bytes: int = 0
     unpatched_notes: list[str] = field(default_factory=list)
     not_checked_warning: str | None = None
+    excluded_warning: str | None = None  # plan rows already at target (not installed)
     # "Patch All": the run's own (older) analysis this one replaces, if any.
     superseded: ServerAnalysis | None = None
 
@@ -284,6 +304,10 @@ class _Context:
         return sorted(self.debs)
 
 
+# Every PatchService of this process: a worker of one counts as live for all on that database.
+_SERVICES: "weakref.WeakSet[PatchService]" = weakref.WeakSet()
+
+
 class PatchService:
     def __init__(
         self,
@@ -301,12 +325,48 @@ class PatchService:
         self.fetcher = fetcher or downloader.urllib_fetcher
         self.analysis_running = analysis_running
         self.sleep, self.clock = sleep, clock  # reboot wait; replaceable in tests
-        self._lock = threading.Lock()
+        # Re-entrant: approve()/start_queue() hold it while eligibility() reconciles.
+        self._lock = threading.RLock()
         self._running = False
+        self._worker: threading.Thread | None = None
+        _SERVICES.add(self)
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        """True only while a worker of this process is alive. Executions or queues that the
+        database still shows as active without one are stale (see ``reconcile``)."""
+        if not self._running:
+            return False
+        worker = self._worker
+        return not isinstance(worker, threading.Thread) or worker.is_alive()
+
+    def _launch(self, job: Callable[[], None]) -> None:
+        worker = self.starter(job)
+        if isinstance(worker, threading.Thread) and self._running:
+            self._worker = worker
+
+    def _clear_stale(self) -> None:
+        """Caller holds ``self._lock``. With no live worker (in any service of this process
+        using the same database), executions/queues still active in the database were cut
+        short: record them as interrupted so nothing stays locked."""
+        if self.is_running:
+            return
+        self._running, self._worker = False, None
+        if any(s.is_running for s in list(_SERVICES) if s.db.path == self.db.path):
+            return
+        executions = self.db.mark_interrupted_executions()
+        queues = self.db.mark_interrupted_queues()
+        if executions or queues:
+            logger.warning(
+                "No live patch worker: marked %d execution(s) and %d Patch All queue(s) as "
+                "interrupted", executions, queues,
+            )  # fmt: skip
+
+    def reconcile(self) -> None:
+        """Clear a stale 'patch running' state so Approve / Patch All are never left disabled
+        after a crash or restart."""
+        with self._lock:
+            self._clear_stale()
 
     # --- settings ---------------------------------------------------------------------
 
@@ -317,10 +377,13 @@ class PatchService:
 
     def eligibility(self, analysis: ServerAnalysis, own_run: bool = False) -> Eligibility:
         """``own_run``: called by the running "Patch All" queue (its own busy flag is set)."""
+        if not own_run:
+            self.reconcile()  # a dead worker must not leave patching locked
         result = Eligibility(allowed=False)
         result.execution = self.db.get_execution_for_analysis(analysis.id)
         debs = unique_debs(analysis)
-        result.packages, result.debs = len(analysis.plan), len(debs)
+        result.packages, result.debs = len(installable(analysis)), len(debs)
+        result.excluded_warning = excluded_warning(analysis)
         result.download_bytes = sum(rows[0].size or 0 for rows in debs.values())
         not_patchable = (
             cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS,
@@ -394,12 +457,13 @@ class PatchService:
         if analysis is None:
             raise PatchNotAllowedError("This analysis no longer exists.")
         with self._lock:
+            self._clear_stale()
             if self._running:
                 raise PatchNotAllowedError("Another patch execution is running.")
             execution_id = self._record_approval(analysis, skip_reboot)
-            self._running = True
+            self._running, self._worker = True, None
         try:
-            self.starter(lambda: self._run_safely(execution_id))
+            self._launch(lambda: self._run_safely(execution_id))
         except Exception:
             self._running = False
             self.db.transition_execution(
@@ -457,8 +521,8 @@ class PatchService:
             self.execute(execution_id)
         except Exception:
             # execute() records every failure itself; this only triggers if the database
-            # is unusable. The execution then stays active until the next startup, where
-            # mark_interrupted_executions() records it as FAILED/UNKNOWN.
+            # is unusable. Once this worker is gone, reconcile() (or the next startup)
+            # records the execution as INTERRUPTED/UNKNOWN.
             logger.exception("Patch execution %s could not record its result", execution_id)
         finally:
             self._running = False
@@ -606,7 +670,7 @@ class PatchService:
         if execution.remote_staging_path != staging.remote_dir(execution.server_name):
             raise PatchAbort("Unexpected remote staging path.")
         debs: dict[str, dict] = {}
-        for plan in analysis.plan:
+        for plan in installable(analysis):  # at-target rows are dropped at revalidation
             sha = downloader.parse_sha256(plan.checksum)
             if not plan.deb_filename or sha is None or not plan.size:
                 raise PatchAbort(f"{plan.binary_package}: approved plan is incomplete.")
@@ -669,8 +733,8 @@ class PatchService:
         remaining, dropped = [], []
         for pkg in ctx.packages:
             current = installed.get((pkg.binary_package, pkg.architecture))
-            if _same_version(current, pkg.target_version):
-                dropped.append(pkg)  # already patched since the analysis: nothing to do
+            if cve_resolver.at_or_above_target(current, pkg.target_version):
+                dropped.append((pkg, current))  # already at (or above) target: nothing to do
                 continue
             remaining.append(pkg)
             if current != pkg.before_version:
@@ -695,24 +759,30 @@ class PatchService:
     def _drop_already_installed(
         self,
         ctx: _Context,
-        dropped: list[PatchPackageResult],
+        dropped: list[tuple[PatchPackageResult, str]],
         remaining: list[PatchPackageResult],
     ) -> None:
-        """Take packages already at their target version out of this execution's plan."""
-        for pkg in dropped:
+        """Take packages already at (or above) their target version out of this execution's
+        plan: a warning, never a failure."""
+        for pkg, current in dropped:
+            detail = "Already installed at the target version at revalidation; not reinstalled."
+            if not cve_resolver.same_version(current, pkg.target_version):
+                detail = (
+                    f"Already installed at {current}, newer than the target version, at "
+                    "revalidation; not reinstalled."
+                )
             self.db.update_execution_package(
-                pkg.id, after_version=pkg.target_version, install_result=ALREADY_AT_TARGET,
-                verification_result="VERIFIED",
-                detail="Already installed at the target version at revalidation; not reinstalled.",
+                pkg.id, after_version=current, install_result=ALREADY_AT_TARGET,
+                verification_result="VERIFIED", detail=detail,
             )  # fmt: skip
-            pkg.after_version, pkg.verification_result = pkg.target_version, "VERIFIED"
-        ctx.dropped, ctx.packages = dropped, remaining
+            pkg.after_version, pkg.verification_result = current, "VERIFIED"
+        ctx.dropped, ctx.packages = [pkg for pkg, _ in dropped], remaining
         needed = {p.deb_filename for p in remaining}
         ctx.debs = {name: deb for name, deb in ctx.debs.items() if name in needed}
-        names = ", ".join(f"{p.binary_package} {p.target_version}" for p in dropped)
+        names = ", ".join(f"{p.binary_package} {current}" for p, current in dropped)
         ctx.notes.append(
-            f"{len(dropped)} package(s) already at the target version were dropped from the "
-            f"plan: {names}."
+            f"{len(dropped)} package(s) already at the target version (or newer) were dropped "
+            f"from the plan: {names}."
         )
         logger.info(
             "Patch execution %s: dropped %d package(s) already at target: %s",
@@ -1201,6 +1271,7 @@ class PatchService:
             raise PatchNotAllowedError("This analysis no longer exists.")
         confirmed = set(confirmed_ids)
         with self._lock:
+            self._clear_stale()
             if self._running:
                 raise PatchNotAllowedError("Another patch execution is running.")
             items = []
@@ -1214,6 +1285,10 @@ class PatchService:
                 if check.superseded:
                     latest = f"Uses the latest analysis #{analysis.run_id} (newer than this run)."
                     detail = f"{latest} {detail}" if detail else latest
+                if status == ps.ITEM_PENDING and check.excluded_warning:
+                    detail = (
+                        f"{detail} {check.excluded_warning}" if detail else check.excluded_warning
+                    )
                 items.append(
                     {
                         "server_analysis_id": analysis.id,
@@ -1226,13 +1301,13 @@ class PatchService:
             if not any(item["status"] == ps.ITEM_PENDING for item in items):
                 raise PatchNotAllowedError("No eligible servers to patch.")
             queue_id = self.db.create_patch_queue(run_id, skip_reboot, items)
-            self._running = True
+            self._running, self._worker = True, None
         logger.info(
             "Patch All queue %s started for analysis run %s: %d server(s), skip_reboot=%s",
             queue_id, run_id, sum(i["status"] == ps.ITEM_PENDING for i in items), skip_reboot,
         )  # fmt: skip
         try:
-            self.starter(lambda: self._run_queue_safely(queue_id))
+            self._launch(lambda: self._run_queue_safely(queue_id))
         except Exception:
             self._running = False
             self._stop_queue(queue_id, None, "Could not start the queue.")

@@ -59,7 +59,9 @@ which installed maintainer scripts request a reboot, and `dpkg-query` (binary pa
 **source package**, source version, architecture and dependency fields) and `dpkg --audit`.
 If `dpkg --audit` reports half-installed or unconfigured packages, the server gets a blocker
 ("Server has unconfigured packages: run sudo dpkg --configure -a") instead of a plan. A
-package whose installed version already equals its target version is never planned.
+package whose installed version is already at or above its target version is never planned:
+it is excluded with an "already at target" warning and the rest is patched. A server is only
+refused when nothing is left to install.
 
 The server is never asked for APT candidates or plans. Those are resolved **on the
 workstation** against a private APT state per Ubuntu release and architecture
@@ -134,6 +136,11 @@ the Reports page). A run keeps a snapshot of the report, the server name, IP and
 tag, and all remote facts, so later edits don't change historical results. Report keys are
 always matched against the canonical server **name**; `display_name` is shown but never used
 for matching. If the app is stopped during an analysis, the run is marked *interrupted*.
+"Running" always means a live worker thread in this process, never a stored status: at
+startup, and whenever a page finds no live worker, leftover running analyses, patch
+executions and Patch All queues are recorded as *interrupted*, so Analyze / Approve /
+Patch All are never left disabled after a crash or restart. (Run one EC2Patcher process per
+database.)
 
 **Severity (Phase 2.2).** Each CVE finding shows a **Severity** (Critical / High / Medium /
 Low / Unknown) and a compact **CVSS** value (e.g. `8.8 (v3.1)`) taken from the official
@@ -173,7 +180,7 @@ Approving (after a confirmation page) runs this pipeline; every step must pass:
 1. **Revalidate**: reconnect and compare hostname, Ubuntu version/codename, architecture and
    the installed version of every planned package with the analysis. Any drift aborts with
    *PATCH ABORTED — SERVER STATE CHANGED* before anything is downloaded. A package that is
-   already installed at its target version is not drift: it is dropped from the plan (and its
+   already installed at (or above) its target version is not drift: it is dropped from the plan (and its
    CVEs are still verified after the install). If every package is already at its target the
    execution ends as **ALREADY PATCHED** without touching the server. `sudo -n true` must
    work (no password prompt, ever).
