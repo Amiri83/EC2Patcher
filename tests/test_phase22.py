@@ -13,7 +13,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from nvd_fixtures import REPORT_CVES, FakeNvd, cve_obj, cvss, make_client, response, v2
+from nvd_fixtures import (
+    REPORT_CVES,
+    FakeNvd,
+    cve_obj,
+    cvss,
+    make_client,
+    nvd_cache_db,
+    response,
+    v2,
+)
 from openpyxl import load_workbook
 from phase2_fixtures import REAL_REPORT, ScriptedSSH, make_metadata
 from test_analysis import AUTH_FAILURE, BAD, BAD_IP, GOOD, GOOD_IP, sync
@@ -244,7 +253,8 @@ def test_api_key_sent_as_header_only(tmp_path, monkeypatch):
     ((url, headers),) = fake.calls
     assert headers["apiKey"] == "sekret-key" and "sekret" not in url
     assert client.interval == nvd.INTERVAL_WITH_KEY
-    assert "sekret" not in "".join(p.read_text() for p in (tmp_path / "nvd-cache").iterdir())
+    with sqlite3.connect(nvd_cache_db(tmp_path)) as conn:
+        assert "sekret" not in "\n".join(conn.iterdump())
 
 
 def test_invalid_cve_id_is_not_sent(tmp_path):
@@ -341,31 +351,11 @@ def cached_client(tmp_path, fake, clock):
     return make_client(tmp_path, fake, now=clock)
 
 
-def test_cache_miss_fresh_stale_refresh(tmp_path):
-    clock = Clock()
-    fake = FakeNvd({CVE: cve_obj(CVE, cvssMetricV31=[cvss("3.1", 7.5, "HIGH")])})
-    assert cached_client(tmp_path, fake, clock).lookup(CVE).severity == "High"  # miss
-    assert len(fake.calls) == 1
-    entry = json.loads((tmp_path / "nvd-cache" / f"{CVE}.json").read_text())
-    assert entry["cve_id"] == CVE and entry["fetched_at"] == "2026-09-27T12:00:00+00:00"
-    assert entry["cve"]["lastModified"] == "2026-09-01T12:17:13.423"
-    assert entry["cve"]["metrics"]["cvssMetricV31"][0]["cvssData"]["baseScore"] == 7.5
-
-    clock.value += timedelta(hours=23)
-    assert cached_client(tmp_path, fake, clock).lookup(CVE).severity == "High"  # fresh
-    assert len(fake.calls) == 1
-
-    clock.value += timedelta(hours=2)
-    fake.cves[CVE] = cve_obj(CVE, cvssMetricV31=[cvss("3.1", 9.8, "CRITICAL")])
-    r = cached_client(tmp_path, fake, clock).lookup(CVE)  # stale -> refreshed
-    assert (r.status, r.severity, len(fake.calls)) == (nvd.OK, "Critical", 2)
-
-
 def test_stale_cache_used_when_nvd_fails(tmp_path):
     clock = Clock()
     fake = FakeNvd({CVE: cve_obj(CVE, cvssMetricV31=[cvss("3.1", 7.5, "HIGH")])})
     cached_client(tmp_path, fake, clock).lookup(CVE)
-    clock.value += timedelta(days=3)
+    clock.value += timedelta(days=31)
     r = cached_client(tmp_path, FakeNvd(replies=[OSError("down")]), clock).lookup(CVE)
     assert (r.status, r.severity, r.score) == (nvd.STALE, "High", 7.5)
     assert "using cached data from 2026-09-27T12:00:00+00:00" in r.note
@@ -383,24 +373,6 @@ def test_not_found_is_cached_too(tmp_path):
     make_client(tmp_path, fake).lookup(CVE)
     assert make_client(tmp_path, fake).lookup(CVE).status == nvd.NOT_FOUND
     assert len(fake.calls) == 1
-
-
-@pytest.mark.parametrize(
-    "content", ["", "{not json", "[]", '{"cve_id": "CVE-1999-1", "fetched_at": "x"}',
-                json.dumps({"cve_id": CVE, "fetched_at": "2026-09-27T12:00:00+00:00", "cve": 5})],
-)  # fmt: skip
-def test_corrupt_cache_entry_is_ignored(tmp_path, content):
-    (tmp_path / "nvd-cache").mkdir()
-    (tmp_path / "nvd-cache" / f"{CVE}.json").write_text(content)
-    fake = FakeNvd({CVE: cve_obj(CVE, cvssMetricV31=[cvss("3.1", 7.5, "HIGH")])})
-    assert make_client(tmp_path, fake).lookup(CVE).severity == "High"
-    assert len(fake.calls) == 1
-
-
-def test_unwritable_cache_does_not_break_lookup(tmp_path):
-    (tmp_path / "nvd-cache").write_text("a file, not a directory")
-    fake = FakeNvd({CVE: cve_obj(CVE, cvssMetricV31=[cvss("3.1", 7.5, "HIGH")])})
-    assert make_client(tmp_path, fake).lookup(CVE).severity == "High"
 
 
 def test_repeated_cve_in_one_run_is_looked_up_once_even_without_cache(tmp_path):
@@ -606,11 +578,11 @@ def test_report_renders_when_nvd_failed(web, pem_file, db_path):
 
 
 def test_report_shows_stale_cache_marker(web, pem_file, db_path, tmp_path):
-    cache = tmp_path / "nvd-cache"
-    cache.mkdir()
-    old = {"cve_id": "CVE-2026-63076", "fetched_at": "2020-01-01T00:00:00+00:00",
-           "cve": REPORT_CVES["CVE-2026-63076"]}  # fmt: skip
-    (cache / "CVE-2026-63076.json").write_text(json.dumps(old))
+    old = REPORT_CVES["CVE-2026-63076"]
+    Database(nvd_cache_db(tmp_path)).put_nvd_cache(
+        "CVE-2026-63076", json.dumps(old["metrics"]), old["lastModified"],
+        "2020-01-01T00:00:00+00:00",
+    )  # fmt: skip
     _, page = analyzed_page(web, pem_file, db_path, FakeNvd(replies=[OSError("down")]))
     assert "Source: NVD &middot; stale cache" in page
     assert "using cached data from 2020-01-01T00:00:00+00:00" in page

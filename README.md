@@ -1,237 +1,54 @@
-
 # EC2 Patcher
 
-A small, local, single-user web GUI for recurring security patching of Ubuntu EC2 servers.
+A small, local, single-user web GUI (FastAPI + Jinja2 + SQLite) for recurring security
+patching of Ubuntu EC2 servers. You keep an inventory of servers, upload the security team's
+CVE report, get a **read-only** per-server analysis with an exact package / `.deb` plan, and
+then patch an approved plan on one server or on all eligible servers of an analysis
+(**Patch All**), with an optional reboot afterwards.
 
-**Current scope: Phase 3.** This covers the application shell, the server inventory
-(with user-defined server tags), SSH connectivity testing, uploading/validating the
-security team's CVE report, a **read-only pre-patch analysis** that produces a per-server
-report (with NVD CVSS severity and Excel export) and an exact package / .deb plan, and
-**per-server patch execution** of an approved plan with verification and patch history, and
-**Patch All** (the eligible servers of one analysis, sequentially). After a verified patch a
-server is rebooted only if `/run/reboot-required` exists on it and *Skip reboot* is unchecked.
-EC2Patcher never runs `apt upgrade` / `dist-upgrade`.
+EC2Patcher never runs `apt upgrade` / `apt dist-upgrade`: it installs only the exact `.deb`
+files of a plan you approved.
 
-## Features (Phase 1 + 1.5)
+## Workflow at a glance
 
-- **Dashboard**: number of configured servers, the latest accepted report, and application status.
-- **Servers**: add, edit, delete and SSH-test servers. **Clear All Servers** requires typing
-  `DELETE SERVERS` first.
-  - Each server has a unique **name**, an **IP address** and a **PEM file path**.
-  - Names may contain letters, digits, `.`, `_` and `-`, and are unique regardless of case.
-    Later phases use the name to match reports and to name per-server directories.
-  - Only the PEM *path* is stored. Key contents are never read, stored or logged. `~` is expanded.
-    The PEM file must exist and be readable when you save or test a server.
-  - The SSH user is always `ubuntu`, and only key-based auth is used.
-- **Server tags** (Phase 1.5): optional free-form key/value labels per server, e.g.
-  `display_name = Billing API`, `env = prod`.
-  - Add, edit and remove tag rows on the Add/Edit Server form (**+ Add Tag** / **Remove**).
-    Saving stores exactly the rows shown; removed rows are deleted.
-  - Keys and values are trimmed. A key is required (max 64 chars); the value may be empty
-    (max 256 chars). Rows with a blank key *and* value are ignored. Up to 50 tags per server.
-  - Keys are unique per server, regardless of case (`Duplicate tag key: env`). Different
-    servers can use the same key.
-  - The Servers page shows the first two tags, sorted by key, then **+N more**. Hover over it
-    to see all tags.
-  - Deleting a server or using **Clear All Servers** also removes its tags.
-  - Tags are inventory metadata only. CVE reports are always matched by the server **name**.
-- **SSH test**: runs `ssh -i <pem> ubuntu@<ip>` with `BatchMode=yes` and `ConnectTimeout=10`,
-  plus a 30 s overall limit. It shows the hostname, OS release and architecture, or a short error
-  such as *Permission denied (publickey)* or *Connection timed out*. The system OpenSSH client
-  runs it with an argument list, never through a shell. New host keys are accepted on first
-  connect (`StrictHostKeyChecking=accept-new`); a changed host key is reported as an error.
-- **Reports**: upload a CVE JSON report (`.json`, max 1 MiB). Validation is structural only. The
-  latest accepted report is kept in SQLite; a failed upload does not replace it.
-- **History / Settings**: placeholders for later phases.
-- **Shutdown App**: stops the local server after you confirm. No data is removed.
+1. **Servers**: add each server (name, IP, PEM path, optional tags) and run the SSH test.
+2. **Reports**: pick or drop the CVE report JSON; it is uploaded and validated automatically.
+3. **Analyze Report**: read-only analysis of every server in the report.
+4. Review each **server report** (Severity, CVSS, Ubuntu priority, package plan, reboot
+   expectation); export it to Excel if needed. **Re-analyze** or **Retry** where needed.
+5. **Approve & Patch** one server, or **Patch All** for the whole analysis. Optionally tick
+   **Skip reboot**.
+6. **History** keeps every decision, execution, verification and reboot result.
 
-## Pre-patch analysis (Phase 2)
+## Target server requirements
 
-On the **Reports** page, click **Analyze Report**. The analysis runs in the background and the
-page shows each server as *Waiting*, *Analyzing*, *Complete* or *Failed* (with the reason).
-Servers are analyzed one after another; one failing server never affects the others. When it
-finishes, **View Report** opens the per-server pre-patch report.
+- Ubuntu, reachable over SSH as the user **`ubuntu`** (fixed) with a PEM key (key-based auth
+  only; the PEM *path* is stored, its contents are never read, stored or logged).
+- **Passwordless sudo** for `ubuntu` for patching: every privileged command uses `sudo -n`, and
+  patching aborts if `sudo -n true` fails. Analysis needs no sudo at all.
+- `dpkg`, `apt-get`, `sha256sum` and write access to `/tmp` (the standard Ubuntu image has
+  them).
 
-**Read-only.** For each server in the latest report, EC2Patcher runs **one** fixed command over
-the same SSH connection settings as the SSH test (`ubuntu@<ip>` with the configured PEM), as the
-unprivileged `ubuntu` user, **without sudo**. It collects the facts: hostname,
-`/etc/os-release`, `dpkg --print-architecture`, `uname -r`, `/run/reboot-required(.pkgs)`,
-which installed maintainer scripts request a reboot, and `dpkg-query` (binary package, version,
-**source package**, source version, architecture and dependency fields) and `dpkg --audit`.
-If `dpkg --audit` reports half-installed or unconfigured packages, the server gets a blocker
-("Server has unconfigured packages: run sudo dpkg --configure -a") instead of a plan. A
-package whose installed version is already at or above its target version is never planned:
-it is excluded with an "already at target" warning and the rest is patched. A server is only
-refused when nothing is left to install.
+## Features
 
-The server is never asked for APT candidates or plans. Those are resolved **on the
-workstation** against a private APT state per Ubuntu release and architecture
-(`<data dir>/apt/<codename>-<arch>/`, e.g. `noble-amd64`). Its `sources.list` holds only the
-Ubuntu archive pockets `<codename>`, `<codename>-updates` and `<codename>-security` (never
-`-proposed` / `-backports`) for the server's architecture. Every `apt-get` / `apt-cache` call
-passes `-o Dir::State=…`, `-o Dir::Cache=…`, `-o Dir::Etc::sourcelist=…` (plus the other
-`Dir::Etc` overrides), so the workstation's own APT configuration and state are never used or
-changed, and no `sudo` is needed:
+### Servers and tags
 
-1. `apt-get update` on the private state, only when its lists are older than the configured
-   maximum age (default 6 hours, at most once per analysis run and release). If the update
-   fails, the affected findings are reported as *Analysis error*. Candidates are never guessed.
-2. APT candidates: `apt-cache policy` / `apt-cache show` for the affected binary packages,
-   evaluated against a dpkg status file rebuilt from the server's `dpkg-query` output.
-3. APT plan: `apt-get -s install ...` (simulation) and `apt-get --print-uris install ...` for
-   the exact candidate versions. `--print-uris` prints the URI, `.deb` file name, size and
-   SHA256 of every package the upgrade needs **without downloading anything**.
+- Add, edit, delete and SSH-test servers. **Clear All Servers** requires typing
+  `DELETE SERVERS`.
+- Names may contain letters, digits, `.`, `_` and `-` and are unique regardless of case. CVE
+  reports are always matched by **name**.
+- Optional key/value **tags** per server (e.g. `display_name = Billing API`, `env = prod`):
+  up to 50 per server, keys unique per server (case-insensitive). `display_name` is shown in
+  reports but never used for matching.
+- **SSH test** runs `ssh -i <pem> ubuntu@<ip>` with `BatchMode=yes`, `ConnectTimeout=10` and a
+  30 s overall limit, and shows hostname, OS release and architecture or a short error. New host
+  keys are accepted on first connect (`accept-new`); a changed host key is an error.
 
-Because the lists are always current, a candidate older than Canonical's fix means the fix is
-genuinely not published in those pockets (*Fixed version not in configured repositories*).
-Fixes published only in Ubuntu Pro / ESM stay *Ubuntu Pro / ESM required*, since the private
-state has no Pro credentials.
+### Report upload
 
-Nothing is downloaded, copied, installed, removed or restarted. There is no SCP and no reboot.
-
-### How a CVE is decided
-
-Ubuntu tracks vulnerabilities per **source** package; APT installs **binary** packages. For
-each reported CVE and the server's Ubuntu release:
-
-1. Canonical's statement(s) for the release name the affected source package(s) and, when
-   fixed, the fixed version (Ubuntu Pro / ESM pockets such as `esm-infra/focal` are recognised).
-2. `dpkg-query` maps installed binary packages to their source package and source version
-   (no substring matching).
-3. Versions are compared with Debian semantics (epochs, revisions, `~`), identical to
-   `dpkg --compare-versions`.
-4. If a patch is required, the archive's APT candidate must be at least the fixed version;
-   otherwise the finding says *Fix known - suitable APT candidate not available* and why.
-5. The APT simulation + `--print-uris` produce the exact .deb plan. Packages fixing several
-   CVEs appear once, linked to every CVE they fix.
-
-Statuses: *Patch required*, *Already fixed*, *Not affected*, *Package not installed*,
-*Fix not available*, *Fix requires Ubuntu Pro / ESM*, *Fix known - suitable APT candidate not
-available*, *Under investigation / needs evaluation*, *Ignored / no fix planned*,
-*Analysis error*. Anything that cannot be decided is shown as such, never as safe. A CVE that
-Canonical does not know is *needs evaluation*.
-
-**Kernels:** kernel CVEs are checked against the *running* kernel. The upgrade path is the
-installed kernel meta package (e.g. `linux-aws`), which pulls in the new ABI packages
-(`linux-image-<abi>-aws`, ...). If a fixed kernel is already installed but not running, the
-finding is *Already fixed* with a *reboot pending* note.
-
-**Reboot:** *Current reboot required* reads `/run/reboot-required`. *Expected reboot after
-planned patch* is YES when the plan contains a new kernel image/modules, or a package whose
-maintainer scripts request a reboot (e.g. `libc6`, `dbus`). The final requirement is verified
-after installation in Phase 3.
-
-### Canonical security metadata
-
-Source: Canonical's Security JSON API at
-`https://ubuntu.com/security/cves/<CVE>.json`. During analysis, EC2Patcher queries
-Canonical once per reported CVE and maps source-package release statuses to its findings.
-Repeated CVEs are memoized in process memory; the Settings button clears that memo.
-There is no persistent Canonical metadata cache or bulk dataset download. If an online
-lookup fails, that CVE is marked **Canonical metadata unavailable** and analysis continues.
-
-### Results
-
-Every analysis is stored as a new run in SQLite (older runs are kept and remain viewable from
-the Reports page). A run keeps a snapshot of the report, the server name, IP and `display_name`
-tag, and all remote facts, so later edits don't change historical results. Report keys are
-always matched against the canonical server **name**; `display_name` is shown but never used
-for matching. If the app is stopped during an analysis, the run is marked *interrupted*.
-"Running" always means a live worker thread in this process, never a stored status: at
-startup, and whenever a page finds no live worker, leftover running analyses, patch
-executions and Patch All queues are recorded as *interrupted*, so Analyze / Approve /
-Patch All are never left disabled after a crash or restart. (Run one EC2Patcher process per
-database.)
-
-**Severity (Phase 2.2).** Each CVE finding shows a **Severity** (Critical / High / Medium /
-Low / Unknown) and a compact **CVSS** value (e.g. `8.8 (v3.1)`) taken from the official
-[NVD CVE API 2.0](https://nvd.nist.gov/developers/vulnerabilities) during the analysis and
-stored with the finding. NVD is *only* used for severity: whether a CVE affects a server, the
-fixed version, the status and the package plan still come exclusively from Canonical.
-Canonical's own priority is still stored and shown as **Ubuntu Priority**.
-
-- CVSS selection (deterministic): the NVD/NIST assessment (`nvd@nist.gov`) if present, else
-  the CNA's *Primary* assessment, else any other; within each group CVSS v4.0 > v3.1 > v3.0
-  (ties by source name). CVSS v2 is only a last-resort fallback (never rated Critical).
-- The rating follows the numeric base score (0.1-3.9 Low, 4.0-6.9 Medium, 7.0-8.9 High,
-  9.0-10.0 Critical); a missing or inconsistent NVD `baseSeverity` is recorded, and a score of
-  0.0 (None) is shown as Unknown, never Low.
-- Each unique CVE is queried once per analysis, sequentially, 6 s apart (NVD's public limit of
-  5 requests / 30 s; 0.6 s with an API key). Set `NVD_API_KEY` to use a key; it is sent in the
-  `apiKey` request header and never stored, logged or exported.
-- Responses are cached per CVE in `~/.cache/ec2patcher/nvd/` for 24 hours. If NVD cannot be
-  reached, older cached data is used and marked *stale cache*; without a cache the severity is
-  **Unknown** ("NVD lookup failed"). NVD problems never change a finding's patch status.
-- Analyses made before Phase 2.2 keep their stored data and show Severity **Unknown**; they
-  are never re-fetched.
-
-**Export to Excel (Phase 2.1).** Each server report page has an *Export to Excel* button that
-downloads `ec2patcher_<server name>_<analysis date>.xlsx` with three sheets: *Summary*,
-*CVE Findings* (every stored finding, including CVSS Score / Version / Vector, Severity Source
-and Ubuntu Priority) and *Package Plan*. The workbook is built on demand from the stored
-snapshot only; exporting never runs ssh, APT, NVD or metadata downloads.
-
-## Patch execution (Phase 3)
-
-Each server report has a **Patch Decision** area with **Reject** and **Approve & Patch**
-(one server at a time; see *Patch All* below for a whole analysis). Rejecting only records
-the decision.
-Approving (after a confirmation page) runs this pipeline; every step must pass:
-
-1. **Revalidate**: reconnect and compare hostname, Ubuntu version/codename, architecture and
-   the installed version of every planned package with the analysis. Any drift aborts with
-   *PATCH ABORTED — SERVER STATE CHANGED* before anything is downloaded. A package that is
-   already installed at (or above) its target version is not drift: it is dropped from the plan (and its
-   CVEs are still verified after the install). If every package is already at its target the
-   execution ends as **ALREADY PATCHED** without touching the server. `sudo -n true` must
-   work (no password prompt, ever).
-2. **Download** each approved `.deb` once from its recorded URI into the local staging
-   directory as `<file>.part`; it is renamed only after size and SHA256 match the plan.
-3. **Transfer** with `scp` to `/tmp/<server name>` on the server and verify size + `sha256sum`.
-   A failed copy is retried once; the exit code and stderr of every attempt are shown on the
-   execution page. If the retry fails too, local and remote staging are cleaned up.
-4. **Simulate** `apt-get -s install <explicit .deb paths>`; the simulation must install exactly
-   the approved packages/versions from the staged files, with no removal or downgrade.
-5. **Install** `sudo -n apt-get install -y <explicit .deb paths>`. APT runs with **no remote
-   sources** (`Dir::Etc::SourceList=/dev/null`, `Dir::Etc::SourceParts=/dev/null`), so it
-   cannot download anything or pull in other updates, plus `--no-remove`,
-   `DEBIAN_FRONTEND=noninteractive` and `NEEDRESTART_MODE=l`.
-6. **Verify** installed versions (Debian version comparison), `dpkg --audit`, each CVE against
-   Canonical's fixed version, and `/run/reboot-required`.
-7. **Clean up** local and remote staging (only after success and after history is saved).
-8. **Reboot** (only after a verified patch): if `/run/reboot-required` exists on the server
-   *now* and **Skip reboot** (a checkbox on the confirmation page, unchecked by default) was not
-   checked, run `sudo -n reboot`, wait up to 10 minutes for SSH to answer with a new boot id,
-   and record the post-reboot uptime and kernel. The reboot status (*Skipped*, *Not required*,
-   *Rebooting*, *Rebooted*, *REBOOT FAILED*, *Not run* after a failed patch) is stored in the
-   history; the patch result itself is not changed by the reboot.
-
-On any other failure the staging files are kept and their paths shown; a new analysis is required
-before trying again. A failed or interrupted install is never retried or rolled back; if the
-connection drops, the server is inspected once more and the result is either proven or
-recorded as *EXECUTION STATE UNKNOWN*. Each approved report can be executed once, and only
-if it is the latest analysis for that server.
-
-**Local Patch Download Directory** (Settings) defaults to `/tmp/${server_name}`. The template
-must contain `${server_name}` and resolve to an absolute path (`~` is expanded); system
-directories, `/tmp` itself and `..` are refused. Existing directories are only reused when
-empty or when they hold EC2Patcher's own files; cleanup deletes only the files it staged.
-
-### Patch All
-
-The analysis run page has a **Patch All** button with a **Skip reboot** checkbox (unchecked by
-default). It opens one confirmation page listing the eligible servers in queue order and the
-servers that are **SKIPPED** with their reasons (unresolved plan, Canonical metadata
-unavailable, nothing to install, …). A server that was analyzed again after this run is
-patched from its **latest** analysis (linked on the confirmation page). After confirming, the servers are patched
-**one at a time** with the per-server pipeline above (including the reboot step). The queue
-**stops at the first failure** (a failed/unknown patch or a failed reboot); the remaining
-servers are shown as **NOT RUN**. A cleanup warning does not stop the queue.
-
-**History** lists every decision and execution with before/target/after versions, CVE
-verification, reboot state and reboot result, cleanup result and errors.
-
-### CVE report format
+On **Reports**, choosing or dropping a `.json` file uploads it immediately (no extra click; a
+plain *Upload Report* button is shown without JavaScript). Max 1 MiB; structural validation
+only. The latest accepted report is kept; a failed upload does not replace it.
 
 ```json
 {
@@ -240,120 +57,182 @@ verification, reboot state and reboot result, cleanup result and errors.
 }
 ```
 
-Each key must exactly match the name of a configured server; an unknown server rejects the
-whole report. Each value must be a JSON array of strings that look like `CVE-YYYY-NNNN...`.
-Case doesn't matter on input. IDs are normalized to uppercase and de-duplicated.
+Each key must be a configured server name (an unknown server rejects the whole report); each
+value is an array of `CVE-YYYY-NNNN…` strings (case-insensitive, normalized and de-duplicated).
 
-## Requirements
+### Analysis (read-only)
+
+**Analyze Report** starts a background run; the run page refreshes itself and shows each
+server as *Waiting*, *Analyzing*, *Complete* or *Failed* (with the reason). Servers are
+analyzed one after another; one failure never affects the others.
+
+- **On the server**: one fixed read-only command as `ubuntu`, **without sudo**: hostname,
+  `/etc/os-release`, architecture, running kernel, `/run/reboot-required(.pkgs)`,
+  `dpkg-query` (binary → source package and versions) and `dpkg --audit`. Nothing is
+  downloaded, copied, installed or restarted.
+- **On the workstation**: APT candidates and the `.deb` plan are resolved against a private
+  APT state per release and architecture (`<data dir>/apt/<codename>-<arch>/`, pockets
+  `<codename>`, `-updates`, `-security`). Every `apt-get` / `apt-cache` call overrides
+  `Dir::State`, `Dir::Cache` and `Dir::Etc`, so the workstation's own APT is never used or
+  changed. `apt-get -s` and `--print-uris` give exact versions, URIs, sizes and SHA256 without
+  downloading anything.
+- **Canonical** (`https://ubuntu.com/security/cves/<CVE>.json`) decides applicability, fixed
+  version and status, per source package and Ubuntu release, with Debian version comparison.
+  Kernel CVEs are checked against the *running* kernel.
+- **NVD** (CVE API 2.0) supplies only the CVSS **Severity** (Critical/High/Medium/Low/Unknown)
+  and score; it never changes a finding's status or plan. Canonical's priority is shown as
+  **Ubuntu Priority**.
+- A server with unconfigured/half-installed packages (`dpkg --audit`) gets a blocker
+  ("run sudo dpkg --configure -a") instead of a plan. Packages already at or above their
+  target version are never planned (shown as an "already at target" warning).
+- Findings are grouped into **Action required**, **Investigate** and **No action**. Anything
+  that cannot be decided is shown as such, never as safe.
+- Every run is stored as a snapshot (report, server facts, findings, plan); older runs stay
+  viewable. **Export to Excel** builds an `.xlsx` (Summary, CVE Findings, Package Plan) from
+  that snapshot only, without any network or SSH access.
+
+**Re-analyze and Retry**
+
+- **Retry failed lookups** (run page): re-runs only the Canonical lookups that failed in that
+  run.
+- **Retry these CVEs** (server report, Investigate bucket): fetches those CVEs again and
+  re-analyzes the server.
+- **Re-analyze** (server report): analyzes the server again, fetching all of its CVEs from
+  Canonical again.
+
+### Patching one server
+
+Each server report has **Reject** and **Approve & Patch** (after a confirmation page with a
+**Skip reboot** checkbox, unchecked by default). Only the latest analysis of a server can be
+executed, and each approved analysis only once. The pipeline stops at the first failing step:
+
+1. **Revalidate** hostname, release, architecture and installed versions against the analysis
+   (drift → *PATCH ABORTED — SERVER STATE CHANGED*); check `sudo -n true`. Packages already
+   at target are dropped; if nothing is left the result is **ALREADY PATCHED**.
+2. **Download** each approved `.deb` from its recorded URI; keep it only if size and SHA256
+   match the plan.
+3. **Transfer** with `scp` to `/tmp/<server name>` and verify size + `sha256sum` (one retry).
+4. **Simulate** `apt-get -s install <explicit .deb paths>`: must install exactly the approved
+   packages/versions, with no removal or downgrade.
+5. **Install** `sudo -n apt-get install -y <explicit .deb paths>` with no remote APT sources,
+   `--no-remove`, `DEBIAN_FRONTEND=noninteractive`, `NEEDRESTART_MODE=l`.
+6. **Verify** installed versions, `dpkg --audit`, each CVE against Canonical's fixed version,
+   and `/run/reboot-required`.
+7. **Clean up** local and remote staging.
+8. **Reboot**, only after a verified patch, only if `/run/reboot-required` exists and **Skip
+   reboot** is unchecked: `sudo -n reboot`, wait up to 10 minutes for a new boot id, record
+   uptime and kernel. The reboot result is recorded separately from the patch result.
+
+A failed or interrupted install is never retried or rolled back; if the connection drops the
+server is inspected once more and the result is proven or recorded as *EXECUTION STATE
+UNKNOWN*. A new analysis is required before trying again.
+
+### Patch All
+
+The analysis run page has **Patch All** with a **Skip reboot** checkbox. The confirmation page
+lists the eligible servers in order and the **SKIPPED** ones with their reasons. A server
+analyzed again after this run is patched from its latest analysis. Servers are patched **one
+at a time** with the pipeline above; the queue **stops at the first failure** and the rest are
+shown as **NOT RUN**. Only one patch execution or queue runs at a time.
+
+### Settings
+
+- **Local Patch Download Directory**: template, default `/tmp/${server_name}`; must contain
+  `${server_name}` and resolve to a safe absolute path.
+- **Security Data**: Canonical and NVD cache details. **Clear Security Cache** empties the
+  in-memory lookup state and both caches (Canonical `cve_metadata_cache`, NVD `nvd_cache`), so
+  the next analysis queries Canonical and NVD again.
+- **Reset Database**: type `RESET` to remove all stored data (refused while an analysis or
+  patch is running).
+
+### Caching and NVD API key
+
+Both caches live in the application SQLite database; failed lookups are never cached and a
+cache error never fails a lookup.
+
+- **Canonical** (`cve_metadata_cache`): reused for 24 h (1 h while a release is under
+  investigation); older entries are refreshed and used as a marked fallback when ubuntu.com is
+  unreachable.
+- **NVD** (`nvd_cache`): raw CVSS metrics per CVE, reused for **30 days**; older entries are
+  refreshed and used as a *stale cache* fallback when NVD is unreachable. Without any data the
+  severity is **Unknown**. (The old on-disk NVD cache under `~/.cache/ec2patcher/nvd/` is no
+  longer read or written and can be deleted.)
+
+NVD requests are spaced 6 s apart (public limit). With an API key they are spaced 0.6 s apart.
+Provide the key **only through the environment**, never in a file in this repository:
+
+```bash
+export NVD_API_KEY=...   # your own key; it is sent only in the apiKey request header
+```
+
+The key is never stored, logged or exported.
+
+## Requirements (workstation)
 
 - Python 3.10+
-- OpenSSH client (`ssh`) on `PATH` (for SSH tests and analysis)
-- APT (`apt-get`, `apt-cache`) and the Ubuntu archive keyring
-  (`/usr/share/keyrings/ubuntu-archive-keyring.gpg`) on the workstation, plus internet access
-  to `archive.ubuntu.com` / `security.ubuntu.com` (or `ports.ubuntu.com` for arm64), for local
-  APT resolution
-- Internet access to `ubuntu.com` for per-CVE Canonical security metadata and to
-  `services.nvd.nist.gov` for CVSS severity (optional: without it severities are Unknown)
+- OpenSSH client (`ssh`, `scp`) on `PATH`
+- APT (`apt-get`, `apt-cache`) and `/usr/share/keyrings/ubuntu-archive-keyring.gpg`
+- Internet access to the Ubuntu archive (`archive.ubuntu.com` / `security.ubuntu.com`, or
+  `ports.ubuntu.com` for arm64), `ubuntu.com` and `services.nvd.nist.gov` (optional: without it
+  severities are Unknown). `HTTPS_PROXY` / `NO_PROXY` are honoured.
 
 ## Install
 
 ```bash
-cd /data/projects/EC2Patcher
-python3 -m venv .venv            # or: uv venv .venv
-.venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"     # or without [dev] if you don't run tests
 ```
 
 ## Run
 
 ```bash
-.venv/bin/ec2patcher             # or: .venv/bin/python -m ec2patcher
+.venv/bin/ec2patcher                  # or: .venv/bin/python -m ec2patcher
 ```
 
-Then open <http://127.0.0.1:8080/>. If a desktop session is available, a browser opens automatically.
-
-Options:
+Open <http://127.0.0.1:8080/> (a browser opens automatically when a desktop session is
+available). Stop with **Shutdown App** in the sidebar or Ctrl+C.
 
 | Option | Default | Description |
 |---|---|---|
-| `--host` | `127.0.0.1` | Bind address (localhost only by default; there is no authentication) |
+| `--host` | `127.0.0.1` | Bind address (no authentication: keep it local) |
 | `--port` | `8080` | Port |
-| `--data-dir` | per-user data dir | Where the database and log live (also `$EC2PATCHER_DATA_DIR`) |
-| `--apt-state-dir` | `<data dir>/apt` | Private APT state for local resolution (also `$EC2PATCHER_APT_STATE_DIR`) |
-| `--apt-max-age-hours` | `6` | Refresh the private APT lists when older than this; `0` = every run (also `$EC2PATCHER_APT_MAX_AGE_HOURS`) |
+| `--data-dir` | per-user data dir | Database and log location (also `$EC2PATCHER_DATA_DIR`) |
+| `--apt-state-dir` | `<data dir>/apt` | Private APT state (also `$EC2PATCHER_APT_STATE_DIR`) |
+| `--apt-max-age-hours` | `6` | Refresh the private APT lists when older; `0` = every run (also `$EC2PATCHER_APT_MAX_AGE_HOURS`) |
 | `--no-browser` | off | Do not open a browser |
 
-Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
+Other environment variables: `NVD_API_KEY`, `EC2PATCHER_CANONICAL_TIMEOUT_SECONDS` (20),
+`EC2PATCHER_CANONICAL_CACHE_TTL_HOURS` (24), `EC2PATCHER_CANONICAL_BREAKER_THRESHOLD` (3).
 
-## Data location
+## Data location (Linux defaults)
 
-| File | Default path (Linux) |
+| What | Path |
 |---|---|
-| SQLite database | `~/.local/share/ec2patcher/ec2patcher.db` |
+| SQLite database (incl. Canonical and NVD caches) | `~/.local/share/ec2patcher/ec2patcher.db` |
 | Log file | `~/.local/share/ec2patcher/ec2patcher.log` |
-| NVD CVSS cache | `~/.cache/ec2patcher/nvd/` |
 | Private APT state | `~/.local/share/ec2patcher/apt/<codename>-<arch>/` |
 
-Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
-user data directory. The schema is created and migrated automatically on startup. A database
-created by an earlier phase is upgraded in place (Phase 1.5 adds `server_tags`, Phase 2 adds the
-analysis tables, Phase 2.2 adds the CVSS columns, Phase 3 adds settings and patch history, then
-reboot results and Patch All queues);
-existing servers, tags and reports are kept.
+The schema is created and migrated automatically on startup (`PRAGMA user_version`); existing
+data is kept. Run one EC2Patcher process per database.
 
 ## Test and lint
 
 ```bash
-.venv/bin/pytest
-.venv/bin/ruff check . && .venv/bin/ruff format --check .
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
 ```
 
-The tests mock `ssh`, `scp`, package downloads, NVD and the local `apt-get` / `apt-cache`
-backend, and use fixture Canonical VEX data, NVD API responses and captured APT output, so they
-never need a real EC2 server, a real PEM, internet access or package installs. Patch execution
-runs against a scripted fake server.
-
-## Project layout
-
-```
-src/ec2patcher/
-  main.py            CLI entry point (argparse + uvicorn, shutdown hook)
-  app.py             FastAPI app and all routes
-  config.py          data directory / defaults
-  database.py        SQLite schema, migrations, server + tag + report storage
-  models.py          Server / Tag / StoredReport dataclasses
-  validation.py      server name / IP / PEM path / tag validation
-  services/
-    ssh_service.py        SSH connectivity test + read-only remote commands (no shell)
-    report_service.py     CVE report structural validation
-    security_metadata.py  Canonical Security JSON API lookups and in-process memo
-    server_state.py       remote facts + dpkg inventory (binary -> source mapping)
-    debversion.py         Debian version comparison (dpkg semantics)
-    cve_resolver.py       CVE status, APT candidate check, package plan, reboot expectation
-    nvd.py                NVD CVE API 2.0 client + cache, CVSS selection (severity only)
-    apt_planner.py        apt-cache / apt-get -s / --print-uris arguments and parsers
-    local_apt.py          private per-release APT state on the workstation (update, queries)
-    analysis_service.py   background analysis runs, persistence
-    patch_service.py      Phase 3 approval/rejection, eligibility, execution pipeline
-    patch_state.py        execution states and allowed transitions
-    patch_remote.py       patch-time remote commands (staging, simulate, install, verify)
-    downloader.py         approved .deb download + size/SHA256 verification
-    staging.py            local/remote staging path rules and safe cleanup
-  templates/         Jinja2 templates
-  static/            CSS + a small amount of vanilla JS
-tests/               pytest suite
-```
+The tests mock `ssh`, `scp`, downloads, Canonical, NVD and the local APT backend; they never
+need a real server, PEM key, internet access or package installs.
 
 ## Security notes
 
-- The app binds to `127.0.0.1` by default and rejects requests whose `Host` header isn't local.
-  It also rejects cross-site POSTs, which guards against CSRF and DNS-rebinding attacks from
-  websites open in your browser.
-- The app never reads PEM contents. Subprocesses never use `shell=True`.
-- The remote analysis command is a fixed string. Local APT commands are argument lists; package
-  names and versions are validated against strict patterns. Analysis uses no `sudo`, no
-  downloads, no installs.
-- Patch commands only use validated `/tmp/<server>` paths and APT archive file names, and
-  `sudo -n` (non-interactive). Only one patch execution (or Patch All queue) runs at a
-  time. `sudo -n reboot` only when `/run/reboot-required` exists and Skip reboot is unchecked;
-  no `apt upgrade`/`dist-upgrade`, no rollback. PEM paths and key material are never logged.
-- Unexpected errors show a generic message in the GUI; details go to the log.
+- Binds to `127.0.0.1` by default; requests with a non-local `Host` header and cross-site POSTs
+  are rejected (CSRF / DNS rebinding).
+- Subprocesses never use `shell=True`; the remote analysis command is fixed; package names,
+  versions and paths are validated against strict patterns.
+- Analysis uses no sudo and changes nothing. Patching uses `sudo -n` only for the sudo check,
+  the `apt-get` simulation/install of the explicit `.deb` files and the optional reboot.
+- PEM contents are never read; the NVD API key is never stored or logged. Unexpected errors
+  show a generic message in the GUI; details go to the log.
