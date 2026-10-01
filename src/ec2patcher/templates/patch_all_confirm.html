@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Confirm Patch All - Analysis #{{ run.id }}{% endblock %}
+{% block heading %}Patch All: Analysis #{{ run.id }}{% endblock %}
+{% block content %}
+<div class="card confirm-card">
+  <div class="alert alert-error"><strong>This action will modify installed packages on {{ eligible|length }} server{{ "" if eligible|length == 1 else "s" }}{% if not skip_reboot %} and reboot the ones that require it{% endif %}.</strong></div>
+  <p>The servers below are patched <strong>one at a time, in this order</strong>. Each server is revalidated, simulated, installed, verified and cleaned up exactly like a single-server patch. <strong>The queue stops at the first failure</strong>; the remaining servers are not run.</p>
+
+  <h3>Servers to patch ({{ eligible|length }})</h3>
+  {% if eligible %}
+  <div class="table-scroll">
+  <table class="table small patch-all-eligible">
+    <thead><tr><th>#</th><th>Server</th><th>Display Name</th><th>IP</th><th>Packages</th><th>Download</th><th>Expected Reboot</th></tr></thead>
+    <tbody>
+      {% for a, c in eligible %}
+      <tr><td class="num">{{ loop.index }}</td><td><strong>{{ a.server_name }}</strong>{% if c.superseded %}<div class="muted small latest-analysis">Patched from its <a href="/analysis/{{ a.run_id }}/servers/{{ a.id }}">latest analysis #{{ a.run_id }}</a> (this run's report is older).</div>{% endif %}{% if c.excluded_warning %}<div class="muted small excluded-warning">{{ c.excluded_warning }}</div>{% endif %}</td><td>{{ a.display_name or "-" }}</td>
+          <td><code>{{ a.ip_address }}</code></td><td>{{ c.packages }}</td><td>{{ c.download_bytes|filesize }}</td>
+          <td>{% if a.expected_reboot %}YES EXPECTED{% else %}NO{% endif %}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">No server of this analysis is eligible for patching.</p>
+  {% endif %}
+
+  {% if skipped %}
+  <h3>Skipped &mdash; not eligible ({{ skipped|length }})</h3>
+  <div class="table-scroll">
+  <table class="table small patch-all-skipped">
+    <thead><tr><th>Server</th><th>Status</th><th>Reason</th></tr></thead>
+    <tbody>
+      {% for a, c in skipped %}
+      <tr class="row-warning"><td><strong>{{ a.server_name }}</strong>{% if a.display_name %} <span class="muted">&middot; {{ a.display_name }}</span>{% endif %}</td>
+          <td><span class="badge badge-neutral">SKIPPED</span></td>
+          <td>{% if c.superseded %}Latest analysis <a href="/analysis/{{ a.run_id }}/servers/{{ a.id }}">#{{ a.run_id }}</a>: {% endif %}{{ c.reasons|join(" ") }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  <form method="post" action="/analysis/{{ run.id }}/patch-all" class="form-actions">
+    <input type="hidden" name="confirm" value="yes">
+    {% for a, c in eligible %}<input type="hidden" name="analysis_id" value="{{ a.id }}">{% endfor %}
+    <label class="check-label"><input type="checkbox" name="skip_reboot" value="1"{% if skip_reboot %} checked{% endif %}> Skip reboot</label>
+    <a href="/analysis/{{ run.id }}" class="btn btn-secondary">Cancel</a>
+    {% if eligible %}<button type="submit" class="btn btn-danger" data-once>Patch {{ eligible|length }} Server{{ "" if eligible|length == 1 else "s" }}</button>{% endif %}
+  </form>
+  <p class="muted small">Reboot: after a server is patched and cleaned up it is rebooted with <code>sudo reboot</code> only if <code>/run/reboot-required</code> exists on it and Skip reboot is unchecked; EC2Patcher then waits up to 10 minutes for SSH to come back before continuing. A reboot that does not come back stops the queue.</p>
+</div>
+{% endblock %}

@@ -6,8 +6,10 @@ A small, local, single-user web GUI for recurring security patching of Ubuntu EC
 (with user-defined server tags), SSH connectivity testing, uploading/validating the
 security team's CVE report, a **read-only pre-patch analysis** that produces a per-server
 report (with NVD CVSS severity and Excel export) and an exact package / .deb plan, and
-**per-server patch execution** of an approved plan with verification and patch history.
-EC2Patcher never reboots a server and never runs `apt upgrade` / `dist-upgrade`.
+**per-server patch execution** of an approved plan with verification and patch history, and
+**Patch All** (the eligible servers of one analysis, sequentially). After a verified patch a
+server is rebooted only if `/run/reboot-required` exists on it and *Skip reboot* is unchecked.
+EC2Patcher never runs `apt upgrade` / `dist-upgrade`.
 
 ## Features (Phase 1 + 1.5)
 
@@ -54,7 +56,12 @@ the same SSH connection settings as the SSH test (`ubuntu@<ip>` with the configu
 unprivileged `ubuntu` user, **without sudo**. It collects the facts: hostname,
 `/etc/os-release`, `dpkg --print-architecture`, `uname -r`, `/run/reboot-required(.pkgs)`,
 which installed maintainer scripts request a reboot, and `dpkg-query` (binary package, version,
-**source package**, source version, architecture and dependency fields).
+**source package**, source version, architecture and dependency fields) and `dpkg --audit`.
+If `dpkg --audit` reports half-installed or unconfigured packages, the server gets a blocker
+("Server has unconfigured packages: run sudo dpkg --configure -a") instead of a plan. A
+package whose installed version is already at or above its target version is never planned:
+it is excluded with an "already at target" warning and the rest is patched. A server is only
+refused when nothing is left to install.
 
 The server is never asked for APT candidates or plans. Those are resolved **on the
 workstation** against a private APT state per Ubuntu release and architecture
@@ -129,6 +136,11 @@ the Reports page). A run keeps a snapshot of the report, the server name, IP and
 tag, and all remote facts, so later edits don't change historical results. Report keys are
 always matched against the canonical server **name**; `display_name` is shown but never used
 for matching. If the app is stopped during an analysis, the run is marked *interrupted*.
+"Running" always means a live worker thread in this process, never a stored status: at
+startup, and whenever a page finds no live worker, leftover running analyses, patch
+executions and Patch All queues are recorded as *interrupted*, so Analyze / Approve /
+Patch All are never left disabled after a crash or restart. (Run one EC2Patcher process per
+database.)
 
 **Severity (Phase 2.2).** Each CVE finding shows a **Severity** (Critical / High / Medium /
 Low / Unknown) and a compact **CVSS** value (e.g. `8.8 (v3.1)`) taken from the official
@@ -161,16 +173,22 @@ snapshot only; exporting never runs ssh, APT, NVD or metadata downloads.
 ## Patch execution (Phase 3)
 
 Each server report has a **Patch Decision** area with **Reject** and **Approve & Patch**
-(one server at a time; there is no bulk patching). Rejecting only records the decision.
+(one server at a time; see *Patch All* below for a whole analysis). Rejecting only records
+the decision.
 Approving (after a confirmation page) runs this pipeline; every step must pass:
 
 1. **Revalidate**: reconnect and compare hostname, Ubuntu version/codename, architecture and
    the installed version of every planned package with the analysis. Any drift aborts with
-   *PATCH ABORTED — SERVER STATE CHANGED* before anything is downloaded. `sudo -n true` must
+   *PATCH ABORTED — SERVER STATE CHANGED* before anything is downloaded. A package that is
+   already installed at (or above) its target version is not drift: it is dropped from the plan (and its
+   CVEs are still verified after the install). If every package is already at its target the
+   execution ends as **ALREADY PATCHED** without touching the server. `sudo -n true` must
    work (no password prompt, ever).
 2. **Download** each approved `.deb` once from its recorded URI into the local staging
    directory as `<file>.part`; it is renamed only after size and SHA256 match the plan.
 3. **Transfer** with `scp` to `/tmp/<server name>` on the server and verify size + `sha256sum`.
+   A failed copy is retried once; the exit code and stderr of every attempt are shown on the
+   execution page. If the retry fails too, local and remote staging are cleaned up.
 4. **Simulate** `apt-get -s install <explicit .deb paths>`; the simulation must install exactly
    the approved packages/versions from the staged files, with no removal or downgrade.
 5. **Install** `sudo -n apt-get install -y <explicit .deb paths>`. APT runs with **no remote
@@ -178,10 +196,16 @@ Approving (after a confirmation page) runs this pipeline; every step must pass:
    cannot download anything or pull in other updates, plus `--no-remove`,
    `DEBIAN_FRONTEND=noninteractive` and `NEEDRESTART_MODE=l`.
 6. **Verify** installed versions (Debian version comparison), `dpkg --audit`, each CVE against
-   Canonical's fixed version, and `/run/reboot-required` (reported, never acted on).
+   Canonical's fixed version, and `/run/reboot-required`.
 7. **Clean up** local and remote staging (only after success and after history is saved).
+8. **Reboot** (only after a verified patch): if `/run/reboot-required` exists on the server
+   *now* and **Skip reboot** (a checkbox on the confirmation page, unchecked by default) was not
+   checked, run `sudo -n reboot`, wait up to 10 minutes for SSH to answer with a new boot id,
+   and record the post-reboot uptime and kernel. The reboot status (*Skipped*, *Not required*,
+   *Rebooting*, *Rebooted*, *REBOOT FAILED*, *Not run* after a failed patch) is stored in the
+   history; the patch result itself is not changed by the reboot.
 
-On any failure the staging files are kept and their paths shown; a new analysis is required
+On any other failure the staging files are kept and their paths shown; a new analysis is required
 before trying again. A failed or interrupted install is never retried or rolled back; if the
 connection drops, the server is inspected once more and the result is either proven or
 recorded as *EXECUTION STATE UNKNOWN*. Each approved report can be executed once, and only
@@ -192,8 +216,19 @@ must contain `${server_name}` and resolve to an absolute path (`~` is expanded);
 directories, `/tmp` itself and `..` are refused. Existing directories are only reused when
 empty or when they hold EC2Patcher's own files; cleanup deletes only the files it staged.
 
+### Patch All
+
+The analysis run page has a **Patch All** button with a **Skip reboot** checkbox (unchecked by
+default). It opens one confirmation page listing the eligible servers in queue order and the
+servers that are **SKIPPED** with their reasons (unresolved plan, Canonical metadata
+unavailable, nothing to install, …). A server that was analyzed again after this run is
+patched from its **latest** analysis (linked on the confirmation page). After confirming, the servers are patched
+**one at a time** with the per-server pipeline above (including the reboot step). The queue
+**stops at the first failure** (a failed/unknown patch or a failed reboot); the remaining
+servers are shown as **NOT RUN**. A cleanup warning does not stop the queue.
+
 **History** lists every decision and execution with before/target/after versions, CVE
-verification, reboot state, cleanup result and errors.
+verification, reboot state and reboot result, cleanup result and errors.
 
 ### CVE report format
 
@@ -260,7 +295,8 @@ Stop the app with **Shutdown App** in the sidebar, or with Ctrl+C.
 Other platforms use the equivalent [platformdirs](https://pypi.org/project/platformdirs/)
 user data directory. The schema is created and migrated automatically on startup. A database
 created by an earlier phase is upgraded in place (Phase 1.5 adds `server_tags`, Phase 2 adds the
-analysis tables, Phase 2.2 adds the CVSS columns, Phase 3 adds settings and patch history);
+analysis tables, Phase 2.2 adds the CVSS columns, Phase 3 adds settings and patch history, then
+reboot results and Patch All queues);
 existing servers, tags and reports are kept.
 
 ## Test and lint
@@ -316,6 +352,7 @@ tests/               pytest suite
   names and versions are validated against strict patterns. Analysis uses no `sudo`, no
   downloads, no installs.
 - Patch commands only use validated `/tmp/<server>` paths and APT archive file names, and
-  `sudo -n` (non-interactive). Only one patch execution runs at a time. No reboot, no
-  `apt upgrade`/`dist-upgrade`, no rollback. PEM paths and key material are never logged.
+  `sudo -n` (non-interactive). Only one patch execution (or Patch All queue) runs at a
+  time. `sudo -n reboot` only when `/run/reboot-required` exists and Skip reboot is unchecked;
+  no `apt upgrade`/`dist-upgrade`, no rollback. PEM paths and key material are never logged.
 - Unexpected errors show a generic message in the GUI; details go to the log.

@@ -409,6 +409,7 @@ def apply_candidates(
     release and architecture (see local_apt), so a candidate older than Canonical's fix means
     the fix is genuinely not published in <release>, -updates or -security."""
     requests: dict[str, str] = {}
+    installed = facts.by_name()
     archive = f"{facts.codename}, {facts.codename}-updates, {facts.codename}-security"
     for f in findings:
         if not needs_candidate_check(f):
@@ -423,6 +424,7 @@ def apply_candidates(
         wanted = kernel_meta_version(f.fixed_version) if f.is_kernel else f.fixed_version
         ok: dict[str, str] = {}
         problems: list[str] = []
+        at_target: list[str] = []
         for name in names:
             cand = candidates.get(name)
             if cand and cand.candidate:
@@ -440,7 +442,11 @@ def apply_candidates(
             except debversion.InvalidVersionError:
                 good = False
             if good:
-                if cand.candidate != cand.installed:
+                pkg = installed.get(name) or installed.get(name.split(":", 1)[0])
+                current = pkg.version if pkg else cand.installed  # the server's dpkg decides
+                if at_or_above_target(current, cand.candidate):
+                    at_target.append(f"{name} {current}")
+                else:
                     ok[name] = cand.candidate
             else:
                 problems.append(f"{name}: APT candidate {cand.candidate} is older than {wanted}")
@@ -460,8 +466,14 @@ def apply_candidates(
             f.status = PATCH_AVAILABLE
             f.detail = f"The Ubuntu archive ({archive}) already offers a fixed version."
         if not ok:
-            f.status = ANALYSIS_ERROR
-            f.detail = "APT candidate equals the installed version although a fix is required."
+            # Every binary is already at (or above) a candidate that carries the fix: nothing
+            # to install for this CVE, which must not block the rest of the server's plan.
+            f.status = ALREADY_FIXED
+            f.detail = (
+                "Installed binary package(s) already at or above the fixed APT candidate: "
+                + ", ".join(at_target)
+                + "."
+            )
             continue
         f.status = PATCH_AVAILABLE
         requests.update(ok)
@@ -469,6 +481,40 @@ def apply_candidates(
 
 
 # --- package plan ---------------------------------------------------------------------
+
+
+def same_version(installed: str | None, target: str | None) -> bool:
+    """True if a package installed at ``installed`` is already at ``target`` (Debian
+    comparison, so '0:1.0' equals '1.0')."""
+    if not installed or not target:
+        return False
+    try:
+        return debversion.compare_versions(installed, target) == 0
+    except debversion.InvalidVersionError:
+        return installed == target
+
+
+def at_or_above_target(installed: str | None, target: str | None) -> bool:
+    """True if a package installed at ``installed`` needs no upgrade to ``target`` (equal or
+    newer by Debian comparison). Such a package is excluded from plans, never an error."""
+    if not installed or not target:
+        return False
+    try:
+        return debversion.compare_versions(installed, target) >= 0
+    except debversion.InvalidVersionError:
+        return installed == target
+
+
+def already_at_target(download: DownloadPlan) -> list[str]:
+    """Packages APT listed whose installed version is at or above the target (excluded from
+    plans)."""
+    return sorted(
+        {
+            f"{d.package.split(':', 1)[0]} {d.target_version}"
+            for d in download.packages
+            if at_or_above_target(d.current_version, d.target_version)
+        }
+    )
 
 
 def reboot_impact(package: str, requests_reboot: bool) -> str | None:
@@ -502,6 +548,8 @@ def build_plan(
 
     entries: dict[tuple[str, str], PlanEntry] = {}
     for deb in download.packages:
+        if at_or_above_target(deb.current_version, deb.target_version):
+            continue  # nothing to upgrade: never planned (see already_at_target)
         base = deb.package.split(":", 1)[0]
         inst = installed.get(deb.package) or installed.get(base)
         source = inst.source if inst else None

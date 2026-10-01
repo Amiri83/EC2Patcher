@@ -13,6 +13,7 @@ from phase3_fixtures import (
     IP,
     PLAN,
     SERVER,
+    FakeClock,
     FakeFetcher,
     FakeUbuntu,
     analysis_plan_output,
@@ -241,7 +242,11 @@ def web(db_path, tmp_path, fake_apt):
     # Analysis resolves the plan with the workstation's private APT state, so the plan whose
     # URIs/sizes/checksums match FakeFetcher's content must come from the local APT backend.
     fake_apt.plan = analysis_plan_output()
-    state = {"fake": FakeUbuntu(plan_output=analysis_plan_output()), "fetcher": FakeFetcher()}
+    state = {
+        "fake": FakeUbuntu(plan_output=analysis_plan_output()),
+        "fetcher": FakeFetcher(),
+        "clock": FakeClock(),
+    }
 
     def factory():
         meta = make_metadata(tmp_path)
@@ -249,6 +254,7 @@ def web(db_path, tmp_path, fake_apt):
             db_path=db_path, ssh_runner=state["fake"], metadata=meta, analysis_starter=sync,
             patch_starter=sync, patch_fetcher=state["fetcher"], shutdown_handler=lambda: None,
         )  # fmt: skip
+        app.state.patcher.sleep, app.state.patcher.clock = state["clock"].sleep, state["clock"]
         return TestClient(app, base_url="http://127.0.0.1")
 
     factory.state = state
@@ -278,6 +284,8 @@ def test_full_web_flow_real_analysis_then_patch(web, pem_file, tmp_path, monkeyp
 
         confirm = c.get(f"{report_url}/approve").text
         assert "This action will modify installed packages on this server." in confirm
+        # "Skip reboot" is offered and unchecked by default.
+        assert '<input type="checkbox" name="skip_reboot" value="1"> Skip reboot' in confirm
         assert (
             "Billing API" in confirm and IP in confirm and "Approve &amp; Start Patching" in confirm
         )
@@ -301,7 +309,9 @@ def test_full_web_flow_real_analysis_then_patch(web, pem_file, tmp_path, monkeyp
         assert result.count("&#10003;") == 10
         assert "VERIFIED" in result and "4 of 4 CVE check(s) verified" in result
         assert "Reboot Required After Patch" in result and "<strong>YES</strong>" in result
-        assert "EC2Patcher does not reboot servers" in result
+        # Skip reboot was left unchecked and /run/reboot-required existed: rebooted.
+        assert "Rebooted" in result and "up 1 minute" in result and "6.8.0-1024-aws" in result
+        assert web.state["fake"].reboots == 1
         assert "Local and remote staging deleted" in result
         assert '<meta http-equiv="refresh"' not in result
 
@@ -314,7 +324,7 @@ def test_full_web_flow_real_analysis_then_patch(web, pem_file, tmp_path, monkeyp
 
         history = c.get("/history").text
         assert SERVER in history and "Billing API" in history and "6/6" in history
-        assert "4/4 verified" in history
+        assert "4/4 verified" in history and "Rebooted" in history
 
         # A fresh analysis sees the patched versions (Phase 2 remains read-only).
         monkeypatch.undo()

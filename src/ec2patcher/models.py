@@ -205,12 +205,53 @@ class PatchExecution:
     audit_ok: bool | None
     audit_output: str | None
     notes: list[str] = field(default_factory=list)
+    # Post-patch reboot; all None for executions recorded before reboot support.
+    skip_reboot: bool | None = None
+    reboot_status: str | None = None  # see patch_state.REBOOT_*
+    reboot_detail: str | None = None
+    reboot_requested_at: str | None = None
+    reboot_finished_at: str | None = None
+    post_reboot_uptime: str | None = None
+    post_reboot_kernel: str | None = None
+    queue_id: int | None = None  # set when started by "Patch All"
+    # One entry per scp attempt: {filename, attempt, ok, exit_code, stderr, error}.
+    transfer_attempts: list[dict] = field(default_factory=list)
     packages: list[PatchPackageResult] = field(default_factory=list)
     cves: list[PatchCveResult] = field(default_factory=list)
 
     @property
     def cves_verified(self) -> int:
         return sum(1 for c in self.cves if c.result == "VERIFIED")
+
+
+@dataclass
+class PatchQueueItem:
+    id: int
+    position: int
+    server_analysis_id: int
+    server_name: str
+    display_name: str | None
+    status: str  # see patch_state.ITEM_*
+    execution_id: int | None
+    detail: str | None
+
+
+@dataclass
+class PatchQueue:
+    """A "Patch All" run: the servers of one analysis run, patched one at a time."""
+
+    id: int
+    analysis_run_id: int
+    created_at: str
+    finished_at: str | None
+    state: str  # see patch_state.QUEUE_*
+    skip_reboot: bool
+    stop_reason: str | None
+    items: list[PatchQueueItem] = field(default_factory=list)
+
+    @property
+    def is_running(self) -> bool:
+        return self.state == "RUNNING"
 
 
 @dataclass

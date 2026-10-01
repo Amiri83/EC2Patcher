@@ -9,22 +9,42 @@ Pipeline (one server, one execution at a time; every step must pass before the n
   -> INSTALLING (apt-get install of the explicit local .debs) -> VERIFYING_INSTALL (versions,
   dpkg --audit, Canonical fixed versions, /run/reboot-required) -> CLEANING_UP -> SUCCESS.
 
-Any failure stops the pipeline, preserves local and remote staging files and records why.
+A package already installed at (or above) its target version is excluded, never an error:
+plan rows recorded that way are not checked or copied, and revalidation drops packages
+patched since the analysis (e.g. by hand). Only when nothing is left to install is the
+server not patched (not eligible, or ALREADY_PATCHED after revalidation).
+
+Each scp copy is retried once; a copy that still fails ends the pipeline after cleaning up
+both staging directories (exit code and stderr of every attempt are kept).
+
+Any other failure stops the pipeline, preserves local and remote staging files and records why.
 After the install may have started nothing is assumed: the outcome is verified on the
-server or recorded as UNKNOWN. There is no rollback, no upgrade/dist-upgrade and no reboot.
+server or recorded as UNKNOWN. There is no rollback and no upgrade/dist-upgrade.
 NVD is never contacted here; CVE checks use the Canonical fixed versions stored at analysis.
+
+Reboot (after a verified patch and cleanup; recorded in ``reboot_status``, the execution
+state is not changed): only if /run/reboot-required exists on the server right then and the
+operator did not choose "Skip reboot". ``sudo reboot`` is issued, then SSH is polled until
+the server answers with a new boot id (at most REBOOT_TIMEOUT_SECONDS); the post-reboot
+uptime and kernel are recorded.
+
+"Patch All" runs the same pipeline (plus reboot) for the eligible servers of one analysis
+run, one server at a time, and stops the queue at the first failed server. A server that was
+analyzed again after that run is patched from its latest analysis.
 """
 
 import logging
 import subprocess
 import threading
+import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ec2patcher.database import Database, DecisionExistsError, ExecutionActiveError
-from ec2patcher.models import PatchExecution, PatchPackageResult, ServerAnalysis
+from ec2patcher.models import AnalysisRun, PatchExecution, PatchPackageResult, ServerAnalysis
 from ec2patcher.services import (
     apt_planner,
     cve_resolver,
@@ -44,7 +64,13 @@ REVALIDATE_TIMEOUT_SECONDS = 90
 SHORT_TIMEOUT_SECONDS = 60
 SIMULATE_TIMEOUT_SECONDS = 180
 INSTALL_TIMEOUT_SECONDS = 1800
+REBOOT_TIMEOUT_SECONDS = 600  # SSH must be back within 10 minutes of "sudo reboot"
+REBOOT_POLL_SECONDS = 10
+REBOOT_ATTEMPT_TIMEOUT_SECONDS = 30
 MAX_STORED_OUTPUT = 20000
+SCP_ATTEMPTS = 2  # one retry per .deb
+MAX_STORED_SCP_STDERR = 2000
+ALREADY_AT_TARGET = "ALREADY AT TARGET"
 
 SERVER_CHANGED = "PATCH ABORTED — SERVER STATE CHANGED"
 PATCH_FAILED = "PATCH FAILED"
@@ -55,11 +81,14 @@ DRIFT_MESSAGE = (
     "Package state changed since this report was analyzed. Run a new analysis before patching."
 )
 
-Starter = Callable[[Callable[[], None]], None]
+# Runs the job in the background; may return the worker thread so liveness can be checked.
+Starter = Callable[[Callable[[], None]], threading.Thread | None]
 
 
-def thread_starter(target: Callable[[], None]) -> None:
-    threading.Thread(target=target, name="ec2patcher-patch", daemon=True).start()
+def thread_starter(target: Callable[[], None]) -> threading.Thread:
+    worker = threading.Thread(target=target, name="ec2patcher-patch", daemon=True)
+    worker.start()
+    return worker
 
 
 def _now() -> str:
@@ -83,18 +112,42 @@ class PatchAbort(Exception):  # noqa: N818 - control flow, not an error in the c
         package: str | None = None,
         state: str = ps.FAILED,
         partial: bool = False,
+        cleanup: bool = False,  # delete the staging files instead of preserving them
     ):
         super().__init__(message)
         self.title, self.package, self.state, self.partial = title, package, state, partial
+        self.cleanup = cleanup
 
 
 # --- plan validation -----------------------------------------------------------------
 
 
+def at_target(row) -> bool:
+    """A plan row whose recorded installed version is already at or above its target (e.g.
+    stored before the planner excluded such rows): excluded from patching, never an error."""
+    return cve_resolver.at_or_above_target(row.current_version, row.target_version)
+
+
+def installable(analysis: ServerAnalysis) -> list:
+    """The plan rows that still need installing (``at_target`` rows excluded)."""
+    return [p for p in analysis.plan if not at_target(p)]
+
+
+def excluded_warning(analysis: ServerAnalysis) -> str | None:
+    rows = [p for p in analysis.plan if at_target(p)]
+    if not rows:
+        return None
+    names = ", ".join(
+        f"{p.binary_package} (installed {p.current_version}, target {p.target_version})"
+        for p in rows
+    )
+    return f"{len(rows)} package(s) already at target are excluded and not installed: {names}."
+
+
 def unique_debs(analysis: ServerAnalysis) -> dict[str, list]:
     """deb file name -> plan rows using it (a shared .deb is downloaded once)."""
     debs: dict[str, list] = {}
-    for p in analysis.plan:
+    for p in installable(analysis):
         if p.deb_filename:
             debs.setdefault(p.deb_filename, []).append(p)
     return debs
@@ -134,9 +187,15 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
             + ", ".join(unavailable)
             + ". Run a new analysis once the metadata is reachable."
         )
+    rows = installable(analysis)
     if not analysis.plan:
         reasons.append("There are no package updates to install.")
-    for p in analysis.plan:
+    elif not rows:
+        reasons.append(
+            "There are no package updates to install: every planned package is already at "
+            "(or above) its target version."
+        )
+    for p in rows:
         name = p.binary_package
         if p.status != "planned":
             reasons.append(f"{name}: package download plan is unresolved.")
@@ -165,19 +224,12 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
             reasons.append(f"{name}: plan is inconsistent (URI does not point at {expected}).")
         if not p.is_dependency and not p.current_version:
             reasons.append(f"{name}: plan is inconsistent (installed version unknown).")
-        if p.current_version:
-            try:
-                if debversion.compare_versions(p.target_version, p.current_version) <= 0:
-                    reasons.append(
-                        f"{name}: plan is inconsistent (target {p.target_version} is not newer "
-                        f"than installed {p.current_version})."
-                    )
-            except debversion.InvalidVersionError:
-                reasons.append(f"{name}: installed version is invalid.")
-    for filename, rows in unique_debs(analysis).items():
-        if len({(r.uri, r.checksum, r.size) for r in rows}) > 1:
+        if p.current_version and not debversion.is_valid_version(p.current_version):
+            reasons.append(f"{name}: installed version is invalid.")
+    for filename, debs in unique_debs(analysis).items():
+        if len({(r.uri, r.checksum, r.size) for r in debs}) > 1:
             reasons.append(f"{filename}: plan is inconsistent (conflicting URI/checksum/size).")
-    covered = {cve for p in analysis.plan for cve in p.cves}
+    covered = {cve for p in analysis.plan for cve in p.cves}  # at-target rows cover theirs
     for f in analysis.findings:
         if f.status != cve_resolver.PATCH_AVAILABLE:
             continue
@@ -224,6 +276,9 @@ class Eligibility:
     download_bytes: int = 0
     unpatched_notes: list[str] = field(default_factory=list)
     not_checked_warning: str | None = None
+    excluded_warning: str | None = None  # plan rows already at target (not installed)
+    # "Patch All": the run's own (older) analysis this one replaces, if any.
+    superseded: ServerAnalysis | None = None
 
 
 # --- execution context --------------------------------------------------------------
@@ -240,10 +295,17 @@ class _Context:
     packages: list[PatchPackageResult]
     debs: dict[str, dict]  # filename -> {uri, size, sha256, package_ids}
     notes: list[str] = field(default_factory=list)
+    reboot_required: bool = False  # /run/reboot-required seen by the post-install check
+    dropped: list[PatchPackageResult] = field(default_factory=list)  # already at target
+    transfer_attempts: list[dict] = field(default_factory=list)
 
     @property
     def filenames(self) -> list[str]:
         return sorted(self.debs)
+
+
+# Every PatchService of this process: a worker of one counts as live for all on that database.
+_SERVICES: "weakref.WeakSet[PatchService]" = weakref.WeakSet()
 
 
 class PatchService:
@@ -254,18 +316,57 @@ class PatchService:
         starter: Starter = thread_starter,
         fetcher: downloader.Fetcher | None = None,
         analysis_running: Callable[[], bool] = lambda: False,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.db = db
         self.runner = runner
         self.starter = starter
         self.fetcher = fetcher or downloader.urllib_fetcher
         self.analysis_running = analysis_running
-        self._lock = threading.Lock()
+        self.sleep, self.clock = sleep, clock  # reboot wait; replaceable in tests
+        # Re-entrant: approve()/start_queue() hold it while eligibility() reconciles.
+        self._lock = threading.RLock()
         self._running = False
+        self._worker: threading.Thread | None = None
+        _SERVICES.add(self)
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        """True only while a worker of this process is alive. Executions or queues that the
+        database still shows as active without one are stale (see ``reconcile``)."""
+        if not self._running:
+            return False
+        worker = self._worker
+        return not isinstance(worker, threading.Thread) or worker.is_alive()
+
+    def _launch(self, job: Callable[[], None]) -> None:
+        worker = self.starter(job)
+        if isinstance(worker, threading.Thread) and self._running:
+            self._worker = worker
+
+    def _clear_stale(self) -> None:
+        """Caller holds ``self._lock``. With no live worker (in any service of this process
+        using the same database), executions/queues still active in the database were cut
+        short: record them as interrupted so nothing stays locked."""
+        if self.is_running:
+            return
+        self._running, self._worker = False, None
+        if any(s.is_running for s in list(_SERVICES) if s.db.path == self.db.path):
+            return
+        executions = self.db.mark_interrupted_executions()
+        queues = self.db.mark_interrupted_queues()
+        if executions or queues:
+            logger.warning(
+                "No live patch worker: marked %d execution(s) and %d Patch All queue(s) as "
+                "interrupted", executions, queues,
+            )  # fmt: skip
+
+    def reconcile(self) -> None:
+        """Clear a stale 'patch running' state so Approve / Patch All are never left disabled
+        after a crash or restart."""
+        with self._lock:
+            self._clear_stale()
 
     # --- settings ---------------------------------------------------------------------
 
@@ -274,11 +375,15 @@ class PatchService:
 
     # --- eligibility -------------------------------------------------------------------
 
-    def eligibility(self, analysis: ServerAnalysis) -> Eligibility:
+    def eligibility(self, analysis: ServerAnalysis, own_run: bool = False) -> Eligibility:
+        """``own_run``: called by the running "Patch All" queue (its own busy flag is set)."""
+        if not own_run:
+            self.reconcile()  # a dead worker must not leave patching locked
         result = Eligibility(allowed=False)
         result.execution = self.db.get_execution_for_analysis(analysis.id)
         debs = unique_debs(analysis)
-        result.packages, result.debs = len(analysis.plan), len(debs)
+        result.packages, result.debs = len(installable(analysis)), len(debs)
+        result.excluded_warning = excluded_warning(analysis)
         result.download_bytes = sum(rows[0].size or 0 for rows in debs.values())
         not_patchable = (
             cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS,
@@ -317,8 +422,10 @@ class PatchService:
         if self.analysis_running():
             reasons.append("An analysis is currently running. Wait for it to finish.")
         active = self.db.active_execution_id()
-        if active is not None or self._running:
+        if active is not None:
             reasons.append(f"Another patch execution is running (#{active}).")
+        elif self._running and not own_run:
+            reasons.append("Another patch execution is running.")
         result.reasons = list(dict.fromkeys(reasons))
         result.allowed = not result.reasons
         return result
@@ -340,55 +447,73 @@ class PatchService:
         )  # fmt: skip
         return execution_id
 
-    def approve(self, analysis_id: int) -> int:
-        """Record APPROVED (after re-checking eligibility) and start the execution."""
+    def approve(self, analysis_id: int, skip_reboot: bool = True) -> int:
+        """Record APPROVED (after re-checking eligibility) and start the execution.
+
+        ``skip_reboot`` defaults to True so only an explicit operator choice (the unchecked
+        "Skip reboot" box in the web UI) lets EC2Patcher reboot a server.
+        """
         analysis = self.db.get_server_analysis(analysis_id)
         if analysis is None:
             raise PatchNotAllowedError("This analysis no longer exists.")
         with self._lock:
+            self._clear_stale()
             if self._running:
                 raise PatchNotAllowedError("Another patch execution is running.")
-            check = self.eligibility(analysis)
-            if not check.allowed:
-                raise PatchNotAllowedError(" ".join(check.reasons))
-            packages = [
-                {
-                    "binary_package": p.binary_package,
-                    "architecture": p.architecture,
-                    "before_version": p.current_version,
-                    "target_version": p.target_version,
-                    "deb_filename": p.deb_filename,
-                    "size": p.size,
-                    "checksum": p.checksum,
-                    "is_dependency": p.is_dependency,
-                }
-                for p in analysis.plan
-            ]
-            try:
-                execution_id = self.db.create_patch_decision(
-                    analysis, ps.APPROVED, check.local_path, check.remote_path, packages
-                )
-            except DecisionExistsError as exc:
-                raise PatchNotAllowedError(
-                    "A decision was already recorded for this report."
-                ) from exc
-            except ExecutionActiveError as exc:
-                raise PatchNotAllowedError("Another patch execution is running.") from exc
-            self._running = True
-        logger.info(
-            "Patch APPROVED: server=%s analysis=%s execution=%s local=%s remote=%s",
-            analysis.server_name, analysis.id, execution_id, check.local_path, check.remote_path,
-        )  # fmt: skip
+            execution_id = self._record_approval(analysis, skip_reboot)
+            self._running, self._worker = True, None
         try:
-            self.starter(lambda: self._run_safely(execution_id))
+            self._launch(lambda: self._run_safely(execution_id))
         except Exception:
             self._running = False
             self.db.transition_execution(
                 execution_id, ps.APPROVED, ps.FAILED, finished_at=_now(),
                 error_title=PATCH_FAILED, error_summary="Could not start the patch execution.",
                 failure_stage=ps.APPROVED, cleanup_status="NOT_NEEDED",
+                reboot_status=ps.REBOOT_SKIPPED if skip_reboot else ps.REBOOT_NOT_RUN,
             )  # fmt: skip
             raise
+        return execution_id
+
+    def _record_approval(
+        self,
+        analysis: ServerAnalysis,
+        skip_reboot: bool,
+        queue_id: int | None = None,
+        own_run: bool = False,
+    ) -> int:
+        """Re-check eligibility and persist APPROVED (caller holds ``self._lock``)."""
+        check = self.eligibility(analysis, own_run=own_run)
+        if not check.allowed:
+            raise PatchNotAllowedError(" ".join(check.reasons))
+        packages = [
+            {
+                "binary_package": p.binary_package,
+                "architecture": p.architecture,
+                "before_version": p.current_version,
+                "target_version": p.target_version,
+                "deb_filename": p.deb_filename,
+                "size": p.size,
+                "checksum": p.checksum,
+                "is_dependency": p.is_dependency,
+            }
+            for p in analysis.plan
+        ]
+        try:
+            execution_id = self.db.create_patch_decision(
+                analysis, ps.APPROVED, check.local_path, check.remote_path, packages,
+                skip_reboot=skip_reboot, queue_id=queue_id,
+            )  # fmt: skip
+        except DecisionExistsError as exc:
+            raise PatchNotAllowedError("A decision was already recorded for this report.") from exc
+        except ExecutionActiveError as exc:
+            raise PatchNotAllowedError("Another patch execution is running.") from exc
+        logger.info(
+            "Patch APPROVED: server=%s analysis=%s execution=%s local=%s remote=%s "
+            "skip_reboot=%s queue=%s",
+            analysis.server_name, analysis.id, execution_id, check.local_path, check.remote_path,
+            skip_reboot, queue_id,
+        )  # fmt: skip
         return execution_id
 
     def _run_safely(self, execution_id: int) -> None:
@@ -396,8 +521,8 @@ class PatchService:
             self.execute(execution_id)
         except Exception:
             # execute() records every failure itself; this only triggers if the database
-            # is unusable. The execution then stays active until the next startup, where
-            # mark_interrupted_executions() records it as FAILED/UNKNOWN.
+            # is unusable. Once this worker is gone, reconcile() (or the next startup)
+            # records the execution as INTERRUPTED/UNKNOWN.
             logger.exception("Patch execution %s could not record its result", execution_id)
         finally:
             self._running = False
@@ -420,6 +545,18 @@ class PatchService:
             move(ps.REVALIDATING, started_at=_now())
             ctx = self._context(execution)
             self._revalidate(ctx)
+            if not ctx.packages:  # every approved package is already at its target version
+                fields = {}
+                if ctx.execution.reboot_status == ps.REBOOT_PENDING:
+                    fields = {
+                        "reboot_status": ps.REBOOT_NOT_RUN,
+                        "reboot_detail": "Nothing was installed; the server was not rebooted.",
+                    }
+                move(
+                    ps.ALREADY_PATCHED, finished_at=_now(), cleanup_status="NOT_NEEDED",
+                    notes=ctx.notes, **fields,
+                )  # fmt: skip
+                return
             move(ps.DOWNLOADING)
             self._download(ctx)
             move(ps.VERIFYING_DOWNLOADS)
@@ -444,11 +581,11 @@ class PatchService:
             )  # fmt: skip
             logger.info("Patch execution %s (%s) finished: %s", execution_id, name, final)
         except PatchAbort as abort:
-            self._fail(execution_id, state, abort, ctx)
+            final = self._fail(execution_id, state, abort, ctx)
         except Exception as exc:
             logger.exception("Patch execution %s (%s) crashed in %s", execution_id, name, state)
             post_install = state in ps.POST_INSTALL
-            self._fail(
+            final = self._fail(
                 execution_id,
                 state,
                 PatchAbort(
@@ -459,8 +596,11 @@ class PatchService:
                 ),
                 ctx,
             )
+        if final in ps.SUCCESSFUL:  # installation verified (a cleanup error does not matter)
+            self._reboot_safely(ctx)
 
-    def _fail(self, execution_id: int, state: str, abort: PatchAbort, ctx) -> None:
+    def _fail(self, execution_id: int, state: str, abort: PatchAbort, ctx) -> str:
+        """Record the failure; returns the state the execution ended in."""
         execution = self.db.get_execution(execution_id)
         target = abort.state
         if state == ps.CLEANING_UP:
@@ -489,12 +629,22 @@ class PatchService:
                 else None
             ),
         }
+        if abort.cleanup and ctx is not None and target != ps.SUCCESS_WITH_CLEANUP_WARNING:
+            try:
+                warning = self._cleanup(ctx)
+            except Exception as exc:
+                logger.exception("Patch execution %s: cleanup after failure crashed", execution_id)
+                warning = f"Cleanup error: {exc}"
+            fields["cleanup_status"] = "WARNING" if warning else "DELETED"
+            fields["cleanup_detail"] = warning
         if target == ps.SUCCESS_WITH_CLEANUP_WARNING:
             fields = {
                 "finished_at": _now(),
                 "cleanup_status": "WARNING",
                 "cleanup_detail": f"Cleanup error: {abort}",
             }
+        elif execution.reboot_status == ps.REBOOT_PENDING:
+            fields["reboot_status"] = ps.REBOOT_NOT_RUN  # never reboot after a failed patch
         if ctx is not None and ctx.notes:
             fields["notes"] = ctx.notes
         self.db.transition_execution(execution_id, state, target, **fields)
@@ -502,6 +652,7 @@ class PatchService:
             "Patch execution %s (%s): %s -> %s: %s",
             execution_id, execution.server_name, state, target, abort,
         )  # fmt: skip
+        return target
 
     def _context(self, execution: PatchExecution) -> _Context:
         analysis = self.db.get_server_analysis(execution.server_analysis_id)
@@ -519,7 +670,7 @@ class PatchService:
         if execution.remote_staging_path != staging.remote_dir(execution.server_name):
             raise PatchAbort("Unexpected remote staging path.")
         debs: dict[str, dict] = {}
-        for plan in analysis.plan:
+        for plan in installable(analysis):  # at-target rows are dropped at revalidation
             sha = downloader.parse_sha256(plan.checksum)
             if not plan.deb_filename or sha is None or not plan.size:
                 raise PatchAbort(f"{plan.binary_package}: approved plan is incomplete.")
@@ -579,8 +730,13 @@ class PatchService:
         if facts.os_id != "ubuntu":
             drift.append(f"Operating system is not Ubuntu ({facts.os_id or 'unknown'}).")
         installed = {(p.base_name, p.architecture): p.version for p in facts.packages}
+        remaining, dropped = [], []
         for pkg in ctx.packages:
             current = installed.get((pkg.binary_package, pkg.architecture))
+            if cve_resolver.at_or_above_target(current, pkg.target_version):
+                dropped.append((pkg, current))  # already at (or above) target: nothing to do
+                continue
+            remaining.append(pkg)
             if current != pkg.before_version:
                 drift.append(
                     f"{pkg.binary_package} ({pkg.architecture}): installed "
@@ -589,8 +745,49 @@ class PatchService:
                 )
         if drift:
             raise PatchAbort(f"{DRIFT_MESSAGE} " + "; ".join(drift), title=SERVER_CHANGED)
+        if dropped:
+            self._drop_already_installed(ctx, dropped, remaining)
+        if not remaining:
+            logger.info(
+                "Patch execution %s: all %d package(s) already at target; nothing to install",
+                ctx.execution.id, len(dropped),
+            )  # fmt: skip
+            return
         self._check_sudo(ctx)
         logger.info("Patch execution %s: revalidation passed", ctx.execution.id)
+
+    def _drop_already_installed(
+        self,
+        ctx: _Context,
+        dropped: list[tuple[PatchPackageResult, str]],
+        remaining: list[PatchPackageResult],
+    ) -> None:
+        """Take packages already at (or above) their target version out of this execution's
+        plan: a warning, never a failure."""
+        for pkg, current in dropped:
+            detail = "Already installed at the target version at revalidation; not reinstalled."
+            if not cve_resolver.same_version(current, pkg.target_version):
+                detail = (
+                    f"Already installed at {current}, newer than the target version, at "
+                    "revalidation; not reinstalled."
+                )
+            self.db.update_execution_package(
+                pkg.id, after_version=current, install_result=ALREADY_AT_TARGET,
+                verification_result="VERIFIED", detail=detail,
+            )  # fmt: skip
+            pkg.after_version, pkg.verification_result = current, "VERIFIED"
+        ctx.dropped, ctx.packages = [pkg for pkg, _ in dropped], remaining
+        needed = {p.deb_filename for p in remaining}
+        ctx.debs = {name: deb for name, deb in ctx.debs.items() if name in needed}
+        names = ", ".join(f"{p.binary_package} {current}" for p, current in dropped)
+        ctx.notes.append(
+            f"{len(dropped)} package(s) already at the target version (or newer) were dropped "
+            f"from the plan: {names}."
+        )
+        logger.info(
+            "Patch execution %s: dropped %d package(s) already at target: %s",
+            ctx.execution.id, len(dropped), names,
+        )  # fmt: skip
 
     def _download(self, ctx: _Context) -> None:
         try:
@@ -669,18 +866,46 @@ class PatchService:
         if not result.ok or "ok" not in result.stdout.split():
             raise PatchAbort(f"Could not write to {ctx.remote_dir}: {result.error or 'no output'}")
         for filename in ctx.filenames:
-            size = ctx.debs[filename]["size"]
-            timeout = min(3600, 120 + size // (256 * 1024))
-            sent = ssh_service.run_scp(
-                ctx.ip, ctx.pem, [str(ctx.local_dir / filename)], ctx.remote_dir,
-                runner=self.runner, timeout=timeout,
-            )  # fmt: skip
+            sent = self._copy(ctx, filename)
             outcome = "TRANSFERRED" if sent.ok else "FAILED"
             for p in self._packages_with(ctx, filename):
                 self.db.update_execution_package(p.id, transfer_result=outcome)
             if not sent.ok:
-                raise PatchAbort(f"Transfer of {filename} failed: {sent.error}", package=filename)
+                exit_code = "none" if sent.returncode is None else sent.returncode
+                # A partial copy is useless: remove local and remote staging files.
+                raise PatchAbort(
+                    f"Transfer of {filename} failed after {SCP_ATTEMPTS} attempts "
+                    f"(scp exit {exit_code}): {sent.error}",
+                    package=filename, cleanup=True,
+                )  # fmt: skip
             logger.info("Patch execution %s: transferred %s", ctx.execution.id, filename)
+
+    def _copy(self, ctx: _Context, filename: str) -> ssh_service.RemoteResult:
+        """scp one .deb, retrying once; every attempt is recorded on the execution."""
+        timeout = min(3600, 120 + ctx.debs[filename]["size"] // (256 * 1024))
+        for attempt in range(1, SCP_ATTEMPTS + 1):
+            sent = ssh_service.run_scp(
+                ctx.ip, ctx.pem, [str(ctx.local_dir / filename)], ctx.remote_dir,
+                runner=self.runner, timeout=timeout,
+            )  # fmt: skip
+            ctx.transfer_attempts.append(
+                {
+                    "filename": filename,
+                    "attempt": attempt,
+                    "ok": sent.ok,
+                    "exit_code": sent.returncode,
+                    "stderr": _tail(sent.stderr.strip(), MAX_STORED_SCP_STDERR) or None,
+                    "error": sent.error,
+                }
+            )
+            self.db.update_execution(ctx.execution.id, transfer_attempts=ctx.transfer_attempts)
+            if sent.ok:
+                return sent
+            logger.warning(
+                "Patch execution %s: scp of %s failed (attempt %d/%d, exit %s): %s",
+                ctx.execution.id, filename, attempt, SCP_ATTEMPTS, sent.returncode, sent.error,
+            )  # fmt: skip
+        return sent
 
     def _verify_transfer(self, ctx: _Context) -> None:
         command = patch_remote.verify_transfer_command(ctx.remote_dir, ctx.filenames)
@@ -789,7 +1014,9 @@ class PatchService:
         return post
 
     def _query_post(self, ctx: _Context) -> patch_remote.PostInstallState | None:
-        command = patch_remote.post_install_command([p.binary_package for p in ctx.packages])
+        # Dropped packages are queried too: their CVEs are verified like the installed ones.
+        names = [p.binary_package for p in [*ctx.packages, *ctx.dropped]]
+        command = patch_remote.post_install_command(names)
         result = self._remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
         if not result.ok:
             logger.warning("Patch execution %s: state query failed", ctx.execution.id)
@@ -884,6 +1111,7 @@ class PatchService:
                 "Post-install verification failed: " + "; ".join(problems),
                 title=PARTIAL_STATE, partial=True,
             )  # fmt: skip
+        ctx.reboot_required = post.reboot_required
         logger.info(
             "Patch execution %s: installation verified (reboot required: %s)",
             ctx.execution.id, "YES" if post.reboot_required else "NO",
@@ -910,6 +1138,259 @@ class PatchService:
             logger.info("Patch execution %s: staging cleaned up", ctx.execution.id)
         return " ".join(warnings) or None
 
+    # --- reboot (after a verified patch and cleanup) -----------------------------------
+
+    def _reboot_safely(self, ctx: _Context) -> None:
+        try:
+            self._reboot(ctx)
+        except Exception as exc:
+            logger.exception("Patch execution %s: reboot step crashed", ctx.execution.id)
+            self.db.update_execution(
+                ctx.execution.id, reboot_status=ps.REBOOT_FAILED, reboot_finished_at=_now(),
+                reboot_detail=f"Unexpected error in the reboot step: {exc}",
+            )  # fmt: skip
+
+    def _reboot(self, ctx: _Context) -> None:
+        execution_id = ctx.execution.id
+        if ctx.execution.reboot_status == ps.REBOOT_SKIPPED:
+            detail = "Skip reboot was selected."
+            if ctx.reboot_required:
+                detail += (
+                    " The server reports a pending reboot (/run/reboot-required); "
+                    "schedule a reboot yourself."
+                )
+            self.db.update_execution(execution_id, reboot_detail=detail)
+            logger.info("Patch execution %s: reboot skipped by the operator", execution_id)
+            return
+        if ctx.execution.reboot_status != ps.REBOOT_PENDING:
+            return
+
+        def finish(status: str, detail: str, **fields) -> None:
+            self.db.update_execution(
+                execution_id, reboot_status=status, reboot_detail=detail,
+                reboot_finished_at=_now(), **fields,
+            )  # fmt: skip
+            logger.info("Patch execution %s: reboot %s: %s", execution_id, status, detail)
+
+        result = self._remote(ctx, patch_remote.REBOOT_CHECK_COMMAND, SHORT_TIMEOUT_SECONDS)
+        check = patch_remote.parse_reboot_check(result.stdout) if result.ok else None
+        if check is None:
+            finish(
+                ps.REBOOT_FAILED,
+                "Could not check /run/reboot-required: "
+                f"{result.error or 'incomplete output'}. The server was not rebooted.",
+            )
+            return
+        if not check.required:
+            finish(ps.REBOOT_NOT_REQUIRED, "/run/reboot-required does not exist on the server.")
+            return
+        self.db.update_execution(
+            execution_id, reboot_status=ps.REBOOT_REQUESTED, reboot_requested_at=_now(),
+            reboot_detail="sudo reboot issued; waiting for SSH to come back.",
+        )  # fmt: skip
+        logger.info("Patch execution %s: rebooting %s", execution_id, ctx.execution.server_name)
+        result = self._remote(ctx, patch_remote.REBOOT_COMMAND, SHORT_TIMEOUT_SECONDS)
+        refused = patch_remote.parse_reboot_refused(result.stdout)
+        if refused:
+            finish(ps.REBOOT_FAILED, refused + " The server was not rebooted.")
+            return
+        state, same_boot = self._wait_for_reboot(ctx, check.boot_id)
+        if state is None:
+            minutes = REBOOT_TIMEOUT_SECONDS // 60
+            finish(
+                ps.REBOOT_FAILED,
+                f"The server still reported the same boot {minutes} minutes after sudo reboot; "
+                "it did not reboot. Check it manually."
+                if same_boot
+                else f"SSH did not come back within {minutes} minutes after sudo reboot. "
+                "Check the server manually (e.g. the EC2 console).",
+            )
+            return
+        finish(
+            ps.REBOOT_DONE,
+            "Rebooted; SSH is back.",
+            post_reboot_uptime=state.uptime or None,
+            post_reboot_kernel=state.kernel or None,
+        )
+
+    def _wait_for_reboot(
+        self, ctx: _Context, old_boot_id: str
+    ) -> tuple[patch_remote.BootState | None, bool]:
+        """Poll SSH until the server answers with a new boot id or the timeout passes.
+
+        Returns (state or None, whether the last answer still came from the old boot).
+        """
+        deadline = self.clock() + REBOOT_TIMEOUT_SECONDS
+        same_boot = False
+        while True:
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return None, same_boot
+            self.sleep(min(REBOOT_POLL_SECONDS, remaining))
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return None, same_boot
+            timeout = max(1, int(min(REBOOT_ATTEMPT_TIMEOUT_SECONDS, remaining)))
+            result = self._remote(ctx, patch_remote.BOOT_STATE_COMMAND, timeout)
+            state = patch_remote.parse_boot_state(result.stdout) if result.ok else None
+            if state is None:
+                same_boot = False
+                continue
+            if state.boot_id != old_boot_id:
+                return state, False
+            same_boot = True  # still up on the old boot: the reboot has not started yet
+
+    # --- "Patch All" -------------------------------------------------------------------
+
+    def queue_preview(self, run: AnalysisRun) -> list[tuple[ServerAnalysis, Eligibility]]:
+        """Every server of the run in queue order, with its eligibility (read-only).
+
+        A server analyzed again after this run is represented by its latest analysis (the
+        run's own one is kept in ``Eligibility.superseded``).
+        """
+        preview = []
+        for analysis in run.servers:
+            latest = None
+            if self.db.newer_analysis_exists(analysis):
+                latest = self.db.latest_analysis_for_server(analysis.server_name)
+            if latest is None or latest.id == analysis.id:
+                preview.append((analysis, self.eligibility(analysis)))
+                continue
+            check = self.eligibility(latest)
+            check.superseded = analysis
+            preview.append((latest, check))
+        return preview
+
+    def start_queue(self, run_id: int, confirmed_ids: list[int], skip_reboot: bool) -> int:
+        """Record a queue for the confirmed, still eligible servers of the run and start it.
+
+        Every server of the run gets an item; the ones not patched are SKIPPED with reasons.
+        """
+        run = self.db.get_analysis_run(run_id, details=True)
+        if run is None:
+            raise PatchNotAllowedError("This analysis no longer exists.")
+        confirmed = set(confirmed_ids)
+        with self._lock:
+            self._clear_stale()
+            if self._running:
+                raise PatchNotAllowedError("Another patch execution is running.")
+            items = []
+            for analysis, check in self.queue_preview(run):
+                status, detail = ps.ITEM_PENDING, None
+                ids = {analysis.id} | ({check.superseded.id} if check.superseded else set())
+                if not check.allowed:
+                    status, detail = ps.ITEM_SKIPPED, " ".join(check.reasons)
+                elif confirmed.isdisjoint(ids):
+                    status, detail = ps.ITEM_SKIPPED, "Not in the confirmed server list."
+                if check.superseded:
+                    latest = f"Uses the latest analysis #{analysis.run_id} (newer than this run)."
+                    detail = f"{latest} {detail}" if detail else latest
+                if status == ps.ITEM_PENDING and check.excluded_warning:
+                    detail = (
+                        f"{detail} {check.excluded_warning}" if detail else check.excluded_warning
+                    )
+                items.append(
+                    {
+                        "server_analysis_id": analysis.id,
+                        "server_name": analysis.server_name,
+                        "display_name": analysis.display_name,
+                        "status": status,
+                        "detail": detail,
+                    }
+                )
+            if not any(item["status"] == ps.ITEM_PENDING for item in items):
+                raise PatchNotAllowedError("No eligible servers to patch.")
+            queue_id = self.db.create_patch_queue(run_id, skip_reboot, items)
+            self._running, self._worker = True, None
+        logger.info(
+            "Patch All queue %s started for analysis run %s: %d server(s), skip_reboot=%s",
+            queue_id, run_id, sum(i["status"] == ps.ITEM_PENDING for i in items), skip_reboot,
+        )  # fmt: skip
+        try:
+            self._launch(lambda: self._run_queue_safely(queue_id))
+        except Exception:
+            self._running = False
+            self._stop_queue(queue_id, None, "Could not start the queue.")
+            raise
+        return queue_id
+
+    def _run_queue_safely(self, queue_id: int) -> None:
+        try:
+            self._run_queue(queue_id)
+        except Exception:
+            logger.exception("Patch All queue %s crashed", queue_id)
+            try:
+                self._stop_queue(queue_id, None, "Unexpected error; see the application log.")
+            except Exception:
+                logger.exception("Patch All queue %s could not record its result", queue_id)
+        finally:
+            self._running = False
+
+    def _run_queue(self, queue_id: int) -> None:
+        """Patch the PENDING servers in order; stop at the first failure."""
+        queue = self.db.get_patch_queue(queue_id)
+        for item in queue.items:
+            if item.status != ps.ITEM_PENDING:
+                continue
+            analysis = self.db.get_server_analysis(item.server_analysis_id)
+            try:
+                if analysis is None:
+                    raise PatchNotAllowedError("This analysis no longer exists.")
+                with self._lock:
+                    execution_id = self._record_approval(
+                        analysis, queue.skip_reboot, queue_id=queue_id, own_run=True
+                    )
+            except PatchNotAllowedError as exc:
+                # Nothing was done on this server: like any ineligible server, it is skipped.
+                self.db.update_queue_item(
+                    item.id, status=ps.ITEM_SKIPPED, detail=f"Not eligible at its turn: {exc}"
+                )
+                continue
+            self.db.update_queue_item(item.id, status=ps.ITEM_RUNNING, execution_id=execution_id)
+            self.execute(execution_id)
+            failure = queue_failure(self.db.get_execution(execution_id))
+            if failure:
+                self.db.update_queue_item(item.id, status=ps.ITEM_FAILED, detail=failure)
+                self._stop_queue(queue_id, item.server_name, failure)
+                return
+            done: dict = {"status": ps.ITEM_SUCCESS}
+            if self.db.get_execution(execution_id).state == ps.ALREADY_PATCHED:
+                note = "Already patched: every package was already at its target version."
+                done["detail"] = f"{item.detail} {note}" if item.detail else note
+            self.db.update_queue_item(item.id, **done)
+        self.db.update_patch_queue(queue_id, state=ps.QUEUE_COMPLETED, finished_at=_now())
+        logger.info("Patch All queue %s completed", queue_id)
+
+    def _stop_queue(self, queue_id: int, failed_server: str | None, reason: str) -> None:
+        queue = self.db.get_patch_queue(queue_id)
+        after = f" after {failed_server} failed" if failed_server else ""
+        for item in queue.items:
+            if item.status == ps.ITEM_PENDING:
+                self.db.update_queue_item(
+                    item.id, status=ps.ITEM_NOT_RUN, detail=f"Not run: the queue stopped{after}."
+                )
+            elif item.status == ps.ITEM_RUNNING:  # only after an unexpected crash
+                self.db.update_queue_item(
+                    item.id, status=ps.ITEM_FAILED,
+                    detail="The queue stopped while this server was being patched; "
+                    "check its execution.",
+                )  # fmt: skip
+        self.db.update_patch_queue(
+            queue_id, state=ps.QUEUE_STOPPED, finished_at=_now(),
+            stop_reason=f"{failed_server}: {reason}" if failed_server else reason,
+        )  # fmt: skip
+        logger.warning("Patch All queue %s stopped%s: %s", queue_id, after, reason)
+
+
+def queue_failure(execution: PatchExecution) -> str | None:
+    """Why this execution stops a "Patch All" queue (None: the server is done)."""
+    if execution.state not in ps.DONE:
+        title = execution.error_title or ps.LABELS.get(execution.state, execution.state)
+        return f"{title}: {execution.error_summary or 'no details'}"
+    if execution.reboot_status == ps.REBOOT_FAILED:
+        return f"REBOOT FAILED: {execution.reboot_detail or 'no details'}"
+    return None
+
 
 # --- presentation -------------------------------------------------------------------
 
@@ -924,9 +1405,15 @@ def progress_steps(execution: PatchExecution) -> list[ProgressStep]:
     """The step list shown while/after patching (no raw terminal output)."""
     if execution.decision != ps.APPROVED:
         return []
+    if execution.state == ps.ALREADY_PATCHED:
+        return [
+            ProgressStep("Preflight revalidation", "done"),
+            ProgressStep("All packages already at the target version; nothing to install", "done"),
+        ]
     debs: dict[str, PatchPackageResult] = {}
     for p in execution.packages:
-        debs.setdefault(p.deb_filename, p)
+        if p.install_result != ALREADY_AT_TARGET:  # dropped at revalidation: never copied
+            debs.setdefault(p.deb_filename, p)
     total = len(debs)
     downloaded = sum(1 for p in debs.values() if p.download_result == "DOWNLOADED")
     transferred = sum(1 for p in debs.values() if p.transfer_result in ("TRANSFERRED", "VERIFIED"))

@@ -18,6 +18,8 @@ from ec2patcher.models import (
     PatchCveResult,
     PatchExecution,
     PatchPackageResult,
+    PatchQueue,
+    PatchQueueItem,
     Server,
     ServerAnalysis,
     StoredReport,
@@ -25,7 +27,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -265,6 +267,44 @@ _MIGRATIONS = {
         ALTER TABLE analysis_runs ADD COLUMN metadata_lookups TEXT NOT NULL DEFAULT '{}';
     """
     + _CVE_METADATA_CACHE,
+    # Post-patch reboot (operator may skip it) and "Patch All" queues. A queue patches the
+    # eligible servers of one analysis run one at a time and stops at the first failure;
+    # every server of the run gets an item (SKIPPED / NOT_RUN included) for the history.
+    8: """
+        ALTER TABLE patch_executions ADD COLUMN skip_reboot INTEGER;
+        ALTER TABLE patch_executions ADD COLUMN reboot_status TEXT;
+        ALTER TABLE patch_executions ADD COLUMN reboot_detail TEXT;
+        ALTER TABLE patch_executions ADD COLUMN reboot_requested_at TEXT;
+        ALTER TABLE patch_executions ADD COLUMN reboot_finished_at TEXT;
+        ALTER TABLE patch_executions ADD COLUMN post_reboot_uptime TEXT;
+        ALTER TABLE patch_executions ADD COLUMN post_reboot_kernel TEXT;
+        ALTER TABLE patch_executions ADD COLUMN queue_id INTEGER;
+        CREATE TABLE patch_queues (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_run_id  INTEGER NOT NULL,
+            created_at       TEXT NOT NULL,
+            finished_at      TEXT,
+            state            TEXT NOT NULL,
+            skip_reboot      INTEGER NOT NULL DEFAULT 0,
+            stop_reason      TEXT
+        );
+        CREATE TABLE patch_queue_items (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            queue_id            INTEGER NOT NULL REFERENCES patch_queues(id) ON DELETE CASCADE,
+            position            INTEGER NOT NULL,
+            server_analysis_id  INTEGER NOT NULL,
+            server_name         TEXT NOT NULL,
+            display_name        TEXT,
+            status              TEXT NOT NULL,
+            execution_id        INTEGER,
+            detail              TEXT
+        );
+        CREATE INDEX idx_patch_queue_items_queue ON patch_queue_items(queue_id);
+    """,
+    # Every scp attempt (exit code + stderr) of an execution, shown on its page.
+    9: """
+        ALTER TABLE patch_executions ADD COLUMN transfer_attempts TEXT NOT NULL DEFAULT '[]';
+    """,
 }
 
 
@@ -425,8 +465,12 @@ _EXECUTION_COLUMNS = {
     "reboot_required_after", "reboot_required_packages", "error_title", "error_summary",
     "error_package", "partial_state_possible", "cleanup_status", "cleanup_detail",
     "install_started_at", "install_finished_at", "install_exit_status", "install_output",
-    "simulation_output", "audit_ok", "audit_output", "notes",
+    "simulation_output", "audit_ok", "audit_output", "notes", "reboot_status", "reboot_detail",
+    "reboot_requested_at", "reboot_finished_at", "post_reboot_uptime", "post_reboot_kernel",
+    "transfer_attempts",
 }  # fmt: skip
+_QUEUE_COLUMNS = {"finished_at", "state", "stop_reason"}
+_QUEUE_ITEM_COLUMNS = {"status", "execution_id", "detail"}
 _EXECUTION_PACKAGE_COLUMNS = {
     "after_version", "download_result", "checksum_result", "transfer_result", "install_result",
     "verification_result", "detail",
@@ -471,6 +515,28 @@ def _row_to_execution(row: sqlite3.Row) -> PatchExecution:
         audit_ok=_bool_or_none(row["audit_ok"]),
         audit_output=row["audit_output"],
         notes=json.loads(row["notes"] or "[]"),
+        skip_reboot=_bool_or_none(row["skip_reboot"]),
+        reboot_status=row["reboot_status"],
+        reboot_detail=row["reboot_detail"],
+        reboot_requested_at=row["reboot_requested_at"],
+        reboot_finished_at=row["reboot_finished_at"],
+        post_reboot_uptime=row["post_reboot_uptime"],
+        post_reboot_kernel=row["post_reboot_kernel"],
+        queue_id=row["queue_id"],
+        transfer_attempts=json.loads(row["transfer_attempts"] or "[]"),
+    )
+
+
+def _row_to_queue_item(row: sqlite3.Row) -> PatchQueueItem:
+    return PatchQueueItem(
+        id=row["id"],
+        position=row["position"],
+        server_analysis_id=row["server_analysis_id"],
+        server_name=row["server_name"],
+        display_name=row["display_name"],
+        status=row["status"],
+        execution_id=row["execution_id"],
+        detail=row["detail"],
     )
 
 
@@ -539,8 +605,8 @@ class Database:
             for target in range(version + 1, SCHEMA_VERSION + 1):
                 conn.executescript(_MIGRATIONS[target])
                 conn.execute(f"PRAGMA user_version = {int(target)}")
-            if version == SCHEMA_VERSION:
-                conn.executescript(_CVE_METADATA_CACHE)
+            # Also covers databases that reached v7 before the cache table was part of it.
+            conn.executescript(_CVE_METADATA_CACHE)
 
     def reset(self) -> bool:
         """Remove all stored data and recreate the current schema."""
@@ -964,6 +1030,16 @@ class Database:
             status=row["status"],
         )
 
+    def latest_analysis_for_server(self, server_name: str) -> ServerAnalysis | None:
+        """The server's analysis from the most recent run that includes it (by name)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM server_analyses WHERE server_name = ? COLLATE NOCASE "
+                "ORDER BY run_id DESC LIMIT 1",
+                (server_name,),
+            ).fetchone()
+        return self.get_server_analysis(row["id"]) if row else None
+
     def newer_analysis_exists(self, analysis: ServerAnalysis) -> bool:
         """True if a later analysis run includes the same server (by canonical name)."""
         with self.connect() as conn:
@@ -1003,6 +1079,8 @@ class Database:
         local_staging_path: str | None = None,
         remote_staging_path: str | None = None,
         packages: list[dict] | None = None,
+        skip_reboot: bool | None = None,
+        queue_id: int | None = None,
     ) -> int:
         """Record APPROVED or REJECTED for one analysis, atomically.
 
@@ -1011,6 +1089,11 @@ class Database:
         """
         patch_state.check_transition(patch_state.PENDING_REVIEW, decision)
         now = _now()
+        reboot_status = None
+        if decision == patch_state.APPROVED:  # the reboot step only exists for an approval
+            reboot_status = (
+                patch_state.REBOOT_SKIPPED if skip_reboot else patch_state.REBOOT_PENDING
+            )
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")  # serialise concurrent approvals
             existing = conn.execute(
@@ -1026,8 +1109,8 @@ class Database:
                 "INSERT INTO patch_executions (analysis_run_id, server_analysis_id, server_id, "
                 "server_name, display_name, ip_address, decision, decided_at, state, updated_at, "
                 "local_staging_path, remote_staging_path, expected_reboot, "
-                "expected_reboot_reason, cleanup_status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "expected_reboot_reason, cleanup_status, skip_reboot, reboot_status, queue_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     analysis.run_id, analysis.id, analysis.server_id, analysis.server_name,
                     analysis.display_name, analysis.ip_address, decision, now, decision, now,
@@ -1035,6 +1118,7 @@ class Database:
                     None if analysis.expected_reboot is None else int(analysis.expected_reboot),
                     analysis.expected_reboot_reason,
                     "NOT_STARTED" if decision == patch_state.APPROVED else None,
+                    None if skip_reboot is None else int(skip_reboot), reboot_status, queue_id,
                 ),
             )  # fmt: skip
             execution_id = cur.lastrowid
@@ -1053,11 +1137,15 @@ class Database:
 
     @staticmethod
     def _active_execution_id(conn) -> int | None:
-        placeholders = ",".join("?" * len(patch_state.ACTIVE))
+        """An execution still in the pipeline, or patched and still in its reboot step."""
+        active = tuple(sorted(patch_state.ACTIVE))
+        successful = tuple(sorted(patch_state.SUCCESSFUL))
+        rebooting = tuple(sorted(patch_state.REBOOT_ACTIVE))
         row = conn.execute(
-            f"SELECT id FROM patch_executions WHERE state IN ({placeholders}) "  # noqa: S608
-            "ORDER BY id LIMIT 1",
-            tuple(sorted(patch_state.ACTIVE)),
+            f"SELECT id FROM patch_executions WHERE state IN ({','.join('?' * len(active))}) "  # noqa: S608
+            f"OR (state IN ({','.join('?' * len(successful))}) "
+            f"AND reboot_status IN ({','.join('?' * len(rebooting))})) ORDER BY id LIMIT 1",
+            (*active, *successful, *rebooting),
         ).fetchone()
         return row["id"] if row else None
 
@@ -1166,9 +1254,10 @@ class Database:
         ]
 
     def mark_interrupted_executions(self) -> int:
-        """Executions still active at startup were cut short by a restart.
+        """Executions still active without a live worker (app restart, crashed worker thread)
+        were cut short.
 
-        Before installing nothing on the server's packages changed -> FAILED. Once the
+        Before installing nothing on the server's packages changed -> INTERRUPTED. Once the
         install may have started the outcome is not provable -> UNKNOWN. Staging files are
         preserved either way. Returns the number of executions updated.
         """
@@ -1176,7 +1265,7 @@ class Database:
         count = 0
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT id, state FROM patch_executions WHERE state IN "  # noqa: S608
+                f"SELECT id, state, reboot_status FROM patch_executions WHERE state IN "  # noqa: S608
                 f"({','.join('?' * len(patch_state.ACTIVE))})",
                 tuple(sorted(patch_state.ACTIVE)),
             ).fetchall()
@@ -1193,16 +1282,18 @@ class Database:
                     target, title = patch_state.UNKNOWN, "EXECUTION STATE UNKNOWN"
                     fields = {"partial_state_possible": 1, "cleanup_status": "PRESERVED"}
                 else:
-                    target, title = patch_state.FAILED, "PATCH FAILED"
+                    target, title = patch_state.INTERRUPTED, "PATCH INTERRUPTED"
                     fields = {"cleanup_status": "PRESERVED"}
                 if title:
                     fields.update(
                         error_title=title,
                         failure_stage=state,
-                        error_summary="The application stopped while the patch was running "
-                        f"(stage: {patch_state.LABELS[state]}). Run a new analysis before "
-                        "retrying.",
+                        error_summary="The patch stopped without finishing (application "
+                        f"restarted or its worker stopped) at stage: {patch_state.LABELS[state]}. "
+                        "Run a new analysis before retrying.",
                     )
+                if row["reboot_status"] == patch_state.REBOOT_PENDING:
+                    fields["reboot_status"] = patch_state.REBOOT_NOT_RUN
                 values, assignments = self._execution_assignments(
                     {**fields, "finished_at": now, "updated_at": now}
                 )
@@ -1212,4 +1303,108 @@ class Database:
                     (target, *values, row["id"], state),
                 )
                 count += 1
+            # Patched, but the app stopped before/while rebooting: the reboot is not proven.
+            successful = tuple(sorted(patch_state.SUCCESSFUL))
+            rebooting = tuple(sorted(patch_state.REBOOT_ACTIVE))
+            cur = conn.execute(
+                "UPDATE patch_executions SET reboot_status = ?, reboot_detail = ?, "  # noqa: S608
+                "reboot_finished_at = ?, updated_at = ? "
+                f"WHERE state IN ({','.join('?' * len(successful))}) "
+                f"AND reboot_status IN ({','.join('?' * len(rebooting))})",
+                (
+                    patch_state.REBOOT_FAILED,
+                    "The application stopped during the reboot step. Check the server manually.",
+                    now, now, *successful, *rebooting,
+                ),
+            )  # fmt: skip
+            count += cur.rowcount
         return count
+
+    # --- "Patch All" queues ----------------------------------------------------------
+
+    def create_patch_queue(self, run_id: int, skip_reboot: bool, items: list[dict]) -> int:
+        """items: {server_analysis_id, server_name, display_name, status, detail} in order."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO patch_queues (analysis_run_id, created_at, state, skip_reboot) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, _now(), patch_state.QUEUE_RUNNING, int(skip_reboot)),
+            )
+            queue_id = cur.lastrowid
+            for position, item in enumerate(items):
+                conn.execute(
+                    "INSERT INTO patch_queue_items (queue_id, position, server_analysis_id, "
+                    "server_name, display_name, status, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        queue_id, position, item["server_analysis_id"], item["server_name"],
+                        item["display_name"], item["status"], item.get("detail"),
+                    ),
+                )  # fmt: skip
+        return queue_id
+
+    def update_patch_queue(self, queue_id: int, **fields) -> None:
+        self._update("patch_queues", _QUEUE_COLUMNS, queue_id, fields)
+
+    def update_queue_item(self, item_id: int, **fields) -> None:
+        self._update("patch_queue_items", _QUEUE_ITEM_COLUMNS, item_id, fields)
+
+    def get_patch_queue(self, queue_id: int) -> PatchQueue | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM patch_queues WHERE id = ?", (queue_id,)).fetchone()
+            if row is None:
+                return None
+            items = conn.execute(
+                "SELECT * FROM patch_queue_items WHERE queue_id = ? ORDER BY position",
+                (queue_id,),
+            ).fetchall()
+        return PatchQueue(
+            id=row["id"],
+            analysis_run_id=row["analysis_run_id"],
+            created_at=row["created_at"],
+            finished_at=row["finished_at"],
+            state=row["state"],
+            skip_reboot=bool(row["skip_reboot"]),
+            stop_reason=row["stop_reason"],
+            items=[_row_to_queue_item(r) for r in items],
+        )
+
+    def latest_queue_id(self, run_id: int) -> int | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM patch_queues WHERE analysis_run_id = ? ORDER BY id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        return row["id"] if row else None
+
+    def mark_interrupted_queues(self) -> int:
+        """Queues still RUNNING at startup were cut short by a restart."""
+        now = _now()
+        with self.connect() as conn:
+            ids = [
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM patch_queues WHERE state = ?", (patch_state.QUEUE_RUNNING,)
+                )
+            ]
+            for queue_id in ids:
+                conn.execute(
+                    "UPDATE patch_queue_items SET status = ?, detail = ? "
+                    "WHERE queue_id = ? AND status = ?",
+                    (
+                        patch_state.ITEM_FAILED, "The application stopped while patching.",
+                        queue_id, patch_state.ITEM_RUNNING,
+                    ),
+                )  # fmt: skip
+                conn.execute(
+                    "UPDATE patch_queue_items SET status = ? WHERE queue_id = ? AND status = ?",
+                    (patch_state.ITEM_NOT_RUN, queue_id, patch_state.ITEM_PENDING),
+                )
+                conn.execute(
+                    "UPDATE patch_queues SET state = ?, finished_at = ?, stop_reason = ? "
+                    "WHERE id = ?",
+                    (
+                        patch_state.QUEUE_STOPPED, now,
+                        "The application stopped while the queue was running.", queue_id,
+                    ),
+                )  # fmt: skip
+        return len(ids)
