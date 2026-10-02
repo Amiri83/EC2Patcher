@@ -6,7 +6,7 @@ See README.md for features and behaviour.
 ## Stack
 
 Python 3.10+, FastAPI + Jinja2 templates (server-rendered, minimal vanilla JS), SQLite
-(stdlib `sqlite3`), uvicorn, openpyxl. System `ssh`/`scp` and local `apt-get`/`apt-cache`
+(stdlib `sqlite3`), uvicorn, openpyxl, cryptography (Fernet). System `ssh`/`scp` and local `apt-get`/`apt-cache`
 via argument-list subprocesses. Lint/format: ruff (line length 100).
 
 ## Layout
@@ -15,7 +15,8 @@ via argument-list subprocesses. Lint/format: ruff (line length 100).
 - `src/ec2patcher/database.py` – schema, `_MIGRATIONS`, `SCHEMA_VERSION`, all queries
 - `src/ec2patcher/services/` – `analysis_service` (runs), `cve_resolver` (statuses/plan),
   `security_metadata` (Canonical), `nvd` (CVSS), `local_apt`/`apt_planner` (workstation APT),
-  `patch_service`/`patch_remote`/`downloader`/`staging` (patching), `ssh_service`
+  `patch_service`/`patch_remote`/`downloader`/`staging` (patching), `ssh_service`,
+  `secret_store` (encrypted secrets, Fernet key file in the config dir)
 - `src/ec2patcher/templates/`, `static/` – UI
 - `tests/` – pytest; fixtures in `conftest.py`, `*_fixtures.py`, `tests/fixtures/`
 
@@ -51,8 +52,12 @@ them); keep it that way.
 
 ## Secrets
 
-Never commit secrets: no API keys (NVD_API_KEY is env var only), PEM keys, hostnames/IPs of
+Never commit secrets: no API keys (NVD_API_KEY comes from the env var or the encrypted
+Settings value, never a file in the repo), PEM keys, the Fernet `secret.key`, hostnames/IPs of
 real servers or real reports. Use placeholders in docs and fake values in tests.
+Stored secrets (server passwords, NVD key) are Fernet-encrypted via
+`services/secret_store`; they must never reach HTML, logs, argv, exports or error messages
+(passwords go to sshpass via `SSHPASS` only).
 
 ## Workflow
 

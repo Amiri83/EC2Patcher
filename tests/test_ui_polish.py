@@ -1,5 +1,6 @@
-"""NVD API key badge, password login (schema v13, sshpass, session-only password), the log
-directory setting with rotating file logs, and the local-only stylesheet."""
+"""NVD API key badge, password login (schema v13, sshpass), the log directory setting with
+rotating file logs, and the local-only stylesheet. The stored (encrypted) passwords that
+replaced the session-only ones are tested in test_stored_credentials.py."""
 
 import logging
 import re
@@ -11,9 +12,6 @@ import pytest
 from conftest import SUCCESS_STDOUT, FakeSSH
 from fastapi.testclient import TestClient
 from nvd_fixtures import FakeNvd, make_client
-from phase2_fixtures import make_metadata
-from phase3_fixtures import IP, SERVER, FakeClock, FakeFetcher, FakeUbuntu, analysis_plan_output
-from test_patch_web import set_staging
 from test_ssh_user import _legacy_db, columns
 from test_web import upload
 
@@ -27,10 +25,6 @@ from ec2patcher.validation import validate_server_input
 SECRET = "S3cr3t-Pa55w0rd!"  # fake test password
 API_KEY = "fake-nvd-key-0123456789abcdef"  # fake test key
 CVE = "CVE-2026-63076"
-
-
-def sync(fn):
-    fn()
 
 
 # --- 1. NVD API key badge ---------------------------------------------------------------------
@@ -106,7 +100,7 @@ def test_badge_never_reveals_the_key_from_the_environment(db_path, monkeypatch):
 def test_fresh_database_is_v13_with_auth_method(db_path):
     db = Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 13
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
     conn.close()
     assert columns(db_path, "servers")["auth_method"] == ("TEXT", 1, "'pem'")
     assert db.create_server("a", "10.0.0.1", "/k.pem").auth_method == AUTH_PEM
@@ -132,7 +126,7 @@ def test_v12_database_upgrades_to_v13_keeping_data(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 13
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
     check.close()
     server = db.get_server_by_name("keep")
     assert server.auth_method == AUTH_PEM  # existing servers keep logging in with their key
@@ -148,7 +142,7 @@ def test_full_upgrade_path_from_v1_reaches_v13(db_path):
     _legacy_db(db_path, 1).close()
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 13
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
     check.close()
     server = db.get_server_by_name("keep")
     assert (server.auth_method, server.ssh_user) == (AUTH_PEM, "ubuntu")
@@ -227,186 +221,6 @@ def test_wrong_password_is_reported():
     denied = FakeSSH(returncode=255, stderr="user@10.0.0.1: Permission denied (password).")
     result = ssh_service.run_remote("10.0.0.1", "", "true", denied, password=SECRET)
     assert "Check the SSH user and password" in result.error
-
-
-def test_session_passwords_are_memory_only_and_repr_is_safe():
-    store = ssh_service.SessionPasswords()
-    store.set(3, SECRET)
-    assert store.get(3) == SECRET and store.has(3) and not store.has(4)
-    assert SECRET not in repr(store) and SECRET not in str(store)
-    store.forget(3)
-    assert store.get(3) is None
-    store.set(1, SECRET)
-    store.clear()
-    assert not store.has(1)
-
-
-# --- 2. password login: web flow --------------------------------------------------------------
-
-
-def password_form(**extra):
-    form = {"name": "pw-01", "ip_address": "10.0.0.8", "pem_path": "", "ssh_user": "admin"}
-    return {**form, "auth_method": AUTH_PASSWORD, **extra}
-
-
-def assert_secret_absent(db_path, caplog, *pages):
-    for page in pages:
-        assert SECRET not in page
-    for path in db_path.parent.iterdir():
-        if path.is_file():
-            assert SECRET.encode() not in path.read_bytes(), path
-    assert SECRET not in caplog.text
-
-
-def test_password_server_web_flow(client, db_path, fake_ssh, caplog):
-    caplog.set_level(logging.DEBUG)
-    page = client.get("/servers/new").text
-    assert 'value="pem" data-auth-method checked' in page  # PEM key is the default
-    assert 'type="password" id="ssh_password" name="ssh_password" value=""' in page
-
-    r = client.post("/servers/new", data=password_form(ssh_password=SECRET))
-    assert r.status_code == 200 and "was added" in r.text
-    server = Database(db_path).get_server_by_name("pw-01")
-    assert server.auth_method == AUTH_PASSWORD and server.pem_path == ""
-    listing = client.get("/servers").text
-    assert "entered this session" in listing and "Forget password" in listing
-
-    # Test SSH uses the session password through sshpass; it never shows up anywhere.
-    tested = client.post(f"/servers/{server.id}/test").text
-    args, kwargs = fake_ssh.calls[-1]
-    assert args[:3] == ["sshpass", "-e", "ssh"] and all(SECRET not in a for a in args)
-    assert kwargs["env"]["SSHPASS"] == SECRET
-    edit = client.get(f"/servers/{server.id}/edit").text
-    assert "Entered for this session" in edit and 'name="ssh_password" value=""' in edit
-
-    # Editing without typing the password keeps the session password.
-    r = client.post(f"/servers/{server.id}/edit", data=password_form())
-    assert r.status_code == 200 and client.app.state.passwords.get(server.id) == SECRET
-
-    r = client.post(f"/servers/{server.id}/password/forget")
-    assert "was forgotten" in r.text and "password needed" in r.text
-    missing = client.post(f"/servers/{server.id}/test").text
-    assert "No SSH password entered" in missing
-    r = client.post(f"/servers/{server.id}/password", data={"ssh_password": SECRET})
-    assert "kept in memory for this app session only" in r.text
-    assert client.app.state.passwords.get(server.id) == SECRET
-    assert_secret_absent(db_path, caplog, page, listing, tested, edit, missing, r.text)
-
-    # Switching to a PEM key forgets the password.
-    client.post(f"/servers/{server.id}/edit", data=password_form(auth_method=AUTH_PEM))
-    assert client.app.state.passwords.get(server.id) == SECRET  # invalid (no PEM): not saved
-    assert Database(db_path).get_server(server.id).auth_method == AUTH_PASSWORD
-
-
-def test_switching_to_pem_and_deleting_forget_the_password(client, db_path, pem_file):
-    client.post("/servers/new", data=password_form(ssh_password=SECRET))
-    server = Database(db_path).get_server_by_name("pw-01")
-    data = password_form(auth_method=AUTH_PEM, pem_path=str(pem_file))
-    client.post(f"/servers/{server.id}/edit", data=data)
-    assert Database(db_path).get_server(server.id).auth_method == AUTH_PEM
-    assert not client.app.state.passwords.has(server.id)
-
-    client.post(f"/servers/{server.id}/edit", data=password_form(ssh_password=SECRET))
-    assert client.app.state.passwords.has(server.id)
-    client.post(f"/servers/{server.id}/delete")
-    assert not client.app.state.passwords.has(server.id)
-
-
-def test_form_test_connection_with_typed_password(client, fake_ssh, db_path, caplog):
-    caplog.set_level(logging.DEBUG)
-    r = client.post("/servers/new", data=password_form(action="test"))
-    assert "Enter the SSH password to test the connection." in r.text and fake_ssh.calls == []
-    r = client.post("/servers/new", data=password_form(action="test", ssh_password=SECRET))
-    assert "SSH CONNECTION SUCCESSFUL" in r.text and "ip-10-10-20-15" in r.text
-    assert fake_ssh.calls[-1][1]["env"]["SSHPASS"] == SECRET
-    assert Database(db_path).get_server_by_name("pw-01") is None  # test does not save
-    assert_secret_absent(db_path, caplog, r.text)
-
-
-def test_password_is_cleared_on_restart(make_client, db_path):
-    with make_client() as c:
-        c.post("/servers/new", data=password_form(ssh_password=SECRET))
-        server_id = Database(db_path).get_server_by_name("pw-01").id
-        assert c.app.state.passwords.has(server_id)
-    with make_client() as c:  # a new app process: nothing remembered
-        assert not c.app.state.passwords.has(server_id)
-        assert "password needed" in c.get("/servers").text
-
-
-def test_clear_servers_and_reset_forget_all_passwords(client, db_path):
-    client.post("/servers/new", data=password_form(ssh_password=SECRET))
-    client.post("/servers/clear", data={"confirm_text": "DELETE SERVERS"})
-    assert repr(client.app.state.passwords) == "SessionPasswords(server_ids=[])"
-    client.post("/servers/new", data=password_form(ssh_password=SECRET))
-    client.post("/settings/reset-database", data={"confirm_text": "RESET"})
-    assert repr(client.app.state.passwords) == "SessionPasswords(server_ids=[])"
-
-
-class PasswordGate:
-    """Runner that requires sshpass + $SSHPASS, then hands the plain ssh/scp call to ``inner``."""
-
-    def __init__(self, inner, password):
-        self.inner, self.password = inner, password
-        self.calls: list[tuple[list[str], dict]] = []
-
-    def __call__(self, args, **kwargs):
-        self.calls.append((args, kwargs))
-        assert args[:2] == ["sshpass", "-e"] and all(self.password not in a for a in args)
-        assert kwargs.get("env", {}).get("SSHPASS") == self.password
-        inner_kwargs = {k: v for k, v in kwargs.items() if k != "env"}
-        return self.inner(args[2:], **inner_kwargs)
-
-
-def test_analysis_and_patching_with_password_login(db_path, tmp_path, fake_apt, caplog):
-    caplog.set_level(logging.DEBUG)
-    fake_apt.plan = analysis_plan_output()
-    ubuntu = FakeUbuntu(plan_output=analysis_plan_output())
-    gate = PasswordGate(ubuntu, SECRET)
-    app = create_app(
-        db_path=db_path, ssh_runner=gate, metadata=make_metadata(tmp_path),
-        analysis_starter=sync, patch_starter=sync, patch_fetcher=FakeFetcher(),
-        shutdown_handler=lambda: None,
-    )  # fmt: skip
-    clock = FakeClock()
-    app.state.patcher.sleep, app.state.patcher.clock = clock.sleep, clock
-    pages = []
-    with TestClient(app, base_url="http://127.0.0.1") as c:
-        data = {
-            "name": SERVER,
-            "ip_address": IP,
-            "auth_method": AUTH_PASSWORD,
-            "ssh_user": "ubuntu",
-        }
-        c.post("/servers/new", data=data)  # no password yet
-        set_staging(c, tmp_path)
-        upload(c, {SERVER: ["CVE-2026-63076", "CVE-2026-54874", "CVE-2026-63075"]})
-        run_url = c.post("/reports/analyze", follow_redirects=False).headers["location"]
-        pages.append(c.get(run_url).text)
-        assert "No SSH password entered" in pages[-1] and gate.calls == []
-
-        server_id = Database(db_path).get_server_by_name(SERVER).id
-        c.post(f"/servers/{server_id}/password", data={"ssh_password": SECRET})
-        run_url = c.post("/reports/analyze", follow_redirects=False).headers["location"]
-        pages.append(c.get(run_url).text)
-        report_url = re.findall(r'href="(/analysis/\d+/servers/\d+)"', pages[-1])[0]
-        pages.append(c.get(report_url).text)
-        assert "PENDING REVIEW" in pages[-1]
-
-        # Forgetting the password blocks patching before anything is downloaded.
-        c.post(f"/servers/{server_id}/password/forget")
-        r = c.post(f"{report_url}/approve", data={"confirm": "yes"})
-        assert r.status_code == 409 and "No SSH password entered" in r.text
-        pages.append(r.text)
-
-        c.post(f"/servers/{server_id}/password", data={"ssh_password": SECRET})
-        r = c.post(f"{report_url}/approve", data={"confirm": "yes"}, follow_redirects=False)
-        result = c.get(r.headers["location"]).text
-        pages.append(result)
-        assert "PATCH SUCCESSFUL" in result
-    binaries = {args[2] for args, _ in gate.calls}
-    assert binaries == {"ssh", "scp"}  # every connection went through sshpass
-    assert ubuntu.ops.count("install") == 1
-    assert_secret_absent(db_path, caplog, *pages)
 
 
 # --- 3. log directory setting -----------------------------------------------------------------

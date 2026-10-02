@@ -22,15 +22,20 @@
       {% if errors.ip_address %}<div class="field-error">{{ errors.ip_address }}</div>{% endif %}
     </div>
     {% set method = form.auth_method or "pem" %}
-    <fieldset class="field auth-field{% if errors.auth_method %} has-error{% endif %}">
-      <legend>Login Method</legend>
-      <div class="radio-row">
+    <div class="field auth-field{% if errors.auth_method %} has-error{% endif %}">
+      <label for="auth_method">Login type</label>
+      <select id="auth_method" name="auth_method" data-auth-method>
         {% for key, label in auth_methods.items() %}
-          <label class="check-label"><input type="radio" name="auth_method" value="{{ key }}" data-auth-method{% if method == key %} checked{% endif %}> {{ label }}</label>
+          <option value="{{ key }}"{% if method == key %} selected{% endif %}>{{ label }}</option>
         {% endfor %}
-      </div>
+      </select>
       {% if errors.auth_method %}<div class="field-error">{{ errors.auth_method }}</div>{% endif %}
-    </fieldset>
+      <noscript>
+        {# Without JavaScript both the PEM path and the password fields stay visible. #}
+        <style>[data-auth-only] { display: block !important; }</style>
+        <div class="hint noscript-auth-hint">Both the PEM key and the password fields are shown; only the ones of the chosen login type are used.</div>
+      </noscript>
+    </div>
     <div class="field{% if errors.pem_path %} has-error{% endif %}" data-auth-only="pem">
       <label for="pem_path">PEM File</label>
       <input type="text" id="pem_path" name="pem_path" value="{{ form.pem_path }}"
@@ -38,11 +43,13 @@
       <div class="hint">Path to the private key on this machine. Only the path is stored.</div>
       {% if errors.pem_path %}<div class="field-error">{{ errors.pem_path }}</div>{% endif %}
     </div>
-    <div class="field" data-auth-only="password">
+    <div class="field{% if errors.ssh_password %} has-error{% endif %}" data-auth-only="password">
       <label for="ssh_password">SSH Password</label>
-      {# Never pre-filled: the password is not stored and never sent back to the browser. #}
-      <input type="password" id="ssh_password" name="ssh_password" value="" autocomplete="off" spellcheck="false">
-      <div class="hint">{% if has_session_password %}<span class="badge badge-success">Entered for this session</span> Leave empty to keep it. {% endif %}Kept in memory for this app session only &mdash; never saved to the database, files or logs, and asked again after a restart. Requires <code>sshpass</code> on this machine. <code>sudo</code> on the server must still be passwordless.</div>
+      {# Never pre-filled: the stored password is never sent back to the browser. #}
+      <input type="password" id="ssh_password" name="ssh_password" value="" autocomplete="new-password" spellcheck="false">
+      {% if errors.ssh_password %}<div class="field-error">{{ errors.ssh_password }}</div>{% endif %}
+      {% if stored_password_error %}<div class="field-error stored-password-error">{{ stored_password_error }}</div>{% endif %}
+      <div class="hint">{% if has_stored_password %}<span class="badge badge-success">Password stored</span> Leave empty to keep the stored password. {% endif %}Stored encrypted per server; never shown, logged or put on a command line. Requires <code>sshpass</code> on this machine. <code>sudo</code> on the server must still be passwordless.</div>
     </div>
     <div class="field{% if errors.ssh_user %} has-error{% endif %}">
       <label for="ssh_user">SSH User</label>

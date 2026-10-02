@@ -44,17 +44,17 @@
     });
   }
 
-  // Server form: show only the fields of the chosen login method (PEM key or password).
-  var authRadios = document.querySelectorAll("input[data-auth-method]");
-  if (authRadios.length) {
+  // Server form: show only the fields of the chosen login type (PEM key or password).
+  // Without JavaScript both stay visible (see the <noscript> block of the form).
+  var authSelect = document.querySelector("select[data-auth-method]");
+  if (authSelect) {
     var showAuthFields = function () {
-      var checked = document.querySelector("input[data-auth-method]:checked");
-      var method = checked ? checked.value : "pem";
+      var method = authSelect.value || "pem";
       document.querySelectorAll("[data-auth-only]").forEach(function (el) {
         el.hidden = el.getAttribute("data-auth-only") !== method;
       });
     };
-    authRadios.forEach(function (radio) { radio.addEventListener("change", showAuthFields); });
+    authSelect.addEventListener("change", showAuthFields);
     showAuthFields();
   }
 
