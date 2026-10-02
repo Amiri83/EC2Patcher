@@ -164,6 +164,7 @@ Provide the key **only through the environment**, never in a file in this reposi
 ```bash
 export NVD_API_KEY=...   # your own key; it is sent only in the apiKey request header
 ```
+Request a free key at https://nvd.nist.gov/developers/request-an-api-key.
 
 The key is never stored, logged or exported.
 
