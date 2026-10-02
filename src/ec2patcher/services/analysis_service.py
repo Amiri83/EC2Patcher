@@ -1,7 +1,9 @@
 """Phase 2 orchestration: analyze the latest report, server by server, and persist results.
 
-Read-only by design. Each server receives exactly one fixed ssh command as the unprivileged
-``ubuntu`` user (no sudo) that collects facts (dpkg-query, os-release, uname, ...). APT
+Read-only by design. Each server receives exactly one fixed ssh command as the server's
+unprivileged SSH user (no sudo) that collects facts (os-release, dpkg-query, uname, ...). The
+OS is detected from /etc/os-release and everything OS-specific is done by its adapter
+(os_adapters; Ubuntu only - other systems are reported as "OS not supported yet"). APT
 candidates and the upgrade plan (apt-get -s / --print-uris) are resolved on the workstation
 against a private APT state for the server's release and architecture (local_apt). Nothing
 is downloaded, copied, installed or restarted.
@@ -27,11 +29,11 @@ from ec2patcher import config
 from ec2patcher.database import Database
 from ec2patcher.models import ServerAnalysis, StoredReport
 from ec2patcher.services import (
-    apt_planner,
     cve_resolver,
     debversion,
     local_apt,
     nvd,
+    os_adapters,
     server_state,
     ssh_service,
 )
@@ -43,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 FACTS_TIMEOUT_SECONDS = 90
 DISPLAY_NAME_TAG = "display_name"
+UNSUPPORTED = os_adapters.UNSUPPORTED_STATUS  # OS without an adapter (not a failure)
 
 # Runs the job in the background; may return the worker thread so liveness can be checked.
 Starter = Callable[[Callable[[], None]], threading.Thread | None]
@@ -370,8 +373,9 @@ class AnalysisService:
             logger.exception("Re-analysis of %s failed unexpectedly", label)
             error = f"Unexpected error: {exc}"
         if not error:
-            self.db.update_server_analysis(analysis_id, error=None)
-        elif analysis.status == "complete" and not error.startswith(server_state.DPKG_BLOCKER):
+            if self.db.get_server_analysis(analysis_id).status != UNSUPPORTED:
+                self.db.update_server_analysis(analysis_id, error=None)
+        elif analysis.status == "complete" and not os_adapters.is_blocker(error):
             # the previous results are still stored (a dpkg blocker invalidates their plan)
             logger.warning("Re-analysis of %s failed: %s", label, error)
             self.db.update_server_analysis(
@@ -420,8 +424,9 @@ class AnalysisService:
 
     def _remote(self, server, command: str, timeout: int) -> ssh_service.RemoteResult:
         return ssh_service.run_remote(
-            server.ip_address, server.pem_path, command, runner=self.runner, timeout=timeout
-        )
+            server.ip_address, server.pem_path, command, runner=self.runner, timeout=timeout,
+            user=server.ssh_user,
+        )  # fmt: skip
 
     def _analyze(
         self,
@@ -431,16 +436,22 @@ class AnalysisService:
     ) -> str | None:
         """Analyze one server; return an error message if the whole server failed.
 
-        ``lookup`` replaces the Canonical lookup (used to retry only the failed CVEs)."""
+        ``lookup`` replaces the Canonical lookup (used to retry only the failed CVEs).
+        A server whose OS has no adapter is marked unsupported (and None is returned)."""
         server = self.db.get_server(analysis.server_id) if analysis.server_id else None
         if server is None:
             return "This server is no longer configured in EC2Patcher."
 
-        result = self._remote(server, server_state.FACTS_COMMAND, FACTS_TIMEOUT_SECONDS)
+        result = self._remote(server, os_adapters.DEFAULT.facts_command, FACTS_TIMEOUT_SECONDS)
         if not result.ok:
             return result.error
+        os_release = os_adapters.os_release_from_output(result.stdout)
+        adapter = os_adapters.detect(os_release)
+        if adapter is None:
+            self._mark_unsupported(analysis, result.stdout, os_release)
+            return None
         try:
-            facts = server_state.parse_facts(result.stdout)
+            facts = adapter.parse_facts(result.stdout)
         except server_state.RemoteOutputError as exc:
             return f"Malformed remote output: {exc}"
         self.db.update_server_analysis(
@@ -453,90 +464,55 @@ class AnalysisService:
             running_kernel=facts.kernel,
             current_reboot_required=facts.reboot_required,
             reboot_required_packages=facts.reboot_required_pkgs,
+            os_id=adapter.os_id,
         )
-        unsupported = server_state.check_supported(facts)
+        unsupported = adapter.check_supported(facts)
         if unsupported:
             return unsupported
-        blocker = server_state.dpkg_blocker(facts)
-        if blocker:  # no plan: apt cannot upgrade anything until dpkg is repaired
+        blocker = adapter.blocker(facts)
+        if blocker:  # no plan: the package manager cannot upgrade anything until repaired
             return blocker
 
-        warnings = list(facts.warnings)
-        metadata_status = self.metadata.status()
-        if not metadata_status.available:
-            lookup = lambda _cve: None  # noqa: E731
-        elif lookup is None:
-            lookup = self.metadata.lookup
-        findings = cve_resolver.resolve_all(analysis.reported_cves, lookup, facts)
-        if not metadata_status.available:
-            warning = f"Canonical security metadata is unavailable: {metadata_status.error}"
-            warnings.append(warning)
-            for finding in findings:
-                finding.status = cve_resolver.METADATA_UNAVAILABLE
-                finding.detail = warning
-        elif any(f.status == cve_resolver.METADATA_UNAVAILABLE for f in findings):
-            warnings.append("Some Canonical metadata lookups failed; those CVEs remain unresolved.")
-        elif any(f.status == cve_resolver.UNKNOWN for f in findings):
-            warnings.append("Some CVEs have no usable Canonical statement for this Ubuntu release.")
-        candidates: dict[str, apt_planner.Candidate] = {}
-        requests: list[tuple[str, str]] = []
-        state: local_apt.AptState | None = None
-        query = cve_resolver.candidate_query_packages(findings, facts)
-        if query:
-            progress(f"Resolving APT candidates locally ({facts.codename}/{facts.architecture})")
-            try:
-                state = self.apt.prepare(facts.codename, facts.architecture)
-                self.db.update_server_analysis(
-                    analysis.id,
-                    apt_updated_at=state.updated_at.isoformat(),
-                    apt_age_hours=max(0.0, (_utcnow() - state.updated_at).total_seconds() / 3600),
-                )
-                candidates = self.apt.candidates(state, facts, query)
-            except (local_apt.AptResolutionError, ValueError) as exc:
-                warnings.append(f"Local APT resolution failed: {exc}")
-                for f in findings:
-                    if cve_resolver.needs_candidate_check(f):
-                        f.status = cve_resolver.ANALYSIS_ERROR
-                        f.detail = f"APT candidate check failed: {exc}"
-            else:
-                requests = cve_resolver.apply_candidates(findings, candidates, facts)
-
-        plan: list[cve_resolver.PlanEntry] = []
-        apt_arguments: list[str] = []
-        if requests and state is not None:
-            download = self.apt.plan(state, facts, requests)
-            apt_arguments = download.apt_arguments
-            if download.removals:
-                warnings.append(
-                    "APT would REMOVE these packages as part of the upgrade: "
-                    + ", ".join(download.removals)
-                )
-            warnings.extend(f"APT: {m}" for m in download.messages[:10])
-            same = cve_resolver.already_at_target(download)
-            if same:
-                warnings.append(
-                    "Excluded from the plan (already at target: installed version is equal to "
-                    "or newer than the target version): " + ", ".join(same)
-                )
-            if download.ok:
-                plan = cve_resolver.build_plan(findings, download, candidates, facts)
-            else:
-                plan = self._unresolved_plan(findings, requests, candidates, facts, download.error)
-
-        self._enrich_severity(findings, progress)
-        reboot, reason = cve_resolver.expected_reboot(plan)
+        context = os_adapters.AnalysisContext(
+            metadata=self.metadata,
+            packages=self.apt,
+            progress=progress,
+            record=lambda **fields: self.db.update_server_analysis(analysis.id, **fields),
+            lookup=lookup,
+        )
+        assessment = adapter.assess(facts, analysis.reported_cves, context)
+        self._enrich_severity(assessment.findings, progress)
+        reboot, reason = adapter.expected_reboot(assessment.plan)
         self.db.save_server_results(
             analysis.id,
-            findings,
-            plan,
+            assessment.findings,
+            assessment.plan,
             status="complete",
             completed_at=_now(),
             expected_reboot=reboot,
             expected_reboot_reason=reason,
-            apt_arguments=apt_arguments,
-            warnings=warnings,
+            apt_arguments=assessment.apt_arguments,
+            warnings=assessment.warnings,
         )
         return None
+
+    def _mark_unsupported(self, analysis: ServerAnalysis, stdout: str, os_release: dict) -> None:
+        """Record what was learned about a server whose OS has no adapter (not a failure)."""
+        message = os_adapters.unsupported_message(os_release)
+        sections = server_state.split_sections(stdout)
+        hostname = next((ln.strip() for ln in sections.get("hostname", []) if ln.strip()), None)
+        logger.info("Analysis of %s skipped: %s", analysis.server_name, message)
+        self.db.update_server_analysis(
+            analysis.id,
+            status=UNSUPPORTED,
+            completed_at=_now(),
+            error=message,
+            remote_hostname=hostname,
+            os_pretty_name=os_release.get("PRETTY_NAME") or os_adapters.describe(os_release),
+            os_version_id=os_release.get("VERSION_ID") or None,
+            os_codename=os_release.get("VERSION_CODENAME") or None,
+            os_id=os_release.get("ID") or None,
+        )
 
     def _enrich_severity(self, findings: list, progress: Callable[[str], None]) -> None:
         """Attach NVD CVSS data to the findings. Statuses and plans are never touched."""
@@ -547,36 +523,6 @@ class AnalysisService:
             for f in findings:
                 if f.cve == cve:
                     f.cvss = result
-
-    @staticmethod
-    def _unresolved_plan(findings, requests, candidates, facts, error) -> list:
-        """Keep the required upgrades visible even when the .deb plan cannot be resolved."""
-        installed = facts.by_name()
-        cves_by_source: dict[str, set[str]] = {}
-        for f in findings:
-            if f.status == cve_resolver.PATCH_AVAILABLE and f.source:
-                cves_by_source.setdefault(f.source, set()).add(f.cve)
-        entries = []
-        for name, version in requests:
-            pkg = installed.get(name)
-            source = pkg.source if pkg else None
-            cand = candidates.get(name)
-            impact = cve_resolver.reboot_impact(name, bool(cand and cand.requests_reboot))
-            entries.append(
-                cve_resolver.PlanEntry(
-                    package=name.split(":", 1)[0],
-                    architecture=pkg.architecture if pkg else facts.architecture,
-                    current_version=pkg.version if pkg else None,
-                    target_version=version,
-                    source=source,
-                    status="unresolved",
-                    reason=f"Unable to resolve package download plan: {error}",
-                    reboot_impact=impact or "No reboot expected",
-                    requests_reboot=impact is not None,
-                    cves=sorted(cves_by_source.get(source, set())),
-                )
-            )
-        return entries
 
 
 # --- presentation helpers -------------------------------------------------------------

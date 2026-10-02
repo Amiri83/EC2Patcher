@@ -9,11 +9,17 @@ import subprocess  # noqa: S404 - required to drive the system ssh client safely
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ec2patcher.validation import check_ip_address, check_pem_path, expand_pem_path
+from ec2patcher.models import DEFAULT_SSH_USER
+from ec2patcher.validation import (
+    check_ip_address,
+    check_pem_path,
+    check_ssh_user,
+    expand_pem_path,
+)
 
 logger = logging.getLogger(__name__)
 
-SSH_USER = "ubuntu"
+SSH_USER = DEFAULT_SSH_USER  # default login user; each server can configure its own
 SSH_BINARY = "ssh"
 CONNECT_TIMEOUT_SECONDS = 10
 # Hard upper bound for the whole ssh process (connect + run remote command).
@@ -53,8 +59,36 @@ class RemoteResult:
     error: str | None = None  # user-friendly message when ok is False
 
 
+def _checked_user(user: str) -> str:
+    error = check_ssh_user(user)
+    if error:
+        raise ValueError(error)
+    return user
+
+
+def _port_options(flag: str, port: int | None) -> list[str]:
+    """``-p``/``-P <port>``; no option (ssh default 22) when ``port`` is None."""
+    if port is None:
+        return []
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536:
+        raise ValueError(f"Invalid SSH port: {port!r}")
+    return [flag, str(port)]
+
+
+def _check_target(ip_address: str, pem_path: str, user: str) -> tuple[str | None, str | None]:
+    """(normalized_ip, error) after validating IP, PEM path and SSH user."""
+    normalized_ip, ip_error = check_ip_address(ip_address)
+    if ip_error:
+        return None, ip_error
+    return normalized_ip, check_pem_path(pem_path) or check_ssh_user(user)
+
+
 def build_ssh_command(
-    ip_address: str, pem_path: str, remote_command: str = REMOTE_COMMAND
+    ip_address: str,
+    pem_path: str,
+    remote_command: str = REMOTE_COMMAND,
+    user: str = SSH_USER,
+    port: int | None = None,
 ) -> list[str]:
     """Build the ssh argument list. PEM path '~' is expanded here.
 
@@ -65,8 +99,9 @@ def build_ssh_command(
         SSH_BINARY,
         "-i", str(expand_pem_path(pem_path)),
         *SSH_OPTIONS,
+        *_port_options("-p", port),
         "--",
-        f"{SSH_USER}@{ip_address}",
+        f"{_checked_user(user)}@{ip_address}",
         remote_command,
     ]  # fmt: skip
 
@@ -82,16 +117,22 @@ SSH_OPTIONS = [
 
 
 def build_scp_command(
-    ip_address: str, pem_path: str, local_files: list[str], remote_dir: str
+    ip_address: str,
+    pem_path: str,
+    local_files: list[str],
+    remote_dir: str,
+    user: str = SSH_USER,
+    port: int | None = None,
 ) -> list[str]:
-    """``scp -i <pem> <options> -- <files...> ubuntu@<ip>:<remote_dir>/`` as an argument list.
+    """``scp -i <pem> <options> -- <files...> <user>@<ip>:<remote_dir>/`` as an argument list.
 
     Callers validate ``remote_dir`` and the file names (no shell metacharacters).
     """
     host = f"[{ip_address}]" if ":" in ip_address else ip_address
     return [
         SCP_BINARY, "-q", "-i", str(expand_pem_path(pem_path)), *SSH_OPTIONS,
-        "--", *local_files, f"{SSH_USER}@{host}:{remote_dir.rstrip('/')}/",
+        *_port_options("-P", port),
+        "--", *local_files, f"{_checked_user(user)}@{host}:{remote_dir.rstrip('/')}/",
     ]  # fmt: skip
 
 
@@ -102,15 +143,14 @@ def run_scp(
     remote_dir: str,
     runner: Runner = subprocess.run,
     timeout: int = PROCESS_TIMEOUT_SECONDS,
+    user: str = SSH_USER,
+    port: int | None = None,
 ) -> RemoteResult:
-    """Copy local files to ``ubuntu@<ip>:<remote_dir>/`` (no shell, same ssh options)."""
-    normalized_ip, ip_error = check_ip_address(ip_address)
-    if ip_error:
-        return RemoteResult(ok=False, error=ip_error)
-    pem_error = check_pem_path(pem_path)
-    if pem_error:
-        return RemoteResult(ok=False, error=pem_error)
-    command = build_scp_command(normalized_ip, pem_path, local_files, remote_dir)
+    """Copy local files to ``<user>@<ip>:<remote_dir>/`` (no shell, same ssh options)."""
+    normalized_ip, error = _check_target(ip_address, pem_path, user)
+    if error:
+        return RemoteResult(ok=False, error=error)
+    command = build_scp_command(normalized_ip, pem_path, local_files, remote_dir, user, port)
     try:
         proc = runner(
             command,
@@ -179,18 +219,18 @@ def run_remote(
     runner: Runner = subprocess.run,
     timeout: int = PROCESS_TIMEOUT_SECONDS,
     accept_returncodes: tuple[int, ...] = (0,),
+    user: str = SSH_USER,
+    port: int | None = None,
 ) -> RemoteResult:
-    """Run a command as ``ubuntu@<ip>`` with the same safe ssh options as the SSH test.
+    """Run a command as ``<user>@<ip>`` with the same safe ssh options as the SSH test.
 
-    The PEM path and IP are validated first. ssh itself exits 255 on connection/auth errors.
+    The IP, PEM path and user are validated first. ssh itself exits 255 on connection/auth
+    errors.
     """
-    normalized_ip, ip_error = check_ip_address(ip_address)
-    if ip_error:
-        return RemoteResult(ok=False, error=ip_error)
-    pem_error = check_pem_path(pem_path)
-    if pem_error:
-        return RemoteResult(ok=False, error=pem_error)
-    command = build_ssh_command(normalized_ip, pem_path, remote_command)
+    normalized_ip, error = _check_target(ip_address, pem_path, user)
+    if error:
+        return RemoteResult(ok=False, error=error)
+    command = build_ssh_command(normalized_ip, pem_path, remote_command, user, port)
     try:
         proc = runner(
             command,
@@ -220,22 +260,23 @@ def run_remote(
 
 
 def check_connection(
-    server_name: str, ip_address: str, pem_path: str, runner: Runner = subprocess.run
+    server_name: str,
+    ip_address: str,
+    pem_path: str,
+    runner: Runner = subprocess.run,
+    user: str = SSH_USER,
+    port: int | None = None,
 ) -> SSHTestResult:
-    """Attempt `ssh -i <pem> ubuntu@<ip>` and collect hostname / OS / architecture."""
+    """Attempt `ssh -i <pem> <user>@<ip>` and collect hostname / OS / architecture."""
     result = SSHTestResult(success=False, server_name=server_name, ip_address=ip_address)
 
-    normalized_ip, ip_error = check_ip_address(ip_address)
-    if ip_error:
-        result.error = ip_error
-        return result
-    pem_error = check_pem_path(pem_path)
-    if pem_error:
-        result.error = pem_error
+    normalized_ip, error = _check_target(ip_address, pem_path, user)
+    if error:
+        result.error = error
         return result
 
-    logger.info("SSH test attempted: server=%s ip=%s", server_name, normalized_ip)
-    command = build_ssh_command(normalized_ip, pem_path)
+    logger.info("SSH test attempted: server=%s ip=%s user=%s", server_name, normalized_ip, user)
+    command = build_ssh_command(normalized_ip, pem_path, user=user, port=port)
     try:
         proc = runner(
             command,
