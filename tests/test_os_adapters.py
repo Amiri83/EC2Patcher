@@ -1,5 +1,7 @@
-"""OS detection and the OsAdapter layer: Ubuntu goes through UbuntuAdapter unchanged, any
-other OS named by /etc/os-release is reported as "OS not supported yet" (not a failure)."""
+"""OS detection and the OsAdapter layer: Ubuntu goes through UbuntuAdapter unchanged, Amazon
+Linux 2023 through AmazonLinuxAdapter (see test_amazon_linux), Amazon Linux 2 is reported as
+"OS not supported" (end of life) and any other OS named by /etc/os-release as "OS not
+supported yet" (neither is a failure)."""
 
 import subprocess
 
@@ -22,6 +24,17 @@ PLATFORM_ID="platform:al2023"
 PRETTY_NAME="Amazon Linux 2023.6.20241010"
 ANSI_COLOR="0;33"
 HOME_URL="https://aws.amazon.com/linux/amazon-linux-2023/\""""
+
+AL2_OS_RELEASE = """NAME="Amazon Linux"
+VERSION="2"
+ID="amzn"
+ID_LIKE="centos rhel fedora"
+VERSION_ID="2"
+PRETTY_NAME="Amazon Linux 2"
+ANSI_COLOR="0;33"
+CPE_NAME="cpe:2.3:o:amazon:amazon_linux:2"
+HOME_URL="https://amazonlinux.com/\""""
+AL2_MESSAGE = "OS not supported: Amazon Linux 2 (end of life)"
 
 DEBIAN_OS_RELEASE = (
     'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nNAME="Debian GNU/Linux"\nVERSION_ID="12"\n'
@@ -74,7 +87,7 @@ def fleet_ssh():
     return FleetSSH(
         {
             UBUNTU_IP: facts_output(),
-            AMAZON_IP: non_dpkg_facts(AMAZON_OS_RELEASE),
+            AMAZON_IP: non_dpkg_facts(AL2_OS_RELEASE),
             DEBIAN_IP: non_dpkg_facts(DEBIAN_OS_RELEASE, hostname="deb-1"),
         }
     )
@@ -88,8 +101,10 @@ def test_detect_from_facts_output():
     assert os_adapters.detect(ubuntu) is os_adapters.UBUNTU
     assert isinstance(os_adapters.UBUNTU, os_adapters.OsAdapter)
     amazon = os_adapters.os_release_from_output(non_dpkg_facts(AMAZON_OS_RELEASE))
-    assert amazon["ID"] == "amzn" and os_adapters.detect(amazon) is None
-    assert os_adapters.unsupported_message(amazon) == "OS not supported yet: Amazon Linux 2023"
+    assert amazon["ID"] == "amzn" and os_adapters.detect(amazon) is os_adapters.AMAZON_LINUX
+    al2 = os_adapters.os_release_from_output(non_dpkg_facts(AL2_OS_RELEASE))
+    assert al2["ID"] == "amzn" and os_adapters.detect(al2) is None
+    assert os_adapters.unsupported_message(al2) == AL2_MESSAGE
     debian = os_adapters.os_release_from_output(non_dpkg_facts(DEBIAN_OS_RELEASE))
     assert os_adapters.unsupported_message(debian) == "OS not supported yet: Debian GNU/Linux 12"
 
@@ -122,7 +137,8 @@ def test_ubuntu_adapter_delegates_to_the_ubuntu_modules():
     assert ubuntu.is_kernel_package("linux-image-6.8.0-1024-aws")
     assert not ubuntu.is_kernel_package("linux-image-aws")
     assert os_adapters.get(None) is ubuntu and os_adapters.get("ubuntu") is ubuntu
-    assert os_adapters.get("amzn") is None
+    assert os_adapters.get("amzn") is os_adapters.AMAZON_LINUX
+    assert os_adapters.get("plan9") is None
 
 
 # --- analysis -------------------------------------------------------------------------
@@ -137,9 +153,9 @@ def test_mixed_fleet_analysis(fleet):
     assert ubuntu.os_codename == "noble" and ubuntu.findings
     # Others: not a failure, a clear message and what could be learned.
     assert amazon.status == "unsupported"
-    assert amazon.error == "OS not supported yet: Amazon Linux 2023"
-    assert (amazon.os_id, amazon.os_version_id) == ("amzn", "2023")
-    assert amazon.os_pretty_name == "Amazon Linux 2023.6.20241010"
+    assert amazon.error == AL2_MESSAGE
+    assert (amazon.os_id, amazon.os_version_id) == ("amzn", "2")
+    assert amazon.os_pretty_name == "Amazon Linux 2"
     assert amazon.remote_hostname == "ip-10-0-0-12" and amazon.findings == []
     assert debian.status == "unsupported"
     assert debian.error == "OS not supported yet: Debian GNU/Linux 12"
@@ -167,14 +183,14 @@ def test_reanalyze_keeps_the_unsupported_message(fleet):
     assert service.reanalyze_server(run.id, amazon.id)
     again = fleet.get_server_analysis(amazon.id)
     assert again.status == "unsupported"
-    assert again.error == "OS not supported yet: Amazon Linux 2023"
+    assert again.error == AL2_MESSAGE
     assert fleet.get_analysis_run(run.id).status == "completed"
 
 
 def test_unsupported_server_is_never_eligible_for_patching(fleet):
     _, run = analyze(fleet, fleet_ssh())
     amazon = fleet.get_server_analysis(run.servers[1].id)
-    assert check_plan(amazon) == ["OS not supported yet: Amazon Linux 2023"]
+    assert check_plan(amazon) == [AL2_MESSAGE]
     service = PatchService(fleet, runner=FleetSSH({}), starter=sync)
     assert not service.eligibility(amazon).allowed
 
@@ -190,11 +206,14 @@ def test_web_pages_show_the_unsupported_os(fleet, make_client):
     amazon = run.servers[1]
     with make_client() as client:
         page = client.get(f"/analysis/{run.id}").text
-        assert "OS not supported yet: Amazon Linux 2023" in page
+        assert AL2_MESSAGE in page
         assert "Not supported" in page
         report = client.get(f"/analysis/{run.id}/servers/{amazon.id}").text
-        assert "OS NOT SUPPORTED YET" in report and "ANALYSIS FAILED" not in report
-        assert "OS not supported yet: Amazon Linux 2023" in report
+        assert "OS NOT SUPPORTED" in report and "ANALYSIS FAILED" not in report
+        assert "OS NOT SUPPORTED YET" not in report  # end of life: never
+        assert AL2_MESSAGE in report
+        debian = client.get(f"/analysis/{run.id}/servers/{run.servers[2].id}").text
+        assert "OS NOT SUPPORTED YET" in debian
         assert "Operating System" in report
         ubuntu = client.get(f"/analysis/{run.id}/servers/{run.servers[0].id}").text
         assert "<dt>Ubuntu</dt>" in ubuntu

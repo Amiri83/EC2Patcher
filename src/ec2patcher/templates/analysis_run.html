@@ -55,8 +55,12 @@
               {% for key, title, n in sm.buckets %}
                 <span class="bucket-count bucket-{{ key }}{% if n and key == 'action' %} text-danger{% elif n and key == 'investigate' %} text-warning{% endif %}">{{ title }}: {{ n }}</span>
               {% endfor %}
+              {% if s.os_id == "amzn" %}
+              <span class="muted patching-unsupported">Patching not supported yet</span>
+              {% else %}
               <span>{{ sm.packages }} package{{ "" if sm.packages == 1 else "s" }} to update</span>
               <span>Reboot: {% if s.expected_reboot %}<strong>YES EXPECTED</strong>{% else %}no expected reboot{% endif %}</span>
+              {% endif %}
             </div>
           {% endif %}
         </div>

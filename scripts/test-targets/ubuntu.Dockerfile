@@ -1,10 +1,11 @@
 # Ubuntu 24.04 SSH test target: login user "ubuntu", key-only auth, passwordless sudo (as on
 # EC2). The public key is mounted at runtime; no key material is baked into the image.
+# ca-certificates: `apt changelog` fetches over HTTPS from changelogs.ubuntu.com (as on EC2).
 FROM ubuntu:24.04
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        openssh-server sudo \
+        openssh-server sudo ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # The image already ships the "ubuntu" user. '*' = no password, but not "locked" for sshd.

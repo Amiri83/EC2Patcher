@@ -3,7 +3,10 @@
 Read-only by design. Each server receives exactly one fixed ssh command as the server's
 unprivileged SSH user (no sudo) that collects facts (os-release, dpkg-query, uname, ...). The
 OS is detected from /etc/os-release and everything OS-specific is done by its adapter
-(os_adapters; Ubuntu only - other systems are reported as "OS not supported yet"). APT
+(os_adapters: Ubuntu, and Amazon Linux 2023 - analysis only - whose own read-only facts
+command (rpm -qa, needs-restarting -r) is a second ssh command; other systems are reported as
+"OS not supported yet"). Amazon Linux advisories (updateinfo.xml) are fetched on the
+workstation (amazon_updateinfo). APT
 candidates and the upgrade plan (apt-get -s / --print-uris) are resolved on the workstation
 against a private APT state for the server's release and architecture (local_apt). Nothing
 is downloaded, copied, installed or restarted.
@@ -29,11 +32,13 @@ from ec2patcher import config
 from ec2patcher.database import Database
 from ec2patcher.models import ServerAnalysis, StoredReport
 from ec2patcher.services import (
+    amazon_updateinfo,
     cve_resolver,
     debversion,
     local_apt,
     nvd,
     os_adapters,
+    rpmversion,
     server_state,
     ssh_service,
 )
@@ -78,6 +83,7 @@ class AnalysisService:
         starter: Starter = thread_starter,
         nvd_client: nvd.NvdClient | None = None,
         apt: local_apt.LocalApt | None = None,
+        advisories: amazon_updateinfo.UpdateInfoSource | None = None,
     ):
         self.db = db
         self.metadata = metadata
@@ -85,6 +91,7 @@ class AnalysisService:
         self.apt = apt or local_apt.LocalApt(
             config.get_apt_state_dir(config.get_data_dir()), config.get_apt_max_age()
         )
+        self.advisories = advisories or amazon_updateinfo.UpdateInfoSource(db)
         self.runner = runner
         self.starter = starter
         self._lock = threading.Lock()
@@ -197,6 +204,7 @@ class AnalysisService:
 
         self.nvd.start_run()
         self.apt.start_run()
+        self.advisories.start_run()
         failures = 0
         for index, analysis in enumerate(run.servers, start=1):
             label = f"{analysis.server_name} ({index} of {len(run.servers)})"
@@ -294,6 +302,7 @@ class AnalysisService:
         self.metadata.start_run(force_refresh=True, cves=failed)
         self.nvd.start_run()
         self.apt.start_run()
+        self.advisories.start_run()
 
         def lookup(cve: str):
             if cve.strip().upper() in failed:
@@ -362,6 +371,7 @@ class AnalysisService:
         self.metadata.start_run(force_refresh=True)
         self.nvd.start_run()
         self.apt.start_run()
+        self.advisories.start_run(force_refresh=True)
         label = analysis.server_name
 
         def progress(message: str) -> None:
@@ -450,6 +460,10 @@ class AnalysisService:
         if adapter is None:
             self._mark_unsupported(analysis, result.stdout, os_release)
             return None
+        if adapter is not os_adapters.DEFAULT:  # the OS's own read-only facts command
+            result = self._remote(server, adapter.facts_command, FACTS_TIMEOUT_SECONDS)
+            if not result.ok:
+                return result.error
         try:
             facts = adapter.parse_facts(result.stdout)
         except server_state.RemoteOutputError as exc:
@@ -479,6 +493,7 @@ class AnalysisService:
             progress=progress,
             record=lambda **fields: self.db.update_server_analysis(analysis.id, **fields),
             lookup=lookup,
+            advisories=self.advisories,
         )
         assessment = adapter.assess(facts, analysis.reported_cves, context)
         self._enrich_severity(assessment.findings, progress)
@@ -548,6 +563,15 @@ class RemediationGroup:
     highest_row: object
 
 
+def _oldest(versions: list[str]) -> str:
+    """Oldest version; rpm versions (Amazon Linux) that are not valid Debian versions are
+    ordered as rpm EVRs."""
+    try:
+        return min(versions, key=debversion.version_key)
+    except debversion.InvalidVersionError:
+        return min(versions, key=rpmversion.version_key)
+
+
 def remediation_groups(findings: list) -> list[RemediationGroup]:
     """Collapse findings with the same source, fix and status for report presentation only.
 
@@ -578,7 +602,8 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
         status = cve_resolver.rollup_status([f.status for f in rows])
         highest = max(rows, key=lambda f: f.cvss_score if f.cvss_score is not None else -1)
         detail = next((f.detail for f in rows if f.status == status and f.detail), None)
-        if status == cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS:
+        newer_release = cve_resolver.NEWER_RELEASEVER_REQUIRED in (detail or "")
+        if status == cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS and not newer_release:
             detail = "The configured repositories do not offer the fixed version."
         result.append(
             RemediationGroup(
@@ -589,7 +614,7 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
                 cvss_score=highest.cvss_score,
                 cvss_label=highest.cvss_label,
                 ubuntu_priority=next((f.priority for f in rows if f.priority), None),
-                installed_version=min(versions, key=debversion.version_key) if versions else None,
+                installed_version=_oldest(versions) if versions else None,
                 fixed_version=first.fixed_version,
                 candidate_version=(
                     max(candidates, key=debversion.version_key) if candidates else None
@@ -628,6 +653,7 @@ BUCKETS = (
             cve_resolver.ANALYSIS_ERROR,
             cve_resolver.PENDING_OR_DEFERRED,
             cve_resolver.NO_FIX_PUBLISHED,
+            cve_resolver.NO_ADVISORY,
         ),
     ),
     (
