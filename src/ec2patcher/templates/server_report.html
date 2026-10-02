@@ -12,14 +12,19 @@
   <a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>
 </div>{% endblock %}
 {% block content %}
-{% macro severity_cell(f) %}<span class="badge {{ severity_classes[f.severity] }}"{% if f.nvd_note %} title="{{ f.nvd_note }}"{% endif %}>{{ f.severity }}</span>{% if f.priority %}<div class="muted small">Ubuntu Priority: {{ f.priority }}</div>{% endif %}{% endmacro %}
+{% set amazon = analysis.os_id == "amzn" %}
+{% macro severity_cell(f) %}<span class="badge {{ severity_classes[f.severity] }}"{% if f.nvd_note %} title="{{ f.nvd_note }}"{% endif %}>{{ f.severity }}</span>{% if f.priority %}<div class="muted small">{{ "ALAS Severity" if analysis.os_id == "amzn" else "Ubuntu Priority" }}: {{ f.priority }}</div>{% endif %}{% endmacro %}
 {% macro cvss_cell(f) %}{% if f.cvss_score is not none %}<span{% if f.cvss_vector %} title="{{ f.cvss_vector }}"{% endif %}>{{ f.cvss_label }}</span>{% else %}<span class="muted">—</span>{% endif %}
   <div class="muted small">{% if f.nvd_status is none %}not captured{% elif f.nvd_status in ("ok", "stale") %}Source: {{ "NVD" if f.cvss_source == "nvd@nist.gov" else (f.cvss_source or "unknown") }}{% if f.cvss_source_type and f.cvss_source != "nvd@nist.gov" %} ({{ f.cvss_source_type }}){% endif %}{% if f.nvd_status == "stale" %} &middot; stale cache{% endif %}{% else %}{{ nvd_status_labels.get(f.nvd_status, f.nvd_status) }}{% endif %}</div>{% endmacro %}
 {% macro findings_table(groups) %}
   {% if groups %}
     <div class="table-scroll">
     <table class="table findings-table">
+      {% if analysis.os_id == "amzn" %}
+      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Source RPM</th><th>Installed Version</th><th>Amazon Fixed Version (Advisory)</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th></tr></thead>
+      {% else %}
       <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Canonical Fixed Version</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th></tr></thead>
+      {% endif %}
       <tbody>
       {% for g in groups %}
           <tr>
@@ -67,7 +72,7 @@
     <h2>Server</h2>
     {% if analysis.status == "complete" %}<span class="badge badge-success">ANALYSIS COMPLETE</span>
     {% elif analysis.status == "failed" %}<span class="badge badge-danger">ANALYSIS FAILED</span>
-    {% elif analysis.status == "unsupported" %}<span class="badge badge-neutral">OS NOT SUPPORTED YET</span>
+    {% elif analysis.status == "unsupported" %}<span class="badge badge-neutral">{{ "OS NOT SUPPORTED" if (analysis.error or "").endswith("(end of life)") else "OS NOT SUPPORTED YET" }}</span>
     {% else %}<span class="badge badge-warning">{{ analysis.status|upper }}</span>{% endif %}
   </div>
   {% if analysis.error and analysis.status == "unsupported" %}<div class="alert alert-warning">{{ analysis.error }}</div>
@@ -78,13 +83,18 @@
     <dt>IP</dt><dd><code>{{ analysis.ip_address or "-" }}</code></dd>
     <dt>Remote Hostname</dt><dd>{{ analysis.remote_hostname or "-" }}</dd>
     <dt>{{ "Ubuntu" if analysis.os_id in (none, "ubuntu") else "Operating System" }}</dt><dd>{{ analysis.os_pretty_name or "-" }}</dd>
-    <dt>Codename</dt><dd>{{ analysis.os_codename or "-" }}</dd>
+    <dt>{{ "Releasever" if amazon else "Codename" }}</dt><dd>{{ analysis.os_codename or "-" }}</dd>
     <dt>Architecture</dt><dd>{{ analysis.architecture or "-" }}</dd>
     <dt>Running Kernel</dt><dd>{{ analysis.running_kernel or "-" }}</dd>
     <dt>Analysis Time</dt><dd>{{ (analysis.completed_at or analysis.started_at or run.started_at)|timestamp }}</dd>
+    {% if amazon %}
+    <dt>Security Advisories</dt>
+    <dd>Amazon Linux 2023 updateinfo (ALAS) of releasever {{ analysis.os_codename or "?" }} and the latest release, fetched on this workstation</dd>
+    {% else %}
     <dt>Canonical Security Metadata</dt>
     <dd>{% include "_metadata_status.html" %}
         <div class="muted small">{{ run.metadata_source or "" }}</div></dd>
+    {% endif %}
     <dt>APT Metadata</dt>
     <dd>{% if analysis.apt_updated_at %}Workstation private lists{% if analysis.os_codename %} ({{ analysis.os_codename }}, {{ analysis.os_codename }}-updates, {{ analysis.os_codename }}-security{% if analysis.architecture %}; {{ analysis.architecture }}{% endif %}){% endif %} updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">not used</span>{% endif %}</dd>
     <dt>Current Reboot Required</dt>
@@ -105,6 +115,9 @@
     {% if ex %}<span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ patch_labels.get(ex.state, ex.state)|upper }}</span>
     {% else %}<span class="badge badge-neutral">PENDING REVIEW</span>{% endif %}
   </div>
+  {% if patching_unsupported %}
+    <p class="muted patching-unsupported">{{ patching_unsupported }}</p>
+  {% else %}
   {% if patch.not_checked_warning %}<div class="alert alert-warning not-checked-warning">{{ patch.not_checked_warning }}</div>{% endif %}
   {% if patch.excluded_warning %}<div class="alert alert-warning excluded-warning">{{ patch.excluded_warning }}</div>{% endif %}
   {% if ex and ex.decision == "REJECTED" %}
@@ -140,6 +153,7 @@
         <button type="button" class="btn btn-primary" disabled>Approve &amp; Patch</button>
       {% endif %}
     </div>
+  {% endif %}
   {% endif %}
 </div>
 
@@ -229,6 +243,8 @@
       </tbody>
     </table>
     </div>
+  {% elif patching_unsupported %}
+    <p class="muted">Package planning is not supported yet for this operating system.</p>
   {% else %}
     <p class="muted">No package updates are planned for this server{% if patch.not_checked_warning %} for the CVEs that were checked{% endif %}.</p>
     {% if patch.not_checked_warning %}<div class="alert alert-warning">{{ patch.not_checked_warning }}</div>{% endif %}

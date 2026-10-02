@@ -104,7 +104,7 @@ def test_only_latest_report_kept(db):
 
 def test_schema_version_set(db):
     with sqlite3.connect(db.path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 12
 
 
 def cache_columns(path):
@@ -161,7 +161,7 @@ def test_reset_recreates_current_schema_and_instance_remains_usable(db):
     assert all(not path.exists() for path in sidecars)
     assert db.count_servers() == 0 and db.get_latest_report() is None
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 12
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }

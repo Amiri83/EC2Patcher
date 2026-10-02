@@ -177,6 +177,8 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
     adapter = os_adapters.for_analysis(analysis)
     if adapter is None:
         return [f"{os_adapters.UNSUPPORTED_PREFIX}: {analysis.os_pretty_name or analysis.os_id}"]
+    if not adapter.supports_patching:
+        return [adapter.patching_unsupported]
     reasons: list[str] = []
     missing = [
         label

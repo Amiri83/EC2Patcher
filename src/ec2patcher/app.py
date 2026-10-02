@@ -29,6 +29,7 @@ from ec2patcher.services import (
     excel_export,
     local_apt,
     nvd,
+    os_adapters,
     patch_service,
     report_service,
     ssh_service,
@@ -83,6 +84,7 @@ STATUS_CLASSES = {
     cve_resolver.PENDING_OR_DEFERRED: "badge-warning",
     cve_resolver.UNKNOWN: "badge-warning",
     cve_resolver.METADATA_UNAVAILABLE: "badge-warning",
+    cve_resolver.NO_ADVISORY: "badge-warning",
     cve_resolver.ALREADY_FIXED: "badge-success",
     cve_resolver.NOT_AFFECTED: "badge-success",
     cve_resolver.PACKAGE_NOT_INSTALLED: "badge-success",
@@ -511,6 +513,10 @@ def create_app(
         latest = db.get_latest_analysis_run()
         groups = analysis_service.remediation_groups(analysis.findings)
         ctx.setdefault("notice", notice_from_query(request))
+        adapter = os_adapters.for_analysis(analysis)
+        unsupported = None  # analysis-only OS: no patch decision is offered
+        if adapter is not None and not adapter.supports_patching:
+            unsupported = adapter.patching_unsupported
         return render(
             request, "server_report.html", "reports", status_code=status_code, run=run,
             analysis=analysis, summary=analysis_service.summarize(analysis),
@@ -518,7 +524,7 @@ def create_app(
             remediation_groups=groups,
             finding_buckets=analysis_service.bucket_groups(groups),
             is_latest=latest is not None and latest.id == run_id,
-            patch=patcher.eligibility(analysis), **ctx,
+            patch=patcher.eligibility(analysis), patching_unsupported=unsupported, **ctx,
         )  # fmt: skip
 
     @app.get("/analysis/{run_id}/servers/{analysis_id}", response_class=HTMLResponse)
@@ -693,6 +699,7 @@ def create_app(
     def clear_security_cache():
         removed = metadata.clear()
         removed = analyzer.nvd.clear() or removed
+        removed = analyzer.advisories.clear() or removed
         return redirect("/settings", notice="cache_cleared" if removed else "cache_clean")
 
     @app.post("/settings/reset-database", response_class=HTMLResponse)
