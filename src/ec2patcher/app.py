@@ -438,10 +438,13 @@ def create_app(
         if run is None:
             raise StarletteHTTPException(404)
         summaries = {s.id: analysis_service.summarize(s) for s in run.servers}
+        eligible_count = 0
+        if not run.is_running:  # same read-only preview as the Patch All confirmation page
+            eligible_count = sum(c.allowed for _, c in patcher.queue_preview(run))
         return render(
             request, "analysis_run.html", "reports", run=run, summaries=summaries,
             notice=notice_from_query(request), patch_running=patcher.is_running,
-            latest_queue_id=db.latest_queue_id(run_id),
+            latest_queue_id=db.latest_queue_id(run_id), eligible_count=eligible_count,
         )  # fmt: skip
 
     @app.post("/analysis/{run_id}/retry-lookups", response_class=HTMLResponse)
