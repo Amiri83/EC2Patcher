@@ -31,6 +31,10 @@ PENDING_OR_DEFERRED = "PENDING_OR_DEFERRED"
 UNKNOWN = "UNKNOWN"
 METADATA_UNAVAILABLE = "METADATA_UNAVAILABLE"
 ANALYSIS_ERROR = "ANALYSIS_ERROR"
+# Amazon Linux: no security advisory (ALAS) references the CVE for the server's release.
+NO_ADVISORY = "NO_ADVISORY"
+# Detail of an Amazon Linux FIX_NOT_IN_CONFIGURED_REPOS finding (kept in report groups).
+NEWER_RELEASEVER_REQUIRED = "The fix needs a newer releasever"
 
 STATUS_LABELS = {
     PATCH_AVAILABLE: "Patch available",
@@ -44,6 +48,7 @@ STATUS_LABELS = {
     UNKNOWN: "Canonical status unknown",
     METADATA_UNAVAILABLE: "Canonical metadata unavailable",
     ANALYSIS_ERROR: "Analysis error",
+    NO_ADVISORY: "No Amazon Linux advisory",
 }
 
 # Older stored snapshots remain readable under the current vocabulary. An old
@@ -71,6 +76,7 @@ STATUS_PRIORITY = [
     PRO_OR_ESM_REQUIRED,
     METADATA_UNAVAILABLE,
     UNKNOWN,
+    NO_ADVISORY,
     PENDING_OR_DEFERRED,
     NO_FIX_PUBLISHED,
     ALREADY_FIXED,

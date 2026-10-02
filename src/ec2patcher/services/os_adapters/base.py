@@ -27,6 +27,7 @@ class AnalysisContext:
     progress: Callable[[str], None]
     record: Callable[..., None]  # update fields of the server's analysis row
     lookup: Callable[[str], object] | None = None  # replaces the metadata lookup (retries)
+    advisories: object = None  # Amazon Linux advisories (amazon_updateinfo.UpdateInfoSource)
 
 
 @dataclass
@@ -42,6 +43,9 @@ class Assessment:
 class OsAdapter(ABC):
     os_id: str  # /etc/os-release ID handled by this adapter (stored with each analysis)
     name: str  # human-readable OS family, e.g. "Ubuntu"
+    # False: analysis only; the patch flow refuses the analysis with ``patching_unsupported``.
+    supports_patching: bool = True
+    patching_unsupported: str = ""
 
     # --- detection and facts (read-only) ---------------------------------------------
 

@@ -28,7 +28,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -323,6 +323,17 @@ _MIGRATIONS = {
     11: """
         ALTER TABLE servers ADD COLUMN ssh_user TEXT NOT NULL DEFAULT 'ubuntu';
         ALTER TABLE server_analyses ADD COLUMN os_id TEXT;
+    """,
+    # Amazon Linux 2023 security advisories (repository updateinfo.xml) per repository
+    # '<releasever>/<arch>', fetched on the workstation: the CVE-referencing advisories as
+    # slim JSON. Failed downloads are never stored.
+    12: """
+        CREATE TABLE amazon_updateinfo_cache (
+            repo        TEXT PRIMARY KEY,
+            advisories  TEXT NOT NULL,
+            repo_url    TEXT,
+            fetched_at  TEXT NOT NULL
+        );
     """,
 }
 
@@ -1066,6 +1077,34 @@ class Database:
     def clear_nvd_cache(self) -> int:
         with self.connect() as conn:
             return conn.execute("DELETE FROM nvd_cache").rowcount
+
+    # --- Amazon Linux updateinfo cache -------------------------------------------------
+
+    def get_updateinfo_cache(self, repo: str) -> tuple[str, str | None, str] | None:
+        """(advisories JSON, repository URL, fetched_at), or None if not cached."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT advisories, repo_url, fetched_at FROM amazon_updateinfo_cache "
+                "WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+        return (row["advisories"], row["repo_url"], row["fetched_at"]) if row else None
+
+    def put_updateinfo_cache(
+        self, repo: str, advisories: str, repo_url: str | None, fetched_at: str
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO amazon_updateinfo_cache (repo, advisories, repo_url, fetched_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(repo) DO UPDATE SET "
+                "advisories = excluded.advisories, repo_url = excluded.repo_url, "
+                "fetched_at = excluded.fetched_at",
+                (repo, advisories, repo_url, fetched_at),
+            )
+
+    def clear_updateinfo_cache(self) -> int:
+        with self.connect() as conn:
+            return conn.execute("DELETE FROM amazon_updateinfo_cache").rowcount
 
     def get_latest_report(self) -> StoredReport | None:
         with self.connect() as conn:
