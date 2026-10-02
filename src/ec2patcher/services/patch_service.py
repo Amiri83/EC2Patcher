@@ -44,12 +44,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ec2patcher.database import Database, DecisionExistsError, ExecutionActiveError
-from ec2patcher.models import AnalysisRun, PatchExecution, PatchPackageResult, ServerAnalysis
+from ec2patcher.models import (
+    DEFAULT_SSH_USER,
+    AnalysisRun,
+    PatchExecution,
+    PatchPackageResult,
+    ServerAnalysis,
+)
 from ec2patcher.services import (
-    apt_planner,
     cve_resolver,
-    debversion,
     downloader,
+    os_adapters,
     patch_remote,
     server_state,
     ssh_service,
@@ -122,19 +127,27 @@ class PatchAbort(Exception):  # noqa: N818 - control flow, not an error in the c
 # --- plan validation -----------------------------------------------------------------
 
 
-def at_target(row) -> bool:
+def _adapter(analysis: ServerAnalysis) -> os_adapters.OsAdapter:
+    """The OS adapter of an analysis (only analyses of a supported OS have a plan)."""
+    return os_adapters.for_analysis(analysis) or os_adapters.DEFAULT
+
+
+def at_target(row, adapter: os_adapters.OsAdapter | None = None) -> bool:
     """A plan row whose recorded installed version is already at or above its target (e.g.
     stored before the planner excluded such rows): excluded from patching, never an error."""
-    return cve_resolver.at_or_above_target(row.current_version, row.target_version)
+    adapter = adapter or os_adapters.DEFAULT
+    return adapter.at_or_above_target(row.current_version, row.target_version)
 
 
 def installable(analysis: ServerAnalysis) -> list:
     """The plan rows that still need installing (``at_target`` rows excluded)."""
-    return [p for p in analysis.plan if not at_target(p)]
+    adapter = _adapter(analysis)
+    return [p for p in analysis.plan if not at_target(p, adapter)]
 
 
 def excluded_warning(analysis: ServerAnalysis) -> str | None:
-    rows = [p for p in analysis.plan if at_target(p)]
+    adapter = _adapter(analysis)
+    rows = [p for p in analysis.plan if at_target(p, adapter)]
     if not rows:
         return None
     names = ", ".join(
@@ -157,16 +170,20 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
     """Reasons why this analysis must not be patched (empty list: plan is complete)."""
     if analysis.status == "failed":
         return ["The analysis of this server failed."]
+    if analysis.status == os_adapters.UNSUPPORTED_STATUS:
+        return [analysis.error or f"{os_adapters.UNSUPPORTED_PREFIX}."]
     if analysis.status != "complete":
         return ["The analysis of this server is not complete."]
+    adapter = os_adapters.for_analysis(analysis)
+    if adapter is None:
+        return [f"{os_adapters.UNSUPPORTED_PREFIX}: {analysis.os_pretty_name or analysis.os_id}"]
     reasons: list[str] = []
     missing = [
         label
         for label, value in (
             ("IP address", analysis.ip_address),
             ("remote hostname", analysis.remote_hostname),
-            ("Ubuntu version", analysis.os_version_id),
-            ("codename", analysis.os_codename),
+            *adapter.release_fields(analysis),
             ("architecture", analysis.architecture),
         )
         if not value
@@ -200,32 +217,7 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
         if p.status != "planned":
             reasons.append(f"{name}: package download plan is unresolved.")
             continue
-        if not p.deb_filename or not staging.DEB_FILENAME_RE.match(p.deb_filename):
-            reasons.append(f"{name}: .deb file name is missing or invalid.")
-        if downloader.check_uri(p.uri):
-            reasons.append(f"{name}: download URI is missing or unsupported.")
-        if downloader.parse_sha256(p.checksum) is None:
-            reasons.append(f"{name}: SHA256 checksum is unavailable.")
-        if not p.size or p.size <= 0:
-            reasons.append(f"{name}: download size is unknown.")
-        if not p.target_version or not debversion.is_valid_version(p.target_version):
-            reasons.append(f"{name}: target version is unresolved.")
-            continue
-        if not p.architecture or p.architecture not in (analysis.architecture, "all"):
-            reasons.append(f"{name}: architecture {p.architecture or '?'} is unresolved.")
-            continue
-        if not apt_planner.PKG_NAME_RE.match(name) or ":" in name:
-            reasons.append(f"{name}: unexpected package name.")
-            continue
-        expected = apt_planner.expected_deb_filename(name, p.target_version, p.architecture)
-        if p.deb_filename and p.deb_filename != expected:
-            reasons.append(f"{name}: plan is inconsistent (.deb {p.deb_filename} != {expected}).")
-        elif p.uri and not apt_planner.uri_basename_matches(p.uri, expected):
-            reasons.append(f"{name}: plan is inconsistent (URI does not point at {expected}).")
-        if not p.is_dependency and not p.current_version:
-            reasons.append(f"{name}: plan is inconsistent (installed version unknown).")
-        if p.current_version and not debversion.is_valid_version(p.current_version):
-            reasons.append(f"{name}: installed version is invalid.")
+        reasons += adapter.plan_row_problems(p, analysis.architecture)
     for filename, debs in unique_debs(analysis).items():
         if len({(r.uri, r.checksum, r.size) for r in debs}) > 1:
             reasons.append(f"{filename}: plan is inconsistent (conflicting URI/checksum/size).")
@@ -294,6 +286,8 @@ class _Context:
     remote_dir: str
     packages: list[PatchPackageResult]
     debs: dict[str, dict]  # filename -> {uri, size, sha256, package_ids}
+    user: str = DEFAULT_SSH_USER  # SSH login user of the server
+    adapter: os_adapters.OsAdapter = os_adapters.DEFAULT  # OS the analysis was made for
     notes: list[str] = field(default_factory=list)
     reboot_required: bool = False  # /run/reboot-required seen by the post-install check
     dropped: list[PatchPackageResult] = field(default_factory=list)  # already at target
@@ -685,10 +679,14 @@ class PatchService:
             remote_dir=execution.remote_staging_path,
             packages=execution.packages,
             debs=debs,
+            user=server.ssh_user,
+            adapter=_adapter(analysis),
         )
 
     def _remote(self, ctx: _Context, command: str, timeout: int) -> ssh_service.RemoteResult:
-        return ssh_service.run_remote(ctx.ip, ctx.pem, command, runner=self.runner, timeout=timeout)
+        return ssh_service.run_remote(
+            ctx.ip, ctx.pem, command, runner=self.runner, timeout=timeout, user=ctx.user
+        )
 
     def _packages_with(self, ctx: _Context, filename: str) -> list[PatchPackageResult]:
         return [p for p in ctx.packages if p.deb_filename == filename]
@@ -705,35 +703,26 @@ class PatchService:
             raise PatchAbort(f"Sudo preflight failed: {result.error}")
         if not patch_remote.parse_sudo(result.stdout):
             raise PatchAbort(
-                "Passwordless sudo (sudo -n) is not available for the ubuntu user. EC2Patcher "
-                "never asks for a sudo password; configure non-interactive sudo and retry."
+                f"Passwordless sudo (sudo -n) is not available for the {ctx.user} user. "
+                "EC2Patcher never asks for a sudo password; configure non-interactive sudo and "
+                "retry."
             )
 
     def _revalidate(self, ctx: _Context) -> None:
-        a = ctx.analysis
-        result = self._remote(ctx, server_state.FACTS_COMMAND, REVALIDATE_TIMEOUT_SECONDS)
+        adapter = ctx.adapter
+        result = self._remote(ctx, adapter.facts_command, REVALIDATE_TIMEOUT_SECONDS)
         if not result.ok:
             raise PatchAbort(f"Pre-patch revalidation failed: {result.error}")
         try:
-            facts = server_state.parse_facts(result.stdout)
+            facts = adapter.parse_facts(result.stdout)
         except server_state.RemoteOutputError as exc:
             raise PatchAbort(f"Pre-patch revalidation failed: {exc}") from exc
-        drift = []
-        for label, now, then in (
-            ("Hostname", facts.hostname, a.remote_hostname),
-            ("Ubuntu VERSION_ID", facts.version_id, a.os_version_id),
-            ("Codename", facts.codename, a.os_codename),
-            ("Architecture", facts.architecture, a.architecture),
-        ):
-            if now != then:
-                drift.append(f"{label} changed: {then} -> {now}")
-        if facts.os_id != "ubuntu":
-            drift.append(f"Operating system is not Ubuntu ({facts.os_id or 'unknown'}).")
+        drift = adapter.os_drift(facts, ctx.analysis)
         installed = {(p.base_name, p.architecture): p.version for p in facts.packages}
         remaining, dropped = [], []
         for pkg in ctx.packages:
             current = installed.get((pkg.binary_package, pkg.architecture))
-            if cve_resolver.at_or_above_target(current, pkg.target_version):
+            if adapter.at_or_above_target(current, pkg.target_version):
                 dropped.append((pkg, current))  # already at (or above) target: nothing to do
                 continue
             remaining.append(pkg)
@@ -766,7 +755,7 @@ class PatchService:
         plan: a warning, never a failure."""
         for pkg, current in dropped:
             detail = "Already installed at the target version at revalidation; not reinstalled."
-            if not cve_resolver.same_version(current, pkg.target_version):
+            if not ctx.adapter.same_version(current, pkg.target_version):
                 detail = (
                     f"Already installed at {current}, newer than the target version, at "
                     "revalidation; not reinstalled."
@@ -886,7 +875,7 @@ class PatchService:
         for attempt in range(1, SCP_ATTEMPTS + 1):
             sent = ssh_service.run_scp(
                 ctx.ip, ctx.pem, [str(ctx.local_dir / filename)], ctx.remote_dir,
-                runner=self.runner, timeout=timeout,
+                runner=self.runner, timeout=timeout, user=ctx.user,
             )  # fmt: skip
             ctx.transfer_attempts.append(
                 {
@@ -940,22 +929,21 @@ class PatchService:
 
     def _simulate(self, ctx: _Context) -> None:
         self._check_sudo(ctx)
-        command = patch_remote.simulate_command(ctx.remote_dir, ctx.filenames)
+        command = ctx.adapter.simulate_command(ctx.remote_dir, ctx.filenames)
         result = self._remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
         if not result.ok:
             raise PatchAbort(f"Install simulation failed: {result.error}")
-        parsed = patch_remote.parse_apt(result.stdout, "simulate")
-        self.db.update_execution(ctx.execution.id, simulation_output=_tail(parsed.output))
-        check = patch_remote.check_simulation(parsed, self._expected(ctx))
+        output, check = ctx.adapter.check_simulation(result.stdout, self._expected(ctx))
+        self.db.update_execution(ctx.execution.id, simulation_output=_tail(output))
         if not check.ok:
             raise PatchAbort("Install simulation rejected: " + "; ".join(check.problems))
         logger.info("Patch execution %s: install simulation passed", ctx.execution.id)
 
     def _install(self, ctx: _Context) -> patch_remote.PostInstallState:
-        command = patch_remote.install_command(ctx.remote_dir, ctx.filenames)
+        command = ctx.adapter.install_command(ctx.remote_dir, ctx.filenames)
         logger.info("Patch execution %s: installing %d .deb(s)", ctx.execution.id, len(ctx.debs))
         result = self._remote(ctx, command, INSTALL_TIMEOUT_SECONDS)
-        parsed = patch_remote.parse_apt(result.stdout, "install")
+        parsed = ctx.adapter.parse_install(result.stdout)
         output = parsed.output or (result.stdout or "").splitlines()
         if result.stderr and not parsed.complete:
             output = [*output, *result.stderr.splitlines()[-20:]]
@@ -1016,12 +1004,12 @@ class PatchService:
     def _query_post(self, ctx: _Context) -> patch_remote.PostInstallState | None:
         # Dropped packages are queried too: their CVEs are verified like the installed ones.
         names = [p.binary_package for p in [*ctx.packages, *ctx.dropped]]
-        command = patch_remote.post_install_command(names)
+        command = ctx.adapter.post_install_command(names)
         result = self._remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
         if not result.ok:
             logger.warning("Patch execution %s: state query failed", ctx.execution.id)
             return None
-        return patch_remote.parse_post_install(result.stdout)
+        return ctx.adapter.parse_post_install(result.stdout)
 
     def _record_post(self, ctx: _Context, post: patch_remote.PostInstallState) -> list[str]:
         """Persist versions, CVE checks, dpkg health and reboot state; return problems."""
@@ -1033,7 +1021,7 @@ class PatchService:
             if after is None:
                 result, detail = "FAILED", "Package is not installed after the patch."
             else:
-                cmp = debversion.compare_versions(after, pkg.target_version)
+                cmp = ctx.adapter.compare_versions(after, pkg.target_version)
                 if cmp < 0:
                     result = "FAILED"
                     detail = f"Installed {after} is below the approved target {pkg.target_version}."
@@ -1093,11 +1081,12 @@ class PatchService:
                     "approved packages."
                 )
             else:
-                resulting = min((s.source_version for s in matches), key=debversion.version_key)
+                adapter = ctx.adapter
+                resulting = min((s.source_version for s in matches), key=adapter.version_key)
                 row["resulting_version"] = resulting
-                if debversion.compare_versions(resulting, f.fixed_version) >= 0:
+                if adapter.compare_versions(resulting, f.fixed_version) >= 0:
                     row["result"] = "VERIFIED"
-                    if any(cve_resolver.KERNEL_REBOOT_RE.match(s.name) for s in matches):
+                    if any(adapter.is_kernel_package(s.name) for s in matches):
                         row["detail"] = "Fixed kernel installed; takes effect after a reboot."
                 else:
                     row["detail"] = f"Resulting version {resulting} is below {f.fixed_version}."
@@ -1172,8 +1161,8 @@ class PatchService:
             )  # fmt: skip
             logger.info("Patch execution %s: reboot %s: %s", execution_id, status, detail)
 
-        result = self._remote(ctx, patch_remote.REBOOT_CHECK_COMMAND, SHORT_TIMEOUT_SECONDS)
-        check = patch_remote.parse_reboot_check(result.stdout) if result.ok else None
+        result = self._remote(ctx, ctx.adapter.reboot_check_command, SHORT_TIMEOUT_SECONDS)
+        check = ctx.adapter.parse_reboot_check(result.stdout) if result.ok else None
         if check is None:
             finish(
                 ps.REBOOT_FAILED,

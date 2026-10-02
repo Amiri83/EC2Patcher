@@ -15,6 +15,9 @@ class Tag:
     value: str
 
 
+DEFAULT_SSH_USER = "ubuntu"
+
+
 @dataclass
 class Server:
     id: int
@@ -24,6 +27,7 @@ class Server:
     created_at: str
     updated_at: str
     tags: list[Tag] = field(default_factory=list)  # ordered by key (case-insensitive), then id
+    ssh_user: str = DEFAULT_SSH_USER  # login user of every ssh/scp to this server
 
 
 @dataclass
@@ -131,6 +135,7 @@ class ServerAnalysis:
     warnings: list[str] = field(default_factory=list)
     findings: list[CveFindingRow] = field(default_factory=list)
     plan: list[PackagePlanRow] = field(default_factory=list)
+    os_id: str | None = None  # OS adapter that analyzed it (None: before v11, i.e. Ubuntu)
 
 
 # --- Phase 3: patch decisions and executions (separate from the analysis snapshot) ------

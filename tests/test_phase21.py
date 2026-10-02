@@ -178,7 +178,7 @@ def test_severity_persisted_with_findings(analyzed):
     assert by_key[("CVE-2026-10004", "bash")].severity == "Low"
     assert by_key[("CVE-2026-10005", "nginx")].priority is None
     assert by_key[("CVE-2026-10005", "nginx")].severity == "Unknown"  # not in NVD
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION == 11
 
 
 def test_severity_column_rendered(web, analyzed):

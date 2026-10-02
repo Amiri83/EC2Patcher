@@ -9,7 +9,7 @@
     <span class="badge badge-neutral">{{ servers|length }} configured</span>
   </div>
   {% if servers %}
-    <p class="muted small">SSH user is fixed to <code>ubuntu</code>. Only PEM file paths are stored, never key contents.</p>
+    <p class="muted small">Only PEM file paths are stored, never key contents.</p>
     <ul class="server-list">
       {% for s in servers %}
         <li class="server-item" id="server-{{ s.id }}">
@@ -17,6 +17,7 @@
             <div class="server-name">{{ s.name }}</div>
             <div class="server-meta">
               <span><span class="meta-label">IP</span> <code>{{ s.ip_address }}</code></span>
+              <span><span class="meta-label">User</span> <code>{{ s.ssh_user }}</code></span>
               <span><span class="meta-label">PEM</span> <code>{{ s.pem_path }}</code></span>
             </div>
             {% if s.tags %}
@@ -49,7 +50,7 @@
   {% else %}
     <div class="empty-state">
       <p class="empty-title">No servers configured</p>
-      <p class="muted">Add your first Ubuntu EC2 server to get started.</p>
+      <p class="muted">Add your first EC2 server to get started.</p>
       <a href="/servers/new" class="btn btn-primary">+ Add Server</a>
     </div>
   {% endif %}
