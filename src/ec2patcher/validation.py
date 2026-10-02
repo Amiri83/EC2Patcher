@@ -22,6 +22,32 @@ PEM_PATH_MAX_LENGTH = 1024
 TAG_KEY_MAX_LENGTH = 64
 TAG_VALUE_MAX_LENGTH = 256
 MAX_TAGS_PER_SERVER = 50
+SSH_PASSWORD_MAX_LENGTH = 256
+# NVD API keys are UUIDs; accept any token of this alphabet (it goes into an HTTP header).
+NVD_API_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+
+
+def check_ssh_password(password: str) -> str | None:
+    """Return an error message (never containing the password), or None."""
+    if not password:
+        return "Enter the SSH password of this server (it is stored encrypted)."
+    if len(password) > SSH_PASSWORD_MAX_LENGTH:
+        return f"SSH password must be at most {SSH_PASSWORD_MAX_LENGTH} characters."
+    if "\x00" in password:  # cannot be passed through the SSHPASS environment variable
+        return "SSH password contains an unsupported character."
+    return None
+
+
+def check_nvd_api_key(key: str) -> str | None:
+    """Return an error message (never containing the key), or None."""
+    if not key:
+        return "Enter the NVD API key."
+    if not NVD_API_KEY_RE.fullmatch(key):
+        return (
+            "That does not look like an NVD API key: use 16-128 letters, digits, '-' or '_' "
+            "(NVD keys look like 0a1b2c3d-...)."
+        )
+    return None
 
 
 @dataclass
@@ -150,7 +176,7 @@ def validate_server_input(
     """Validate and normalize server form input. Uniqueness is checked against the DB.
 
     Password login needs no PEM file (the path is cleared); the password itself is never
-    part of the server input."""
+    part of the server input (see :func:`check_ssh_password`)."""
     result = ServerInput(
         name=(name or "").strip(),
         ip_address=(ip_address or "").strip(),

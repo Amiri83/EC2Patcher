@@ -3,20 +3,21 @@
 The command is always built as an argument list and run without a shell, so user
 supplied values (IP address, PEM path) are never interpreted by a shell.
 
-Servers log in with a PEM key (default) or with username + password. A password is never
-stored: it lives only in :class:`SessionPasswords` (process memory) and reaches ssh/scp
+Servers log in with a PEM key (default) or with username + password. A password is stored
+per server, encrypted (services.secret_store), decrypted only to connect and reaches ssh/scp
 through ``sshpass -e``, which reads it from the ``SSHPASS`` environment variable of the
-child process - never from the command line, a file or a log.
+child process - never from the command line, a plain-text file or a log.
 """
 
 import logging
 import os
 import subprocess  # noqa: S404 - required to drive the system ssh client safely
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 from ec2patcher.models import AUTH_PASSWORD, DEFAULT_SSH_USER
+from ec2patcher.services.secret_store import SecretError
 from ec2patcher.validation import (
     check_ip_address,
     check_pem_path,
@@ -53,53 +54,26 @@ SSHPASS_MISSING = (
     "use password login, or switch this server to a PEM key."
 )
 PASSWORD_MISSING = (  # an error message, not a password
-    "No SSH password entered for this server in this session. Enter it on the Servers "  # noqa: S105
-    "page (it is kept in memory only until the app is restarted), then try again."
+    "No SSH password is stored for this server. Edit the server on the Servers page, "  # noqa: S105
+    "enter its password and save, then try again."
 )
 
 
-class SessionPasswords:
-    """SSH passwords per server id, in memory only for the lifetime of the app process.
-
-    Never persisted or logged; ``repr`` shows only which server ids have a password.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._passwords: dict[int, str] = {}
-
-    def set(self, server_id: int, password: str) -> None:
-        with self._lock:
-            self._passwords[int(server_id)] = password
-
-    def get(self, server_id: int | None) -> str | None:
-        if server_id is None:
-            return None
-        with self._lock:
-            return self._passwords.get(int(server_id))
-
-    def has(self, server_id: int | None) -> bool:
-        return self.get(server_id) is not None
-
-    def forget(self, server_id: int) -> None:
-        with self._lock:
-            self._passwords.pop(int(server_id), None)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._passwords.clear()
-
-    def __repr__(self) -> str:
-        with self._lock:
-            return f"SessionPasswords(server_ids={sorted(self._passwords)})"
+class PasswordSource(Protocol):
+    def server_password(self, server_id: int) -> str | None: ...
 
 
-def server_password(server, passwords: SessionPasswords | None) -> tuple[str | None, str | None]:
+def server_password(server, credentials: PasswordSource) -> tuple[str | None, str | None]:
     """(password, error) for one configured server: (None, None) for PEM key login,
-    (None, PASSWORD_MISSING) for password login without a password in this session."""
+    (None, PASSWORD_MISSING) for password login without a stored password, and (None, the
+    user-facing reason) when the stored password cannot be decrypted. Never raises."""
     if getattr(server, "auth_method", None) != AUTH_PASSWORD:
         return None, None
-    password = passwords.get(server.id) if passwords is not None else None
+    try:
+        password = credentials.server_password(server.id)
+    except SecretError as exc:
+        logger.error("Stored SSH password of %s cannot be used: %s", server.name, exc)
+        return None, str(exc)
     return (password, None) if password else (None, PASSWORD_MISSING)
 
 

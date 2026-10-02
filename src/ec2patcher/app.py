@@ -32,13 +32,20 @@ from ec2patcher.services import (
     os_adapters,
     patch_service,
     report_service,
+    secret_store,
     ssh_service,
     staging,
 )
 from ec2patcher.services import patch_state as ps
+from ec2patcher.services.secret_store import SecretError
 from ec2patcher.services.security_metadata import SecurityMetadata
 from ec2patcher.services.severity import SEVERITIES, SEVERITY_CLASSES
-from ec2patcher.validation import tag_rows, validate_server_input
+from ec2patcher.validation import (
+    check_nvd_api_key,
+    check_ssh_password,
+    tag_rows,
+    validate_server_input,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +73,8 @@ NOTICES = {
     "saved": "Settings saved.",
     "reset": "Settings reset to default.",
     "rejected": "Patching was rejected for this report. No action was taken.",
-    "password_set": (
-        "SSH password for '{name}' is kept in memory for this app session only (never stored)."
-    ),
-    "password_forgotten": "SSH password for '{name}' was forgotten.",
-    "password_empty": "Enter the SSH password for '{name}'.",
+    "nvd_key_saved": "NVD API key saved (encrypted). It is used instead of NVD_API_KEY.",
+    "nvd_key_cleared": "NVD API key removed from Settings.",
     "log_dir_saved": "Log directory saved. The application now logs to the new location.",
     "log_dir_reset": "Log directory reset to default.",
 }
@@ -112,12 +116,14 @@ def create_app(
     patch_starter: patch_service.Starter | None = None,
     patch_fetcher: downloader.Fetcher | None = None,
     file_logging: bool = False,
-    passwords: ssh_service.SessionPasswords | None = None,
+    secret_key_path: Path | None = None,
 ) -> FastAPI:
     """``file_logging``: log to the rotating file of the configured log directory (the CLI
-    enables it). ``passwords``: in-memory SSH passwords of this app session."""
+    enables it). ``secret_key_path``: Fernet key file of the stored secrets (default: in the
+    config directory)."""
     db = Database(db_path or get_data_dir() / DB_FILENAME)
-    passwords = passwords or ssh_service.SessionPasswords()  # never persisted
+    # Server passwords and the NVD API key, encrypted in the database.
+    credentials = secret_store.SecretStore(db, secret_store.SecretBox(secret_key_path))
 
     def log_dir() -> Path:
         return logging_setup.log_dir_for(db.get_setting(logging_setup.LOG_DIR_SETTING))
@@ -152,8 +158,22 @@ def create_app(
         starter=analysis_starter or analysis_service.thread_starter,
         nvd_client=nvd_client,
         apt=apt,
-        passwords=passwords,
+        credentials=credentials,
     )
+
+    def apply_nvd_key(startup: bool = False) -> None:
+        """Use the NVD API key saved in Settings (it overrides NVD_API_KEY)."""
+        if startup and not credentials.has_nvd_key():
+            return  # keep the client's own key (NVD_API_KEY)
+        try:
+            key = credentials.nvd_key()
+        except SecretError as exc:
+            logger.error("The NVD API key saved in Settings cannot be used: %s", exc)
+            analyzer.nvd.use_settings_key(None, unreadable=True)
+            return
+        analyzer.nvd.use_settings_key(key)
+
+    apply_nvd_key(startup=True)
     interrupted = db.mark_interrupted_executions()
     if interrupted:
         logger.warning("Marked %d unfinished patch execution(s) as interrupted", interrupted)
@@ -166,7 +186,7 @@ def create_app(
         starter=patch_starter or patch_service.thread_starter,
         fetcher=patch_fetcher,
         analysis_running=lambda: analyzer.is_running,
-        passwords=passwords,
+        credentials=credentials,
     )
 
     @asynccontextmanager
@@ -195,6 +215,7 @@ def create_app(
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
     templates.env.globals["nvd_cache_days"] = analyzer.nvd.max_age.days
     templates.env.globals["nvd_key_status"] = lambda: analyzer.nvd.key_status
+    templates.env.globals["nvd_key_source"] = lambda: analyzer.nvd.key_source
     templates.env.globals["patch_labels"] = ps.LABELS
     templates.env.globals["patch_badges"] = ps.BADGES
     templates.env.globals["reboot_labels"] = ps.REBOOT_LABELS
@@ -204,7 +225,7 @@ def create_app(
     templates.env.globals["auth_methods"] = AUTH_METHODS
     app.state.analyzer = analyzer
     app.state.patcher = patcher
-    app.state.passwords = passwords
+    app.state.credentials = credentials
 
     def run_ssh_test(
         name: str, ip: str, pem: str, user: str, password: str | None = None
@@ -281,20 +302,31 @@ def create_app(
         servers = db.list_servers()
         return render(
             request, "servers.html", "servers", status_code=status_code,
-            servers=servers, confirm_text=CLEAR_CONFIRMATION_TEXT,
-            password_ids={s.id for s in servers if passwords.has(s.id)}, **ctx,
+            servers=servers, confirm_text=CLEAR_CONFIRMATION_TEXT, **ctx,
         )  # fmt: skip
 
     @app.get("/servers", response_class=HTMLResponse)
     def list_servers(request: Request):
         return servers_page(request)
 
+    def stored_password(server_id: int | None) -> tuple[str | None, str | None]:
+        """(password, error) of a saved server: (None, None) when none is stored."""
+        if server_id is None:
+            return None, None
+        try:
+            return credentials.server_password(server_id), None
+        except SecretError as exc:
+            return None, str(exc)
+
     def server_form(request: Request, server_id: int | None, form: dict, status_code=200, **ctx):
-        # The password field is always rendered empty; only "entered this session" is shown.
+        # The password field is always rendered empty; only "a password is stored" is shown.
+        server = db.get_server(server_id) if server_id is not None else None
+        has_stored = server is not None and server.has_password
         return render(
             request, "server_form.html", "servers", status_code=status_code,
             server_id=server_id, form=form, errors=ctx.pop("errors", {}),
-            has_session_password=passwords.has(server_id), **ctx,
+            has_stored_password=has_stored,
+            stored_password_error=stored_password(server_id)[1] if has_stored else None, **ctx,
         )  # fmt: skip
 
     def handle_server_form(
@@ -316,35 +348,53 @@ def create_app(
         }  # fmt: skip
         form["tags"] = tag_rows(tag_keys, tag_values)
         use_password = auth_method == AUTH_PASSWORD
-        if action == "test":
-            password = (ssh_password or passwords.get(server_id)) if use_password else None
-            if use_password and not password:
+        if action == "test":  # never saves anything
+            password, error = None, None
+            if use_password and ssh_password:
+                password, error = ssh_password, check_ssh_password(ssh_password)
+            elif use_password:
+                password, error = stored_password(server_id)
+                if password is None and error is None:
+                    error = "Enter the SSH password to test the connection."
+            if error:
                 result = ssh_service.SSHTestResult(
-                    False, name.strip() or "(unsaved)", ip.strip(),
-                    error="Enter the SSH password to test the connection.",
-                )  # fmt: skip
+                    False, name.strip() or "(unsaved)", ip.strip(), error=error
+                )
             else:
                 result = run_ssh_test(
                     name.strip() or "(unsaved)", ip.strip(), pem, ssh_user.strip(), password
                 )
-            if result.success and use_password and ssh_password and server_id is not None:
-                passwords.set(server_id, ssh_password)  # memory only
             return server_form(request, server_id, form, ssh_result=result)
 
         data = validate_server_input(
             db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values,
             ssh_user=ssh_user, auth_method=auth_method,
         )  # fmt: skip
+        existing = db.get_server(server_id) if server_id is not None else None
+        if data.auth_method == AUTH_PASSWORD:
+            # An empty field keeps the stored password; a new server needs one.
+            error = check_ssh_password(ssh_password)
+            if not ssh_password and existing is not None and existing.has_password:
+                error = None
+            if error:
+                data.errors["ssh_password"] = error
         if not data.is_valid:
             return server_form(request, server_id, form, status_code=422, errors=data.errors)
+        encrypted = None
+        if data.auth_method == AUTH_PASSWORD and ssh_password:
+            try:
+                encrypted = credentials.encrypt(ssh_password)
+            except SecretError as exc:
+                logger.error("Cannot store the SSH password of %s: %s", data.name, exc)
+                errors = {"ssh_password": str(exc)}
+                return server_form(request, server_id, form, status_code=422, errors=errors)
         try:
             if server_id is None:
-                server = db.create_server(
+                db.create_server(
                     data.name, data.ip_address, data.pem_path, tags=data.tags,
                     ssh_user=data.ssh_user, auth_method=data.auth_method,
+                    password_encrypted=encrypted,
                 )  # fmt: skip
-                if data.auth_method == AUTH_PASSWORD and ssh_password:
-                    passwords.set(server.id, ssh_password)  # memory only
                 logger.info(
                     "Server created: %s (%s@%s, %s login), %d tag(s)",
                     data.name, data.ssh_user, data.ip_address, data.auth_method, len(data.tags),
@@ -355,10 +405,12 @@ def create_app(
                 ssh_user=data.ssh_user, auth_method=data.auth_method,
             ):  # fmt: skip
                 return redirect("/servers", notice="not_found")
-            if data.auth_method != AUTH_PASSWORD:
-                passwords.forget(server_id)
-            elif ssh_password:
-                passwords.set(server_id, ssh_password)  # memory only
+            if data.auth_method != AUTH_PASSWORD and existing.has_password:
+                credentials.clear_server_password(server_id)  # key login: drop the password
+                logger.info("Stored SSH password removed: server=%s", data.name)
+            elif encrypted is not None:
+                db.set_server_password(server_id, encrypted)
+                logger.info("Stored SSH password replaced (encrypted): server=%s", data.name)
             logger.info(
                 "Server edited: id=%s %s (%s), %d tag(s)",
                 server_id, data.name, data.ip_address, len(data.tags),
@@ -441,7 +493,6 @@ def create_app(
         server = db.get_server(server_id)
         if server is None or not db.delete_server(server_id):
             return redirect("/servers", notice="not_found")
-        passwords.forget(server_id)
         logger.info("Server deleted: id=%s %s", server_id, server.name)
         return redirect("/servers", notice="deleted", name=server.name)
 
@@ -450,7 +501,7 @@ def create_app(
         server = db.get_server(server_id)
         if server is None:
             return redirect("/servers", notice="not_found")
-        password, error = ssh_service.server_password(server, passwords)
+        password, error = ssh_service.server_password(server, credentials)
         if error:
             result = ssh_service.SSHTestResult(False, server.name, server.ip_address, error=error)
         else:
@@ -459,34 +510,12 @@ def create_app(
             )
         return servers_page(request, ssh_result=result, tested_id=server_id)
 
-    @app.post("/servers/{server_id}/password")
-    def set_session_password(server_id: int, ssh_password: str = Form("")):
-        """Keep the SSH password of a password-login server in memory for this app session."""
-        server = db.get_server(server_id)
-        if server is None or not server.uses_password:
-            return redirect("/servers", notice="not_found")
-        if not ssh_password:
-            return redirect("/servers", notice="password_empty", name=server.name)
-        passwords.set(server_id, ssh_password)
-        logger.info("SSH password entered for this session: server=%s", server.name)
-        return redirect("/servers", notice="password_set", name=server.name)
-
-    @app.post("/servers/{server_id}/password/forget")
-    def forget_session_password(server_id: int):
-        server = db.get_server(server_id)
-        if server is None:
-            return redirect("/servers", notice="not_found")
-        passwords.forget(server_id)
-        logger.info("SSH password forgotten: server=%s", server.name)
-        return redirect("/servers", notice="password_forgotten", name=server.name)
-
     @app.post("/servers/clear", response_class=HTMLResponse)
     def clear_servers(request: Request, confirm_text: str = Form("")):
         if confirm_text.strip() != CLEAR_CONFIRMATION_TEXT:
             error = f"Servers were NOT cleared. Type {CLEAR_CONFIRMATION_TEXT} exactly to confirm."
             return servers_page(request, status_code=400, error=error)
-        count = db.clear_servers()
-        passwords.clear()
+        count = db.clear_servers()  # their stored passwords go with them
         logger.info("All servers cleared (%d removed)", count)
         return redirect("/servers", notice="cleared", count=count)
 
@@ -793,8 +822,43 @@ def create_app(
             active_log_file=logging_setup.active_log_file(),
             log_file=logging_setup.log_file_in(log_dir()),
             log_max_mb=logging_setup.LOG_MAX_BYTES // (1024 * 1024),
-            log_backups=logging_setup.LOG_BACKUP_COUNT, **ctx,
+            log_backups=logging_setup.LOG_BACKUP_COUNT, nvd_key=nvd_key_view(),
+            secret_key_path=credentials.box.key_path, **ctx,
         )  # fmt: skip
+
+    def nvd_key_view() -> dict:
+        """What Settings shows of the NVD API key: only the last 4 characters of a saved key,
+        nothing of NVD_API_KEY."""
+        view = {
+            "saved": credentials.has_nvd_key(), "masked": None, "error": None,
+            "env_set": bool(os.environ.get(nvd.API_KEY_ENV)),
+        }  # fmt: skip
+        if view["saved"]:
+            try:
+                view["masked"] = secret_store.mask(credentials.nvd_key())
+            except SecretError as exc:
+                view["error"] = str(exc)
+        return view
+
+    @app.post("/settings/nvd-key", response_class=HTMLResponse)
+    def save_nvd_key(request: Request, action: str = Form("save"), nvd_api_key: str = Form("")):
+        if action == "clear":
+            credentials.clear_nvd_key()
+            apply_nvd_key()
+            logger.info("NVD API key removed from Settings")
+            return redirect("/settings", notice="nvd_key_cleared")
+        key = nvd_api_key.strip()
+        error = check_nvd_api_key(key)
+        if error is None:
+            try:
+                credentials.set_nvd_key(key)
+            except SecretError as exc:
+                error = str(exc)
+        if error:  # the typed key is never echoed back
+            return settings_page(request, status_code=422, nvd_key_error=error)
+        apply_nvd_key()
+        logger.info("NVD API key saved in Settings (encrypted)")
+        return redirect("/settings", notice="nvd_key_saved")
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings(request: Request):
@@ -823,8 +887,8 @@ def create_app(
         if confirm_text != "RESET":
             return settings_page(request, status_code=400, error="Type RESET exactly to confirm.")
         db.reset()
-        passwords.clear()
         apply_log_dir()  # the saved log directory was removed with the settings
+        apply_nvd_key()  # so was a saved NVD API key: back to NVD_API_KEY
         return redirect("/settings", notice="database_reset")
 
     @app.post("/settings/staging", response_class=HTMLResponse)

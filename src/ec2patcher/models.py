@@ -17,8 +17,8 @@ class Tag:
 
 DEFAULT_SSH_USER = "ubuntu"
 
-# Server login methods. The password of AUTH_PASSWORD servers is never stored anywhere; it is
-# entered once per app session and kept in memory only (ssh_service.SessionPasswords).
+# Server login methods. The password of AUTH_PASSWORD servers is stored per server, encrypted
+# (services.secret_store); it is never part of this model, shown, logged or put on a command line.
 AUTH_PEM = "pem"
 AUTH_PASSWORD = "password"  # noqa: S105 - a login method name, not a secret
 AUTH_METHODS = {AUTH_PEM: "PEM key", AUTH_PASSWORD: "Username + password"}
@@ -34,7 +34,8 @@ class Server:
     updated_at: str
     tags: list[Tag] = field(default_factory=list)  # ordered by key (case-insensitive), then id
     ssh_user: str = DEFAULT_SSH_USER  # login user of every ssh/scp to this server
-    auth_method: str = AUTH_PEM  # AUTH_PEM (pem_path) or AUTH_PASSWORD (session password)
+    auth_method: str = AUTH_PEM  # AUTH_PEM (pem_path) or AUTH_PASSWORD (stored password)
+    has_password: bool = False  # an encrypted SSH password is stored (the value never is here)
 
     @property
     def uses_password(self) -> bool:

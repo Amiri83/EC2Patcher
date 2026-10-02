@@ -7,8 +7,9 @@ Unknown and never changes a finding's status.
 
 One request per CVE (``cveId`` query parameter), sequential and rate limited: NVD allows
 5 requests per rolling 30 s without an API key and 50 with one, so requests are spaced 6 s /
-0.6 s apart. The optional ``NVD_API_KEY`` environment variable is sent in the ``apiKey``
-request header, as the 2.0 API requires; it is never stored, logged or exported. Responses
+0.6 s apart. The optional API key (saved encrypted in Settings, else the ``NVD_API_KEY``
+environment variable) is sent in the ``apiKey`` request header, as the 2.0 API requires; it is
+never shown, logged or exported. Responses
 are cached per CVE in the application database (table ``nvd_cache``; raw ``metrics`` kept, so
 the selection is recomputed on reuse): entries younger than 30 days are used without a
 request, older entries are refreshed and used as a fallback (marked stale) when NVD cannot be
@@ -53,11 +54,16 @@ NO_CVSS = "no_cvss"  # NVD knows the CVE but has no usable CVSS metric
 NOT_FOUND = "not_found"  # NVD returned zero vulnerabilities
 FAILED = "failed"  # lookup failed and nothing was cached
 
-# NVD_API_KEY state for the UI badge (this process only; the key itself is never shown).
-KEY_NOT_SET = "not_set"  # no NVD_API_KEY
+# API key state for the UI badge (this process only; the key itself is never shown).
+KEY_NOT_SET = "not_set"  # no key in Settings or NVD_API_KEY
 KEY_SET = "set"  # key configured, no keyed request answered yet
 KEY_IN_USE = "in_use"  # the last keyed request succeeded
 KEY_REJECTED = "rejected"  # NVD answered HTTP 403 to the last keyed request
+KEY_UNREADABLE = "unreadable"  # a key is saved in Settings but cannot be decrypted
+
+# Where the key in use comes from: a key saved in Settings overrides NVD_API_KEY.
+KEY_SOURCE_SETTINGS = "settings"
+KEY_SOURCE_ENV = "env"
 
 STATUS_LABELS = {
     OK: "NVD",
@@ -287,17 +293,38 @@ class NvdClient:
                 Path(cache_db) if cache_db else config.get_data_dir() / config.DB_FILENAME
             )
         self.transport = transport
-        self._api_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV) or None
-        self.interval = INTERVAL_WITH_KEY if self._api_key else INTERVAL_PUBLIC
+        # The key without a Settings override: the argument, else NVD_API_KEY.
+        self._default_key = api_key if api_key is not None else os.environ.get(API_KEY_ENV) or None
         self.sleep, self.monotonic, self.now, self.max_age = sleep, monotonic, now, max_age
         self.requests = 0  # HTTP requests sent (for diagnostics/tests)
-        self._key_state = KEY_SET if self._api_key else KEY_NOT_SET
         self._last_request: float | None = None
+        self._use_key(self._default_key, KEY_SOURCE_ENV)
         self.start_run()
+
+    def __repr__(self) -> str:
+        return f"NvdClient(key_status={self._key_state!r}, key_source={self.key_source!r})"
+
+    def _use_key(self, key: str | None, source: str, state: str | None = None) -> None:
+        self._api_key = key or None
+        self.key_source = source if self._api_key or state else None
+        self.interval = INTERVAL_WITH_KEY if self._api_key else INTERVAL_PUBLIC
+        self._key_state = state or (KEY_SET if self._api_key else KEY_NOT_SET)
+
+    def use_settings_key(self, key: str | None, unreadable: bool = False) -> None:
+        """Apply the key saved in Settings; it overrides NVD_API_KEY. ``None`` (no key saved)
+        falls back to NVD_API_KEY. ``unreadable``: a key is saved but cannot be decrypted;
+        no key is sent then (the badge asks to enter it again)."""
+        if unreadable:
+            self._use_key(None, KEY_SOURCE_SETTINGS, KEY_UNREADABLE)
+        elif key:
+            self._use_key(key, KEY_SOURCE_SETTINGS)
+        else:
+            self._use_key(self._default_key, KEY_SOURCE_ENV)
 
     @property
     def key_status(self) -> str:
-        """KEY_NOT_SET / KEY_SET / KEY_IN_USE / KEY_REJECTED (never the key itself)."""
+        """KEY_NOT_SET / KEY_SET / KEY_IN_USE / KEY_REJECTED / KEY_UNREADABLE (never the key
+        itself)."""
         return self._key_state
 
     def start_run(self) -> None:
@@ -378,7 +405,10 @@ class NvdClient:
                 self._key_state = KEY_IN_USE
             elif self._api_key and status == 403:
                 self._key_state = KEY_REJECTED
-                logger.warning("NVD rejected the configured NVD_API_KEY (HTTP 403)")
+                logger.warning(
+                    "NVD rejected the configured API key from %s (HTTP 403)",
+                    "Settings" if self.key_source == KEY_SOURCE_SETTINGS else API_KEY_ENV,
+                )
             if status == 200:
                 return parse_response(body, cve_id)
             backoff = self.interval * 2**attempt
