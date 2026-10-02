@@ -2,14 +2,21 @@
 
 The command is always built as an argument list and run without a shell, so user
 supplied values (IP address, PEM path) are never interpreted by a shell.
+
+Servers log in with a PEM key (default) or with username + password. A password is never
+stored: it lives only in :class:`SessionPasswords` (process memory) and reaches ssh/scp
+through ``sshpass -e``, which reads it from the ``SSHPASS`` environment variable of the
+child process - never from the command line, a file or a log.
 """
 
 import logging
+import os
 import subprocess  # noqa: S404 - required to drive the system ssh client safely
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ec2patcher.models import DEFAULT_SSH_USER
+from ec2patcher.models import AUTH_PASSWORD, DEFAULT_SSH_USER
 from ec2patcher.validation import (
     check_ip_address,
     check_pem_path,
@@ -35,6 +42,65 @@ REMOTE_COMMAND = (
 )
 
 Runner = Callable[..., subprocess.CompletedProcess]
+
+SSHPASS_BINARY = "sshpass"
+SSHPASS_ENV = "SSHPASS"
+# sshpass's own exit codes (otherwise it passes through the exit code of ssh/scp).
+SSHPASS_WRONG_PASSWORD = 5
+SSHPASS_HOST_KEY_UNKNOWN = 6
+SSHPASS_MISSING = (
+    "The 'sshpass' command was not found. Install it (e.g. sudo apt install sshpass) to "
+    "use password login, or switch this server to a PEM key."
+)
+PASSWORD_MISSING = (  # an error message, not a password
+    "No SSH password entered for this server in this session. Enter it on the Servers "  # noqa: S105
+    "page (it is kept in memory only until the app is restarted), then try again."
+)
+
+
+class SessionPasswords:
+    """SSH passwords per server id, in memory only for the lifetime of the app process.
+
+    Never persisted or logged; ``repr`` shows only which server ids have a password.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._passwords: dict[int, str] = {}
+
+    def set(self, server_id: int, password: str) -> None:
+        with self._lock:
+            self._passwords[int(server_id)] = password
+
+    def get(self, server_id: int | None) -> str | None:
+        if server_id is None:
+            return None
+        with self._lock:
+            return self._passwords.get(int(server_id))
+
+    def has(self, server_id: int | None) -> bool:
+        return self.get(server_id) is not None
+
+    def forget(self, server_id: int) -> None:
+        with self._lock:
+            self._passwords.pop(int(server_id), None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._passwords.clear()
+
+    def __repr__(self) -> str:
+        with self._lock:
+            return f"SessionPasswords(server_ids={sorted(self._passwords)})"
+
+
+def server_password(server, passwords: SessionPasswords | None) -> tuple[str | None, str | None]:
+    """(password, error) for one configured server: (None, None) for PEM key login,
+    (None, PASSWORD_MISSING) for password login without a password in this session."""
+    if getattr(server, "auth_method", None) != AUTH_PASSWORD:
+        return None, None
+    password = passwords.get(server.id) if passwords is not None else None
+    return (password, None) if password else (None, PASSWORD_MISSING)
 
 
 @dataclass
@@ -75,12 +141,43 @@ def _port_options(flag: str, port: int | None) -> list[str]:
     return [flag, str(port)]
 
 
-def _check_target(ip_address: str, pem_path: str, user: str) -> tuple[str | None, str | None]:
-    """(normalized_ip, error) after validating IP, PEM path and SSH user."""
+def _check_target(
+    ip_address: str, pem_path: str, user: str, password: str | None = None
+) -> tuple[str | None, str | None]:
+    """(normalized_ip, error) after validating IP, PEM path (key login only) and SSH user."""
     normalized_ip, ip_error = check_ip_address(ip_address)
     if ip_error:
         return None, ip_error
+    if password is not None:
+        if not password:
+            return normalized_ip, "SSH password is required."
+        return normalized_ip, check_ssh_user(user)
     return normalized_ip, check_pem_path(pem_path) or check_ssh_user(user)
+
+
+def _auth_prefix(binary: str, pem_path: str, password: str | None) -> list[str]:
+    """``[sshpass -e] <binary> <identity/auth options>``. The password itself is never part of
+    the argument list (sshpass -e reads it from $SSHPASS)."""
+    if password is None:
+        return [binary, "-i", str(expand_pem_path(pem_path)), *SSH_OPTIONS]
+    return [SSHPASS_BINARY, "-e", binary, *PASSWORD_SSH_OPTIONS]
+
+
+def _run_kwargs(password: str | None) -> dict:
+    """Extra subprocess arguments: the SSHPASS environment for password login."""
+    if password is None:
+        return {}
+    return {"env": {**os.environ, SSHPASS_ENV: password}}
+
+
+def _sshpass_error(returncode: int, password: str | None) -> str | None:
+    if password is None:
+        return None
+    if returncode == SSHPASS_WRONG_PASSWORD:
+        return "Permission denied: the SSH password was rejected. Check the user and password."
+    if returncode == SSHPASS_HOST_KEY_UNKNOWN:
+        return "Host key verification failed (unknown host key)."
+    return None
 
 
 def build_ssh_command(
@@ -89,16 +186,16 @@ def build_ssh_command(
     remote_command: str = REMOTE_COMMAND,
     user: str = SSH_USER,
     port: int | None = None,
+    password: str | None = None,
 ) -> list[str]:
     """Build the ssh argument list. PEM path '~' is expanded here.
 
     ``remote_command`` is passed as a single argument and interpreted by the remote login
     shell, so callers must only pass constant text or values quoted with shlex.quote().
+    With a ``password`` the command runs through ``sshpass -e`` (password not on argv).
     """
     return [
-        SSH_BINARY,
-        "-i", str(expand_pem_path(pem_path)),
-        *SSH_OPTIONS,
+        *_auth_prefix(SSH_BINARY, pem_path, password),
         *_port_options("-p", port),
         "--",
         f"{_checked_user(user)}@{ip_address}",
@@ -114,6 +211,14 @@ SSH_OPTIONS = [
     "-o", f"ConnectTimeout={CONNECT_TIMEOUT_SECONDS}",
     "-o", "StrictHostKeyChecking=accept-new",
 ]  # fmt: skip
+# Password login (through sshpass): no keys or agent, exactly one password prompt.
+PASSWORD_SSH_OPTIONS = [
+    "-o", "PubkeyAuthentication=no",
+    "-o", "PreferredAuthentications=password,keyboard-interactive",
+    "-o", "NumberOfPasswordPrompts=1",
+    "-o", f"ConnectTimeout={CONNECT_TIMEOUT_SECONDS}",
+    "-o", "StrictHostKeyChecking=accept-new",
+]  # fmt: skip
 
 
 def build_scp_command(
@@ -123,14 +228,18 @@ def build_scp_command(
     remote_dir: str,
     user: str = SSH_USER,
     port: int | None = None,
+    password: str | None = None,
 ) -> list[str]:
-    """``scp -i <pem> <options> -- <files...> <user>@<ip>:<remote_dir>/`` as an argument list.
+    """``scp -i <pem> <options> -- <files...> <user>@<ip>:<remote_dir>/`` as an argument list
+    (``sshpass -e scp ...`` with a ``password``).
 
     Callers validate ``remote_dir`` and the file names (no shell metacharacters).
     """
     host = f"[{ip_address}]" if ":" in ip_address else ip_address
+    prefix = _auth_prefix(SCP_BINARY, pem_path, password)
+    split = prefix.index(SCP_BINARY) + 1
     return [
-        SCP_BINARY, "-q", "-i", str(expand_pem_path(pem_path)), *SSH_OPTIONS,
+        *prefix[:split], "-q", *prefix[split:],
         *_port_options("-P", port),
         "--", *local_files, f"{_checked_user(user)}@{host}:{remote_dir.rstrip('/')}/",
     ]  # fmt: skip
@@ -145,12 +254,15 @@ def run_scp(
     timeout: int = PROCESS_TIMEOUT_SECONDS,
     user: str = SSH_USER,
     port: int | None = None,
+    password: str | None = None,
 ) -> RemoteResult:
     """Copy local files to ``<user>@<ip>:<remote_dir>/`` (no shell, same ssh options)."""
-    normalized_ip, error = _check_target(ip_address, pem_path, user)
+    normalized_ip, error = _check_target(ip_address, pem_path, user, password)
     if error:
         return RemoteResult(ok=False, error=error)
-    command = build_scp_command(normalized_ip, pem_path, local_files, remote_dir, user, port)
+    command = build_scp_command(
+        normalized_ip, pem_path, local_files, remote_dir, user, port, password
+    )
     try:
         proc = runner(
             command,
@@ -159,17 +271,22 @@ def run_scp(
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             check=False,
+            **_run_kwargs(password),
         )
     except subprocess.TimeoutExpired:
         return RemoteResult(ok=False, error=f"The file transfer did not finish within {timeout}s.")
     except FileNotFoundError:
-        return RemoteResult(ok=False, error="The 'scp' command was not found.")
+        missing = SSHPASS_MISSING if password is not None else "The 'scp' command was not found."
+        return RemoteResult(ok=False, error=missing)
     except OSError as exc:
         logger.exception("Could not start scp process")
         return RemoteResult(ok=False, error=f"Could not run scp: {exc.strerror or exc}")
     stdout, stderr = proc.stdout or "", proc.stderr or ""
     if proc.returncode != 0:
-        return RemoteResult(False, stdout, stderr, proc.returncode, describe_ssh_error(stderr))
+        message = _sshpass_error(proc.returncode, password) or describe_ssh_error(
+            stderr, password is not None
+        )
+        return RemoteResult(False, stdout, stderr, proc.returncode, message)
     return RemoteResult(True, stdout, stderr, proc.returncode)
 
 
@@ -183,7 +300,7 @@ def parse_remote_info(stdout: str) -> dict[str, str]:
     return info
 
 
-def describe_ssh_error(stderr: str) -> str:
+def describe_ssh_error(stderr: str, password_login: bool = False) -> str:
     """Translate ssh stderr into a short, user-friendly message."""
     text = stderr or ""
     lower = text.lower()
@@ -195,6 +312,8 @@ def describe_ssh_error(stderr: str) -> str:
     if "unprotected private key file" in lower or "bad permissions" in lower:
         return "PEM file permissions are too open. Run: chmod 400 <pem-file>"
     if "permission denied" in lower:
+        if password_login:
+            return "Permission denied. Check the SSH user and password of this server."
         return "Permission denied (publickey). Check the PEM file matches this server."
     if "timed out" in lower:
         return "Connection timed out. Check the IP address, network access and security group."
@@ -221,16 +340,17 @@ def run_remote(
     accept_returncodes: tuple[int, ...] = (0,),
     user: str = SSH_USER,
     port: int | None = None,
+    password: str | None = None,
 ) -> RemoteResult:
     """Run a command as ``<user>@<ip>`` with the same safe ssh options as the SSH test.
 
-    The IP, PEM path and user are validated first. ssh itself exits 255 on connection/auth
-    errors.
+    The IP, PEM path (key login) and user are validated first. ssh itself exits 255 on
+    connection/auth errors; sshpass exits 5 on a rejected password.
     """
-    normalized_ip, error = _check_target(ip_address, pem_path, user)
+    normalized_ip, error = _check_target(ip_address, pem_path, user, password)
     if error:
         return RemoteResult(ok=False, error=error)
-    command = build_ssh_command(normalized_ip, pem_path, remote_command, user, port)
+    command = build_ssh_command(normalized_ip, pem_path, remote_command, user, port, password)
     try:
         proc = runner(
             command,
@@ -239,17 +359,23 @@ def run_remote(
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             check=False,
+            **_run_kwargs(password),
         )
     except subprocess.TimeoutExpired:
         return RemoteResult(ok=False, error=f"The remote command did not finish within {timeout}s.")
     except FileNotFoundError:
-        return RemoteResult(ok=False, error="The 'ssh' command was not found.")
+        missing = SSHPASS_MISSING if password is not None else "The 'ssh' command was not found."
+        return RemoteResult(ok=False, error=missing)
     except OSError as exc:
         logger.exception("Could not start ssh process")
         return RemoteResult(ok=False, error=f"Could not run ssh: {exc.strerror or exc}")
     stdout, stderr = proc.stdout or "", proc.stderr or ""
     if proc.returncode == 255:
-        return RemoteResult(False, stdout, stderr, 255, describe_ssh_error(stderr))
+        message = describe_ssh_error(stderr, password is not None)
+        return RemoteResult(False, stdout, stderr, 255, message)
+    sshpass_error = _sshpass_error(proc.returncode, password)
+    if sshpass_error and proc.returncode not in accept_returncodes:
+        return RemoteResult(False, stdout, stderr, proc.returncode, sshpass_error)
     if proc.returncode not in accept_returncodes:
         detail = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
         message = f"Remote command failed (exit {proc.returncode})"
@@ -266,17 +392,22 @@ def check_connection(
     runner: Runner = subprocess.run,
     user: str = SSH_USER,
     port: int | None = None,
+    password: str | None = None,
 ) -> SSHTestResult:
-    """Attempt `ssh -i <pem> <user>@<ip>` and collect hostname / OS / architecture."""
+    """Attempt `ssh -i <pem> <user>@<ip>` (or password login through sshpass) and collect
+    hostname / OS / architecture."""
     result = SSHTestResult(success=False, server_name=server_name, ip_address=ip_address)
 
-    normalized_ip, error = _check_target(ip_address, pem_path, user)
+    normalized_ip, error = _check_target(ip_address, pem_path, user, password)
     if error:
         result.error = error
         return result
 
-    logger.info("SSH test attempted: server=%s ip=%s user=%s", server_name, normalized_ip, user)
-    command = build_ssh_command(normalized_ip, pem_path, user=user, port=port)
+    logger.info(
+        "SSH test attempted: server=%s ip=%s user=%s login=%s",
+        server_name, normalized_ip, user, "key" if password is None else "password",
+    )  # fmt: skip
+    command = build_ssh_command(normalized_ip, pem_path, user=user, port=port, password=password)
     try:
         proc = runner(
             command,
@@ -285,11 +416,16 @@ def check_connection(
             timeout=PROCESS_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             check=False,
+            **_run_kwargs(password),
         )
     except subprocess.TimeoutExpired:
         result.error = "Connection timed out. The server did not respond in time."
     except FileNotFoundError:
-        result.error = "The 'ssh' command was not found. Install the OpenSSH client."
+        result.error = (
+            "The 'ssh' command was not found. Install the OpenSSH client."
+            if password is None
+            else SSHPASS_MISSING
+        )
     except OSError as exc:
         logger.exception("SSH test could not start ssh process")
         result.error = f"Could not run ssh: {exc.strerror or exc}"
@@ -305,7 +441,9 @@ def check_connection(
                 "SSH test stderr for %s (exit %s): %s",
                 server_name, proc.returncode, (proc.stderr or "").strip()[:1000],
             )  # fmt: skip
-            result.error = describe_ssh_error(proc.stderr or "")
+            result.error = _sshpass_error(proc.returncode, password) or describe_ssh_error(
+                proc.stderr or "", password is not None
+            )
 
     if result.success:
         logger.info(

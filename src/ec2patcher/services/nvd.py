@@ -53,6 +53,12 @@ NO_CVSS = "no_cvss"  # NVD knows the CVE but has no usable CVSS metric
 NOT_FOUND = "not_found"  # NVD returned zero vulnerabilities
 FAILED = "failed"  # lookup failed and nothing was cached
 
+# NVD_API_KEY state for the UI badge (this process only; the key itself is never shown).
+KEY_NOT_SET = "not_set"  # no NVD_API_KEY
+KEY_SET = "set"  # key configured, no keyed request answered yet
+KEY_IN_USE = "in_use"  # the last keyed request succeeded
+KEY_REJECTED = "rejected"  # NVD answered HTTP 403 to the last keyed request
+
 STATUS_LABELS = {
     OK: "NVD",
     STALE: "NVD (stale cache)",
@@ -285,8 +291,14 @@ class NvdClient:
         self.interval = INTERVAL_WITH_KEY if self._api_key else INTERVAL_PUBLIC
         self.sleep, self.monotonic, self.now, self.max_age = sleep, monotonic, now, max_age
         self.requests = 0  # HTTP requests sent (for diagnostics/tests)
+        self._key_state = KEY_SET if self._api_key else KEY_NOT_SET
         self._last_request: float | None = None
         self.start_run()
+
+    @property
+    def key_status(self) -> str:
+        """KEY_NOT_SET / KEY_SET / KEY_IN_USE / KEY_REJECTED (never the key itself)."""
+        return self._key_state
 
     def start_run(self) -> None:
         """Forget per-run state: the in-run memo and the 'NVD unreachable' circuit breaker."""
@@ -362,6 +374,11 @@ class NvdClient:
                 status, response_headers, body = transport(url, headers, REQUEST_TIMEOUT_SECONDS)
             except (OSError, TimeoutError) as exc:  # URLError is an OSError
                 raise NvdUnreachable(f"NVD unreachable: {exc}") from exc
+            if self._api_key and status == 200:
+                self._key_state = KEY_IN_USE
+            elif self._api_key and status == 403:
+                self._key_state = KEY_REJECTED
+                logger.warning("NVD rejected the configured NVD_API_KEY (HTTP 403)")
             if status == 200:
                 return parse_response(body, cve_id)
             backoff = self.interval * 2**attempt

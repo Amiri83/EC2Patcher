@@ -29,12 +29,32 @@
   </form>
   {% endif %}
 </div>
+<div class="card form-card" id="logging">
+  <h2>Logging</h2>
+  <form method="post" action="/settings/log-dir">
+    <div class="field{% if log_dir_error %} has-error{% endif %}">
+      <label for="log_dir_path">Log directory</label>
+      <input type="text" id="log_dir_path" name="log_dir_path" value="{{ log_dir_value }}" autocomplete="off" spellcheck="false">
+      {% if log_dir_error %}<div class="field-error">{{ log_dir_error }}</div>{% endif %}
+      <div class="hint">Absolute path (<code>~</code> is expanded); it is created if needed and must be writable. Default: <code>{{ default_log_dir }}</code>.</div>
+    </div>
+    <dl class="kv">
+      <dt>Current log file</dt><dd>{% if active_log_file %}<code class="log-file">{{ active_log_file }}</code>{% else %}<code class="log-file">{{ log_file }}</code> <span class="muted small">(file logging is not active in this process)</span>{% endif %}</dd>
+      <dt>Rotation</dt><dd>{{ log_backups }} &times; {{ log_max_mb }} MB (oldest file is removed)</dd>
+    </dl>
+    <div class="form-actions">
+      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
+      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+    </div>
+  </form>
+</div>
 <div class="card">
   <h2>Application</h2>
   <dl class="kv">
     <dt>Version</dt><dd>{{ version }}</dd>
     <dt>Database</dt><dd><code>{{ db_path }}</code></dd>
     <dt>SSH user</dt><dd>Per server (default <code>ubuntu</code>)</dd>
+    <dt>SSH login</dt><dd>Per server: PEM key (default) or username + password via <code>sshpass</code>; passwords are kept in memory for this app session only</dd>
   </dl>
 </div>
 <div class="card">
@@ -60,7 +80,7 @@
     <dt>Refresh when older than</dt><dd>{{ "%g"|format(apt_max_age_hours) }} hours{% if not apt_max_age_hours %} (every analysis run){% endif %}</dd>
   </dl>
 </div>
-<div class="card">
+<div class="card danger-zone">
   <h2>Reset Database</h2>
   <p class="muted">Permanently removes servers, reports, analyses, and settings.</p>
   <form method="post" action="/settings/reset-database">

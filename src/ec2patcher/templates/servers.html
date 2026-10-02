@@ -9,7 +9,7 @@
     <span class="badge badge-neutral">{{ servers|length }} configured</span>
   </div>
   {% if servers %}
-    <p class="muted small">Only PEM file paths are stored, never key contents.</p>
+    <p class="muted small">Only PEM file paths are stored, never key contents. SSH passwords are never stored: they are kept in memory for this app session only.</p>
     <ul class="server-list">
       {% for s in servers %}
         <li class="server-item" id="server-{{ s.id }}">
@@ -18,8 +18,25 @@
             <div class="server-meta">
               <span><span class="meta-label">IP</span> <code>{{ s.ip_address }}</code></span>
               <span><span class="meta-label">User</span> <code>{{ s.ssh_user }}</code></span>
+              {% if s.uses_password %}
+              <span><span class="meta-label">Login</span> password
+                {% if s.id in password_ids %}<span class="badge badge-success">entered this session</span>{% else %}<span class="badge badge-warning">password needed</span>{% endif %}</span>
+              {% else %}
               <span><span class="meta-label">PEM</span> <code>{{ s.pem_path }}</code></span>
+              {% endif %}
             </div>
+            {% if s.uses_password %}
+              {% if s.id in password_ids %}
+                <form method="post" action="/servers/{{ s.id }}/password/forget" class="inline password-form">
+                  <button type="submit" class="btn btn-ghost btn-sm">Forget password</button>
+                </form>
+              {% else %}
+                <form method="post" action="/servers/{{ s.id }}/password" class="inline password-form">
+                  <input type="password" name="ssh_password" value="" autocomplete="off" aria-label="SSH password for {{ s.name }}" placeholder="SSH password">
+                  <button type="submit" class="btn btn-secondary btn-sm">Use for this session</button>
+                </form>
+              {% endif %}
+            {% endif %}
             {% if s.tags %}
               <div class="server-tags">
                 {% for t in s.tags[:2] %}

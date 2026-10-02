@@ -1,0 +1,7 @@
+{# NVD_API_KEY state of this process; never shows any part of the key. #}
+{% set key_status = nvd_key_status() if nvd_key_status is defined else "not_set" %}
+{% if key_status == "in_use" %}<span class="badge badge-success nvd-key-badge" data-nvd-key="in_use">NVD API key: in use</span>
+{% elif key_status == "rejected" %}<span class="badge badge-danger nvd-key-badge" data-nvd-key="rejected" title="NVD answered HTTP 403: check NVD_API_KEY">NVD API key rejected</span>
+{% elif key_status == "set" %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="set">NVD API key: set (not used yet)</span>
+{% else %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="not_set" title="Set the NVD_API_KEY environment variable for faster CVSS lookups">NVD API key: not set</span>
+{% endif %}

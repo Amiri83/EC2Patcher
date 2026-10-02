@@ -44,6 +44,20 @@
     });
   }
 
+  // Server form: show only the fields of the chosen login method (PEM key or password).
+  var authRadios = document.querySelectorAll("input[data-auth-method]");
+  if (authRadios.length) {
+    var showAuthFields = function () {
+      var checked = document.querySelector("input[data-auth-method]:checked");
+      var method = checked ? checked.value : "pem";
+      document.querySelectorAll("[data-auth-only]").forEach(function (el) {
+        el.hidden = el.getAttribute("data-auth-only") !== method;
+      });
+    };
+    authRadios.forEach(function (radio) { radio.addEventListener("change", showAuthFields); });
+    showAuthFields();
+  }
+
   // Report upload: submit as soon as a file is picked or dropped (the <noscript>
   // button covers the no-JS case). The dropzone is locked while uploading so the
   // report cannot be submitted twice.
