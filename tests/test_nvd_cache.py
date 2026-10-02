@@ -186,7 +186,7 @@ def test_settings_clear_also_empties_nvd_cache(client, db_path):
 def test_fresh_database_is_v10_with_nvd_cache(db_path):
     Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 13
     assert nvd_columns(db_path) == [
         ("cve", "TEXT", 1), ("metrics", "TEXT", 0), ("last_modified", "TEXT", 0),
         ("fetched_at", "TEXT", 0),

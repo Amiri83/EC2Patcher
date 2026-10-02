@@ -8,7 +8,7 @@ from itertools import zip_longest
 from pathlib import Path
 
 from ec2patcher.database import Database
-from ec2patcher.models import DEFAULT_SSH_USER
+from ec2patcher.models import AUTH_METHODS, AUTH_PASSWORD, AUTH_PEM, DEFAULT_SSH_USER
 
 # Server names are later used to match CVE reports and to name per-server
 # directories, so keep them to a filesystem- and shell-safe character set.
@@ -32,6 +32,7 @@ class ServerInput:
     tags: list[tuple[str, str]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
     ssh_user: str = DEFAULT_SSH_USER
+    auth_method: str = AUTH_PEM
 
     @property
     def is_valid(self) -> bool:
@@ -144,14 +145,21 @@ def validate_server_input(
     tag_keys: list[str] | None = None,
     tag_values: list[str] | None = None,
     ssh_user: str = DEFAULT_SSH_USER,
+    auth_method: str = AUTH_PEM,
 ) -> ServerInput:
-    """Validate and normalize server form input. Uniqueness is checked against the DB."""
+    """Validate and normalize server form input. Uniqueness is checked against the DB.
+
+    Password login needs no PEM file (the path is cleared); the password itself is never
+    part of the server input."""
     result = ServerInput(
         name=(name or "").strip(),
         ip_address=(ip_address or "").strip(),
         pem_path=(pem_path or "").strip(),
         ssh_user=(ssh_user or "").strip(),
+        auth_method=(auth_method or AUTH_PEM).strip(),
     )
+    if result.auth_method not in AUTH_METHODS:
+        result.errors["auth_method"] = "Choose PEM key or username + password login."
 
     name_error = check_name(result.name)
     if name_error is None:
@@ -167,9 +175,12 @@ def validate_server_input(
     else:
         result.ip_address = normalized_ip
 
-    pem_error = check_pem_path(result.pem_path)
-    if pem_error:
-        result.errors["pem_path"] = pem_error
+    if result.auth_method == AUTH_PASSWORD:
+        result.pem_path = ""
+    else:
+        pem_error = check_pem_path(result.pem_path)
+        if pem_error:
+            result.errors["pem_path"] = pem_error
 
     user_error = check_ssh_user(result.ssh_user)
     if user_error:

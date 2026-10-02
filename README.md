@@ -23,8 +23,9 @@ files of a plan you approved.
 ## Target server requirements
 
 - Ubuntu, reachable over SSH as the server's **SSH user** (per server, default `ubuntu`) with
-  a PEM key (key-based auth only; the PEM *path* is stored, its contents are never read, stored
-  or logged). Other operating systems are detected and listed as *OS not supported yet*.
+  a PEM key (default; the PEM *path* is stored, its contents are never read, stored or logged)
+  or with username + password (see below). Other operating systems are detected and listed as
+  *OS not supported yet*.
 - **Passwordless sudo** for that user for patching: every privileged command uses `sudo -n`,
   and patching aborts if `sudo -n true` fails. Analysis needs no sudo at all.
 - `dpkg`, `apt-get`, `sha256sum` and write access to `/tmp` (the standard Ubuntu image has
@@ -46,6 +47,15 @@ files of a plan you approved.
 - **SSH test** runs `ssh -i <pem> <user>@<ip>` with `BatchMode=yes`, `ConnectTimeout=10` and a
   30 s overall limit, and shows hostname, OS release and architecture or a short error. New host
   keys are accepted on first connect (`accept-new`); a changed host key is an error.
+- **Login method** per server: **PEM key** (default) or **username + password**. A password is
+  **never stored** (not in the database, files or logs): it is entered once per app session (on
+  the server form or the Servers list), kept in memory only and forgotten on restart, delete,
+  Clear All Servers, Reset Database or a switch back to PEM. Password login runs `sshpass -e
+  ssh|scp ...`; the password reaches sshpass only through the `SSHPASS` environment variable,
+  never the command line. Install `sshpass` on the workstation (`sudo apt install sshpass`);
+  without it the connection fails with a clear message. Analysis or patching of a password
+  server without a session password is refused. `sudo` on the server must still be
+  passwordless (`sudo -n`).
 
 ### Report upload
 
@@ -146,6 +156,9 @@ shown as **NOT RUN**. Only one patch execution or queue runs at a time.
 
 - **Local Patch Download Directory**: template, default `/tmp/${server_name}`; must contain
   `${server_name}` and resolve to a safe absolute path.
+- **Logging**: the **Log directory** (default: the per-user log directory from platformdirs, or
+  `$EC2PATCHER_LOG_DIR`) and the current log file path. The directory is created if needed and
+  must be writable, or it is not saved. Logs rotate at 5 MB, keeping 5 old files.
 - **Security Data**: Canonical and NVD cache details. **Clear Security Cache** empties the
   in-memory lookup state and both caches (Canonical `cve_metadata_cache`, NVD `nvd_cache`), so
   the next analysis queries Canonical and NVD again.
@@ -173,7 +186,9 @@ export NVD_API_KEY=...   # your own key; it is sent only in the apiKey request h
 ```
 Request a free key at https://nvd.nist.gov/developers/request-an-api-key.
 
-The key is never stored, logged or exported.
+The key is never stored, logged, exported or shown. The Pre-Patch Analysis pages show only its
+state: *NVD API key: not set*, *set (not used yet)*, *in use* (green, after a successful keyed
+request in this app session) or *NVD API key rejected* (red, NVD answered HTTP 403).
 
 ## Requirements (workstation)
 
@@ -209,7 +224,8 @@ available). Stop with **Shutdown App** in the sidebar or Ctrl+C.
 | `--apt-max-age-hours` | `6` | Refresh the private APT lists when older; `0` = every run (also `$EC2PATCHER_APT_MAX_AGE_HOURS`) |
 | `--no-browser` | off | Do not open a browser |
 
-Other environment variables: `NVD_API_KEY`, `EC2PATCHER_CANONICAL_TIMEOUT_SECONDS` (20),
+Other environment variables: `NVD_API_KEY`, `EC2PATCHER_LOG_DIR` (default log directory),
+`EC2PATCHER_CANONICAL_TIMEOUT_SECONDS` (20),
 `EC2PATCHER_CANONICAL_CACHE_TTL_HOURS` (24), `EC2PATCHER_CANONICAL_BREAKER_THRESHOLD` (3).
 
 ## Data location (Linux defaults)
@@ -217,7 +233,7 @@ Other environment variables: `NVD_API_KEY`, `EC2PATCHER_CANONICAL_TIMEOUT_SECOND
 | What | Path |
 |---|---|
 | SQLite database (incl. Canonical and NVD caches) | `~/.local/share/ec2patcher/ec2patcher.db` |
-| Log file | `~/.local/share/ec2patcher/ec2patcher.log` |
+| Log file (rotating, 5 × 5 MB; directory configurable in Settings) | `~/.local/state/ec2patcher/log/ec2patcher.log` |
 | Private APT state | `~/.local/share/ec2patcher/apt/<codename>-<arch>/` |
 
 The schema is created and migrated automatically on startup (`PRAGMA user_version`); existing
@@ -257,5 +273,6 @@ Overrides: `EC2P_IT_HOST`, `EC2P_IT_UBUNTU_PORT`, `EC2P_IT_AMAZON_PORT`, `EC2P_I
   versions and paths are validated against strict patterns.
 - Analysis uses no sudo and changes nothing. Patching uses `sudo -n` only for the sudo check,
   the `apt-get` simulation/install of the explicit `.deb` files and the optional reboot.
-- PEM contents are never read; the NVD API key is never stored or logged. Unexpected errors
+- PEM contents are never read; the NVD API key and SSH passwords are never stored or logged
+  (passwords live in memory for the app session and reach sshpass via `SSHPASS` only). Unexpected errors
   show a generic message in the GUI; details go to the log.
