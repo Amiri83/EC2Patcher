@@ -25,8 +25,15 @@
       <label for="pem_path">PEM File</label>
       <input type="text" id="pem_path" name="pem_path" value="{{ form.pem_path }}"
              placeholder="~/.ssh/prod.pem" autocomplete="off" spellcheck="false" required>
-      <div class="hint">Path to the private key on this machine. Only the path is stored. SSH user: <code>ubuntu</code>.</div>
+      <div class="hint">Path to the private key on this machine. Only the path is stored.</div>
       {% if errors.pem_path %}<div class="field-error">{{ errors.pem_path }}</div>{% endif %}
+    </div>
+    <div class="field{% if errors.ssh_user %} has-error{% endif %}">
+      <label for="ssh_user">SSH User</label>
+      <input type="text" id="ssh_user" name="ssh_user" value="{{ form.ssh_user }}"
+             placeholder="ubuntu" maxlength="32" autocomplete="off" spellcheck="false" required>
+      <div class="hint">Login user for every SSH/SCP connection to this server (default <code>ubuntu</code>; e.g. <code>ec2-user</code> on Amazon Linux).</div>
+      {% if errors.ssh_user %}<div class="field-error">{{ errors.ssh_user }}</div>{% endif %}
     </div>
 
     <fieldset class="field tags-field{% if errors.tags %} has-error{% endif %}">

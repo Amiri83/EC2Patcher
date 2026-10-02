@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ec2patcher.models import (
+    DEFAULT_SSH_USER,
     AnalysisRun,
     CveFindingRow,
     PackagePlanRow,
@@ -27,7 +28,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -316,6 +317,13 @@ _MIGRATIONS = {
             fetched_at     TEXT NOT NULL
         );
     """,
+    # Per-server SSH login user (every ssh/scp; existing servers keep the formerly fixed
+    # 'ubuntu') and the OS adapter that analyzed a server (NULL for older rows: only Ubuntu
+    # could be analyzed before this version).
+    11: """
+        ALTER TABLE servers ADD COLUMN ssh_user TEXT NOT NULL DEFAULT 'ubuntu';
+        ALTER TABLE server_analyses ADD COLUMN os_id TEXT;
+    """,
 }
 
 
@@ -349,6 +357,7 @@ def _row_to_server(row: sqlite3.Row) -> Server:
         name=row["name"],
         ip_address=row["ip_address"],
         pem_path=row["pem_path"],
+        ssh_user=row["ssh_user"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -362,7 +371,7 @@ _SERVER_ANALYSIS_COLUMNS = {
     "status", "error", "started_at", "completed_at", "remote_hostname", "os_pretty_name",
     "os_version_id", "os_codename", "architecture", "running_kernel", "apt_updated_at",
     "apt_age_hours", "current_reboot_required", "reboot_required_packages", "expected_reboot",
-    "expected_reboot_reason", "apt_arguments", "warnings",
+    "expected_reboot_reason", "apt_arguments", "warnings", "os_id",
 }  # fmt: skip
 
 
@@ -419,6 +428,7 @@ def _row_to_server_analysis(row: sqlite3.Row) -> ServerAnalysis:
         expected_reboot_reason=row["expected_reboot_reason"],
         apt_arguments=json.loads(row["apt_arguments"] or "[]"),
         warnings=json.loads(row["warnings"] or "[]"),
+        os_id=row["os_id"],
     )
 
 
@@ -684,6 +694,7 @@ class Database:
         ip_address: str,
         pem_path: str,
         tags: list[tuple[str, str]] | None = None,
+        ssh_user: str = DEFAULT_SSH_USER,
     ) -> Server:
         """Insert a server (and optionally its tags) in one transaction."""
         _check_duplicate_keys(tags or [])
@@ -691,9 +702,9 @@ class Database:
         try:
             with self.connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO servers (name, ip_address, pem_path, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (name, ip_address, pem_path, now, now),
+                    "INSERT INTO servers (name, ip_address, pem_path, ssh_user, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, ip_address, pem_path, ssh_user, now, now),
                 )
                 server_id = cur.lastrowid
                 if tags:
@@ -709,16 +720,18 @@ class Database:
         ip_address: str,
         pem_path: str,
         tags: list[tuple[str, str]] | None = None,
+        ssh_user: str | None = None,
     ) -> bool:
-        """Update a server. If ``tags`` is given, it replaces the server's full tag set."""
+        """Update a server. If ``tags`` is given, it replaces the server's full tag set; the
+        SSH user is only changed when ``ssh_user`` is given."""
         if tags is not None:
             _check_duplicate_keys(tags)
         try:
             with self.connect() as conn:
                 cur = conn.execute(
-                    "UPDATE servers SET name = ?, ip_address = ?, pem_path = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    (name, ip_address, pem_path, _now(), server_id),
+                    "UPDATE servers SET name = ?, ip_address = ?, pem_path = ?, "
+                    "ssh_user = COALESCE(?, ssh_user), updated_at = ? WHERE id = ?",
+                    (name, ip_address, pem_path, ssh_user, _now(), server_id),
                 )
                 if cur.rowcount == 1 and tags is not None:
                     self._replace_tags(conn, server_id, tags)

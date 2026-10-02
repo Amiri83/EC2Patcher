@@ -36,17 +36,19 @@
     {% for s in run.servers %}
       {% set sm = summaries[s.id] %}
       <li class="progress-item progress-{{ s.status }}">
-        <span class="progress-icon" aria-hidden="true">{% if s.status == "complete" %}&#10003;{% elif s.status == "analyzing" %}&#9679;{% elif s.status == "waiting" %}&#9675;{% else %}&#10005;{% endif %}</span>
+        <span class="progress-icon" aria-hidden="true">{% if s.status == "complete" %}&#10003;{% elif s.status == "analyzing" %}&#9679;{% elif s.status == "waiting" %}&#9675;{% elif s.status == "unsupported" %}&#8856;{% else %}&#10005;{% endif %}</span>
         <div class="progress-main">
           <div>
             <strong>{{ s.server_name }}</strong>
             {% if s.display_name %}<span class="muted">&middot; {{ s.display_name }}</span>{% endif %}
             <span class="progress-state">
-              {% if s.status == "complete" %}Complete{% elif s.status == "analyzing" %}Analyzing{% elif s.status == "waiting" %}Waiting{% else %}Failed{% endif %}
+              {% if s.status == "complete" %}Complete{% elif s.status == "analyzing" %}Analyzing{% elif s.status == "waiting" %}Waiting{% elif s.status == "unsupported" %}Not supported{% else %}Failed{% endif %}
             </span>
           </div>
           {% if s.status == "failed" %}
             <div class="progress-error">{{ s.error }}</div>
+          {% elif s.status == "unsupported" %}
+            <div class="muted">{{ s.error }}</div>
           {% elif s.status == "complete" %}
             <div class="server-meta">
               <span>{{ sm.reported }} CVE{{ "" if sm.reported == 1 else "s" }}</span>
@@ -58,7 +60,7 @@
             </div>
           {% endif %}
         </div>
-        {% if s.status in ("complete", "failed") %}
+        {% if s.status in ("complete", "failed", "unsupported") %}
           <a href="/analysis/{{ run.id }}/servers/{{ s.id }}" class="btn btn-secondary btn-sm">View Report</a>
         {% endif %}
       </li>

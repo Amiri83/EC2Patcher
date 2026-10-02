@@ -35,6 +35,12 @@ ec2patcher = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Integration tests need the local SSH test targets (scripts/test-targets); they are
+# deselected by default and run with: pytest -m integration
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs the local SSH test target containers (scripts/test-targets/up.sh)",
+]
 
 [tool.ruff]
 line-length = 100

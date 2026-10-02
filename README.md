@@ -22,10 +22,11 @@ files of a plan you approved.
 
 ## Target server requirements
 
-- Ubuntu, reachable over SSH as the user **`ubuntu`** (fixed) with a PEM key (key-based auth
-  only; the PEM *path* is stored, its contents are never read, stored or logged).
-- **Passwordless sudo** for `ubuntu` for patching: every privileged command uses `sudo -n`, and
-  patching aborts if `sudo -n true` fails. Analysis needs no sudo at all.
+- Ubuntu, reachable over SSH as the server's **SSH user** (per server, default `ubuntu`) with
+  a PEM key (key-based auth only; the PEM *path* is stored, its contents are never read, stored
+  or logged). Other operating systems are detected and listed as *OS not supported yet*.
+- **Passwordless sudo** for that user for patching: every privileged command uses `sudo -n`,
+  and patching aborts if `sudo -n true` fails. Analysis needs no sudo at all.
 - `dpkg`, `apt-get`, `sha256sum` and write access to `/tmp` (the standard Ubuntu image has
   them).
 
@@ -40,7 +41,9 @@ files of a plan you approved.
 - Optional key/value **tags** per server (e.g. `display_name = Billing API`, `env = prod`):
   up to 50 per server, keys unique per server (case-insensitive). `display_name` is shown in
   reports but never used for matching.
-- **SSH test** runs `ssh -i <pem> ubuntu@<ip>` with `BatchMode=yes`, `ConnectTimeout=10` and a
+- Each server has an **SSH user** (default `ubuntu`, e.g. `ec2-user` on Amazon Linux) used for
+  every ssh/scp to it. It must be a plain POSIX user name (`[a-z_][a-z0-9_.-]*`, max 32).
+- **SSH test** runs `ssh -i <pem> <user>@<ip>` with `BatchMode=yes`, `ConnectTimeout=10` and a
   30 s overall limit, and shows hostname, OS release and architecture or a short error. New host
   keys are accepted on first connect (`accept-new`); a changed host key is an error.
 
@@ -63,13 +66,17 @@ value is an array of `CVE-YYYY-NNNN…` strings (case-insensitive, normalized an
 ### Analysis (read-only)
 
 **Analyze Report** starts a background run; the run page refreshes itself and shows each
-server as *Waiting*, *Analyzing*, *Complete* or *Failed* (with the reason). Servers are
-analyzed one after another; one failure never affects the others.
+server as *Waiting*, *Analyzing*, *Complete*, *Failed* (with the reason) or *Not supported*.
+Servers are analyzed one after another; one failure never affects the others.
 
-- **On the server**: one fixed read-only command as `ubuntu`, **without sudo**: hostname,
-  `/etc/os-release`, architecture, running kernel, `/run/reboot-required(.pkgs)`,
+- **On the server**: one fixed read-only command as the server's SSH user, **without sudo**:
+  hostname, `/etc/os-release`, architecture, running kernel, `/run/reboot-required(.pkgs)`,
   `dpkg-query` (binary → source package and versions) and `dpkg --audit`. Nothing is
   downloaded, copied, installed or restarted.
+- **OS detection**: the OS is taken from `/etc/os-release`; everything OS-specific (inventory,
+  Canonical lookups, APT planning, install, reboot check) sits behind an `OsAdapter`
+  (`services/os_adapters/`). Ubuntu is the only adapter: any other OS is shown as
+  `OS not supported yet: <name> <version>` (not a failure, never patchable).
 - **On the workstation**: APT candidates and the `.deb` plan are resolved against a private
   APT state per release and architecture (`<data dir>/apt/<codename>-<arch>/`, pockets
   `<codename>`, `-updates`, `-security`). Every `apt-get` / `apt-cache` call overrides
@@ -226,6 +233,21 @@ data is kept. Run one EC2Patcher process per database.
 
 The tests mock `ssh`, `scp`, downloads, Canonical, NVD and the local APT backend; they never
 need a real server, PEM key, internet access or package installs.
+
+### Integration tests (local containers, no AWS)
+
+`scripts/test-targets/` holds two SSH targets with key-only auth on localhost: Ubuntu 24.04
+(user `ubuntu`, port 2201) and Amazon Linux 2023 (user `ec2-user`, port 2202). The key pair is
+generated at runtime into `scripts/test-targets/.keys/` (git-ignored). Docker runs via `sudo`
+(set `DOCKER=docker` to change that).
+
+```bash
+sh scripts/test-targets/up.sh                 # build + start, generate the key on first use
+.venv/bin/python -m pytest -q -m integration  # deselected by default
+sh scripts/test-targets/down.sh
+```
+
+Overrides: `EC2P_IT_HOST`, `EC2P_IT_UBUNTU_PORT`, `EC2P_IT_AMAZON_PORT`, `EC2P_IT_KEY`.
 
 ## Security notes
 

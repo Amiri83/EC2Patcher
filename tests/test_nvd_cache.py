@@ -186,7 +186,7 @@ def test_settings_clear_also_empties_nvd_cache(client, db_path):
 def test_fresh_database_is_v10_with_nvd_cache(db_path):
     Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 10
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 11
     assert nvd_columns(db_path) == [
         ("cve", "TEXT", 1), ("metrics", "TEXT", 0), ("last_modified", "TEXT", 0),
         ("fetched_at", "TEXT", 0),
@@ -215,7 +215,7 @@ def test_v9_database_upgrades_to_v10_keeping_data(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     check.close()
     assert [c[0] for c in nvd_columns(db_path)] == ["cve", "metrics", "last_modified", "fetched_at"]
     assert db.get_server_by_name("keep") is not None
