@@ -1,19 +1,23 @@
 """OS adapters and OS detection from /etc/os-release.
 
-Ubuntu is the only implementation. Analysis collects facts with one read-only ssh command:
-the default adapter's ``facts_command``, whose output starts with the OS-independent hostname
-and os-release sections. The OS is detected from that section before anything else is parsed;
-a server whose os-release names an OS without an adapter is reported as "OS not supported
-yet" instead of failing on output it cannot understand. (An adapter whose facts differ from
-Ubuntu's will need that command to branch on the OS in the remote shell.)
+Ubuntu (analysis + patching) and Amazon Linux 2023 (analysis only). Analysis collects facts
+with one read-only ssh command: the default (Ubuntu) adapter's ``facts_command``, whose output
+starts with the OS-independent hostname and os-release sections. The OS is detected from that
+section before anything else is parsed; another adapter's own read-only facts command is then
+run as a second ssh command (so the Ubuntu command never changes). A server whose os-release
+names an OS without an adapter is reported as "OS not supported yet" (Amazon Linux 2: not
+supported, end of life) instead of failing on output it cannot understand.
 """
 
 from ec2patcher.services import server_state
+from ec2patcher.services.os_adapters.amazon_linux import AmazonLinuxAdapter
 from ec2patcher.services.os_adapters.base import AnalysisContext, Assessment, OsAdapter
 from ec2patcher.services.os_adapters.ubuntu import UbuntuAdapter
 
 __all__ = [
     "ADAPTERS",
+    "AMAZON_LINUX",
+    "AmazonLinuxAdapter",
     "DEFAULT",
     "UNSUPPORTED_PREFIX",
     "UNSUPPORTED_STATUS",
@@ -31,11 +35,13 @@ __all__ = [
 ]
 
 UBUNTU = UbuntuAdapter()
-ADAPTERS: tuple[OsAdapter, ...] = (UBUNTU,)
+AMAZON_LINUX = AmazonLinuxAdapter()
+ADAPTERS: tuple[OsAdapter, ...] = (UBUNTU, AMAZON_LINUX)
 # Collects the facts used for detection, and parses output without a usable os-release.
 DEFAULT: OsAdapter = UBUNTU
 
 UNSUPPORTED_PREFIX = "OS not supported yet"
+EOL_PREFIX = "OS not supported"  # end-of-life releases that will never get an adapter
 # Server analysis status for an OS without an adapter (not a failure; nothing to patch).
 UNSUPPORTED_STATUS = "unsupported"
 
@@ -66,6 +72,8 @@ def describe(os_release: dict[str, str]) -> str:
 
 
 def unsupported_message(os_release: dict[str, str]) -> str:
+    if os_release.get("ID") == "amzn" and os_release.get("VERSION_ID") == "2":
+        return f"{EOL_PREFIX}: {describe(os_release)} (end of life)"
     return f"{UNSUPPORTED_PREFIX}: {describe(os_release)}"
 
 

@@ -2,7 +2,9 @@
 
 Deselected by default; run with ``pytest -m integration`` after ``scripts/test-targets/up.sh``.
 Real ssh to containers on localhost only (no AWS, no other network): SSH test and OS
-detection on Ubuntu 24.04 (user ubuntu) and Amazon Linux 2023 (user ec2-user).
+detection on Ubuntu 24.04 (user ubuntu) and Amazon Linux 2023 (user ec2-user). The CVE
+analysis / patch end-to-end tests (real Canonical, AL2023 CDN and Ubuntu archive) are in
+test_integration_e2e.py.
 
 Environment (defaults match compose.yaml / up.sh):
   EC2P_IT_HOST         127.0.0.1
@@ -112,12 +114,24 @@ def test_integration_os_detection_amazon_linux():
     stdout = facts_output(*AMAZON)
     os_release = os_adapters.os_release_from_output(stdout)
     assert os_release["ID"] == "amzn" and os_release["VERSION_ID"] == "2023"
-    assert os_adapters.detect(os_release) is None
-    assert os_adapters.unsupported_message(os_release) == "OS not supported yet: Amazon Linux 2023"
+    adapter = os_adapters.detect(os_release)
+    assert adapter is os_adapters.AMAZON_LINUX
+    user, port = AMAZON
+    result = ssh_service.run_remote(
+        HOST, KEY, adapter.facts_command, timeout=90, user=user, port=port
+    )
+    assert result.ok, result.error
+    facts = adapter.parse_facts(result.stdout)  # real rpm inventory of the container
+    assert facts.hostname == "ec2p-test-amazonlinux" and facts.architecture in ("x86_64", "aarch64")
+    assert facts.releasever == "latest" or facts.releasever.startswith("2023.")
+    assert any(p.name == "openssh-server" for p in facts.packages)
+    assert facts.reboot_required is not None, facts.warnings  # needs-restarting (dnf-utils)
+    assert adapter.check_supported(facts) is None
 
 
 def test_integration_analysis_of_both_targets(db, tmp_path):
-    """The analysis service end to end (no CVEs: no Canonical / NVD / APT work needed)."""
+    """The analysis service end to end (no CVEs: no Canonical / NVD / APT / Amazon Linux
+    advisory work needed)."""
     servers = {"it-ubuntu": UBUNTU, "it-amazon": AMAZON}
     results = {}
     for name, (user, port) in servers.items():
@@ -132,6 +146,7 @@ def test_integration_analysis_of_both_targets(db, tmp_path):
     assert ubuntu.status == "complete", ubuntu.error
     assert (ubuntu.os_id, ubuntu.os_codename) == ("ubuntu", "noble")
     assert ubuntu.remote_hostname == "ec2p-test-ubuntu"
-    assert amazon.status == "unsupported"
-    assert amazon.error == "OS not supported yet: Amazon Linux 2023"
+    assert amazon.status == "complete", amazon.error
     assert amazon.os_id == "amzn" and amazon.remote_hostname == "ec2p-test-amazonlinux"
+    assert amazon.os_version_id == "2023" and amazon.os_codename  # the releasever
+    assert amazon.plan == [] and amazon.findings == []

@@ -8,7 +8,7 @@ from phase2_fixtures import FakeApt
 from ec2patcher import config
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
-from ec2patcher.services import local_apt, nvd, security_metadata
+from ec2patcher.services import amazon_updateinfo, local_apt, nvd, security_metadata
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +46,16 @@ def no_live_nvd(monkeypatch):
 
     monkeypatch.setattr(nvd, "http_get", offline)
     monkeypatch.delenv(nvd.API_KEY_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_live_amazon_updateinfo(monkeypatch):
+    """Tests never reach cdn.amazonlinux.com; sources without a fake transport see it offline."""
+
+    def offline(url, timeout):
+        raise OSError("network access to cdn.amazonlinux.com is disabled in tests")
+
+    monkeypatch.setattr(amazon_updateinfo, "http_get", offline)
 
 
 @pytest.fixture
