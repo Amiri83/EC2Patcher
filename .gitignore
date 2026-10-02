@@ -8,3 +8,5 @@ dist/
 .ruff_cache/
 *.db
 *.log
+# SSH key pair of the local test targets (generated at runtime by scripts/test-targets/up.sh)
+scripts/test-targets/.keys/

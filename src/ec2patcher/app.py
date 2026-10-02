@@ -21,6 +21,7 @@ from ec2patcher import __version__, config
 from ec2patcher.config import DB_FILENAME, get_apt_max_age, get_apt_state_dir, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
 from ec2patcher.formatting import format_size, format_timestamp
+from ec2patcher.models import DEFAULT_SSH_USER
 from ec2patcher.services import (
     analysis_service,
     cve_resolver,
@@ -171,10 +172,10 @@ def create_app(
     app.state.analyzer = analyzer
     app.state.patcher = patcher
 
-    def run_ssh_test(name: str, ip: str, pem: str) -> ssh_service.SSHTestResult:
+    def run_ssh_test(name: str, ip: str, pem: str, user: str) -> ssh_service.SSHTestResult:
         if ssh_runner is not None:
-            return ssh_service.check_connection(name, ip, pem, runner=ssh_runner)
-        return ssh_service.check_connection(name, ip, pem)
+            return ssh_service.check_connection(name, ip, pem, runner=ssh_runner, user=user)
+        return ssh_service.check_connection(name, ip, pem, user=user)
 
     def render(request: Request, template: str, active: str, status_code: int = 200, **ctx):
         ctx.setdefault("notice", None)
@@ -264,28 +265,35 @@ def create_app(
         pem: str,
         tag_keys: list[str] | None,
         tag_values: list[str] | None,
+        ssh_user: str,
     ):
-        form = {"name": name, "ip_address": ip, "pem_path": pem}
+        form = {"name": name, "ip_address": ip, "pem_path": pem, "ssh_user": ssh_user}
         form["tags"] = tag_rows(tag_keys, tag_values)
         if action == "test":
-            result = run_ssh_test(name.strip() or "(unsaved)", ip.strip(), pem)
+            result = run_ssh_test(name.strip() or "(unsaved)", ip.strip(), pem, ssh_user.strip())
             return server_form(request, server_id, form, ssh_result=result)
 
         data = validate_server_input(
-            db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values
-        )
+            db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values,
+            ssh_user=ssh_user,
+        )  # fmt: skip
         if not data.is_valid:
             return server_form(request, server_id, form, status_code=422, errors=data.errors)
         try:
             if server_id is None:
-                db.create_server(data.name, data.ip_address, data.pem_path, tags=data.tags)
+                db.create_server(
+                    data.name, data.ip_address, data.pem_path, tags=data.tags,
+                    ssh_user=data.ssh_user,
+                )  # fmt: skip
                 logger.info(
-                    "Server created: %s (%s), %d tag(s)", data.name, data.ip_address, len(data.tags)
-                )
+                    "Server created: %s (%s@%s), %d tag(s)",
+                    data.name, data.ssh_user, data.ip_address, len(data.tags),
+                )  # fmt: skip
                 return redirect("/servers", notice="created", name=data.name)
             if not db.update_server(
-                server_id, data.name, data.ip_address, data.pem_path, tags=data.tags
-            ):
+                server_id, data.name, data.ip_address, data.pem_path, tags=data.tags,
+                ssh_user=data.ssh_user,
+            ):  # fmt: skip
                 return redirect("/servers", notice="not_found")
             logger.info(
                 "Server edited: id=%s %s (%s), %d tag(s)",
@@ -301,9 +309,8 @@ def create_app(
 
     @app.get("/servers/new", response_class=HTMLResponse)
     def new_server(request: Request):
-        return server_form(
-            request, None, {"name": "", "ip_address": "", "pem_path": "", "tags": []}
-        )
+        form = {"name": "", "ip_address": "", "pem_path": "", "ssh_user": DEFAULT_SSH_USER}
+        return server_form(request, None, {**form, "tags": []})
 
     @app.post("/servers/new", response_class=HTMLResponse)
     def create_server(
@@ -312,11 +319,12 @@ def create_app(
         name: str = Form(""),
         ip_address: str = Form(""),
         pem_path: str = Form(""),
+        ssh_user: str = Form(DEFAULT_SSH_USER),
         tag_key: list[str] | None = Form(None),  # noqa: B008
         tag_value: list[str] | None = Form(None),  # noqa: B008
     ):
         return handle_server_form(
-            request, None, action, name, ip_address, pem_path, tag_key, tag_value
+            request, None, action, name, ip_address, pem_path, tag_key, tag_value, ssh_user
         )
 
     @app.get("/servers/{server_id}/edit", response_class=HTMLResponse)
@@ -328,6 +336,7 @@ def create_app(
             "name": server.name,
             "ip_address": server.ip_address,
             "pem_path": server.pem_path,
+            "ssh_user": server.ssh_user,
             "tags": [{"key": t.key, "value": t.value} for t in server.tags],
         }
         return server_form(request, server_id, form)
@@ -340,13 +349,16 @@ def create_app(
         name: str = Form(""),
         ip_address: str = Form(""),
         pem_path: str = Form(""),
+        ssh_user: str | None = Form(None),  # absent: keep the server's current user
         tag_key: list[str] | None = Form(None),  # noqa: B008
         tag_value: list[str] | None = Form(None),  # noqa: B008
     ):
-        if db.get_server(server_id) is None:
+        server = db.get_server(server_id)
+        if server is None:
             return redirect("/servers", notice="not_found")
+        user = server.ssh_user if ssh_user is None else ssh_user
         return handle_server_form(
-            request, server_id, action, name, ip_address, pem_path, tag_key, tag_value
+            request, server_id, action, name, ip_address, pem_path, tag_key, tag_value, user
         )
 
     @app.post("/servers/{server_id}/delete")
@@ -362,7 +374,7 @@ def create_app(
         server = db.get_server(server_id)
         if server is None:
             return redirect("/servers", notice="not_found")
-        result = run_ssh_test(server.name, server.ip_address, server.pem_path)
+        result = run_ssh_test(server.name, server.ip_address, server.pem_path, server.ssh_user)
         return servers_page(request, ssh_result=result, tested_id=server_id)
 
     @app.post("/servers/clear", response_class=HTMLResponse)

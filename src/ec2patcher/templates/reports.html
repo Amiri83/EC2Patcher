@@ -102,9 +102,9 @@
     <h2>Pre-Patch Analysis</h2>
     {% if analysis_running %}<span class="badge badge-warning">RUNNING</span>{% endif %}
   </div>
-  <p class="muted small">Connects to each server in the latest report (read-only, as <code>ubuntu</code>, no sudo),
-    checks installed packages against Canonical's Ubuntu security metadata and APT, and builds a per-server
-    pre-patch report. No packages are downloaded, installed or restarted.</p>
+  <p class="muted small">Connects to each server in the latest report (read-only, as the server's SSH user, no sudo),
+    detects the OS, checks installed packages against Canonical's Ubuntu security metadata and APT, and builds a per-server
+    pre-patch report. Servers that do not run Ubuntu are listed as "OS not supported yet". No packages are downloaded, installed or restarted.</p>
   {% if report %}
     <form method="post" action="/reports/analyze" class="form-actions">
       <button type="submit" class="btn btn-primary" {% if analysis_running %}disabled{% endif %}>Analyze Report</button>

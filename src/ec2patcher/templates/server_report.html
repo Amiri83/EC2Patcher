@@ -67,15 +67,17 @@
     <h2>Server</h2>
     {% if analysis.status == "complete" %}<span class="badge badge-success">ANALYSIS COMPLETE</span>
     {% elif analysis.status == "failed" %}<span class="badge badge-danger">ANALYSIS FAILED</span>
+    {% elif analysis.status == "unsupported" %}<span class="badge badge-neutral">OS NOT SUPPORTED YET</span>
     {% else %}<span class="badge badge-warning">{{ analysis.status|upper }}</span>{% endif %}
   </div>
-  {% if analysis.error %}<div class="alert alert-error">{{ analysis.error }}</div>{% endif %}
+  {% if analysis.error and analysis.status == "unsupported" %}<div class="alert alert-warning">{{ analysis.error }}</div>
+  {% elif analysis.error %}<div class="alert alert-error">{{ analysis.error }}</div>{% endif %}
   <dl class="kv report-header">
     <dt>Server Name</dt><dd>{{ analysis.server_name }}</dd>
     {% if analysis.display_name %}<dt>Display Name</dt><dd>{{ analysis.display_name }}</dd>{% endif %}
     <dt>IP</dt><dd><code>{{ analysis.ip_address or "-" }}</code></dd>
     <dt>Remote Hostname</dt><dd>{{ analysis.remote_hostname or "-" }}</dd>
-    <dt>Ubuntu</dt><dd>{{ analysis.os_pretty_name or "-" }}</dd>
+    <dt>{{ "Ubuntu" if analysis.os_id in (none, "ubuntu") else "Operating System" }}</dt><dd>{{ analysis.os_pretty_name or "-" }}</dd>
     <dt>Codename</dt><dd>{{ analysis.os_codename or "-" }}</dd>
     <dt>Architecture</dt><dd>{{ analysis.architecture or "-" }}</dd>
     <dt>Running Kernel</dt><dd>{{ analysis.running_kernel or "-" }}</dd>
@@ -200,7 +202,7 @@
       {% endif %}
     {% endfor %}
   {% else %}
-    <p class="muted">No findings{% if analysis.status == "failed" %} - the analysis of this server failed before CVEs could be evaluated. Reported CVEs: {{ analysis.reported_cves|join(", ") }}{% endif %}.</p>
+    <p class="muted">No findings{% if analysis.status == "failed" %} - the analysis of this server failed before CVEs could be evaluated. Reported CVEs: {{ analysis.reported_cves|join(", ") }}{% elif analysis.status == "unsupported" %} - this operating system is not supported yet, so CVEs were not evaluated. Reported CVEs: {{ analysis.reported_cves|join(", ") }}{% endif %}.</p>
   {% endif %}
 </div>
 
