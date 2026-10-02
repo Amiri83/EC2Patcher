@@ -17,11 +17,11 @@ from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from ec2patcher import __version__, config
+from ec2patcher import __version__, config, logging_setup
 from ec2patcher.config import DB_FILENAME, get_apt_max_age, get_apt_state_dir, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
 from ec2patcher.formatting import format_size, format_timestamp
-from ec2patcher.models import DEFAULT_SSH_USER
+from ec2patcher.models import AUTH_METHODS, AUTH_PASSWORD, AUTH_PEM, DEFAULT_SSH_USER
 from ec2patcher.services import (
     analysis_service,
     cve_resolver,
@@ -66,6 +66,13 @@ NOTICES = {
     "saved": "Settings saved.",
     "reset": "Settings reset to default.",
     "rejected": "Patching was rejected for this report. No action was taken.",
+    "password_set": (
+        "SSH password for '{name}' is kept in memory for this app session only (never stored)."
+    ),
+    "password_forgotten": "SSH password for '{name}' was forgotten.",
+    "password_empty": "Enter the SSH password for '{name}'.",
+    "log_dir_saved": "Log directory saved. The application now logs to the new location.",
+    "log_dir_reset": "Log directory reset to default.",
 }
 
 
@@ -104,8 +111,28 @@ def create_app(
     apt_max_age_hours: float | None = None,
     patch_starter: patch_service.Starter | None = None,
     patch_fetcher: downloader.Fetcher | None = None,
+    file_logging: bool = False,
+    passwords: ssh_service.SessionPasswords | None = None,
 ) -> FastAPI:
+    """``file_logging``: log to the rotating file of the configured log directory (the CLI
+    enables it). ``passwords``: in-memory SSH passwords of this app session."""
     db = Database(db_path or get_data_dir() / DB_FILENAME)
+    passwords = passwords or ssh_service.SessionPasswords()  # never persisted
+
+    def log_dir() -> Path:
+        return logging_setup.log_dir_for(db.get_setting(logging_setup.LOG_DIR_SETTING))
+
+    def apply_log_dir() -> None:
+        if not file_logging:
+            return
+        for directory in dict.fromkeys([log_dir(), config.get_default_log_dir()]):
+            try:
+                logging_setup.configure_file_logging(directory)
+                return
+            except OSError as exc:
+                logger.warning("Cannot log to %s: %s", directory, exc)
+
+    apply_log_dir()
     interrupted = db.mark_interrupted_runs()
     if interrupted:
         logger.warning("Marked %d unfinished analysis run(s) as interrupted", interrupted)
@@ -125,6 +152,7 @@ def create_app(
         starter=analysis_starter or analysis_service.thread_starter,
         nvd_client=nvd_client,
         apt=apt,
+        passwords=passwords,
     )
     interrupted = db.mark_interrupted_executions()
     if interrupted:
@@ -138,6 +166,7 @@ def create_app(
         starter=patch_starter or patch_service.thread_starter,
         fetcher=patch_fetcher,
         analysis_running=lambda: analyzer.is_running,
+        passwords=passwords,
     )
 
     @asynccontextmanager
@@ -165,19 +194,25 @@ def create_app(
     templates.env.globals["apt_max_age_hours"] = apt.max_age.total_seconds() / 3600
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
     templates.env.globals["nvd_cache_days"] = analyzer.nvd.max_age.days
+    templates.env.globals["nvd_key_status"] = lambda: analyzer.nvd.key_status
     templates.env.globals["patch_labels"] = ps.LABELS
     templates.env.globals["patch_badges"] = ps.BADGES
     templates.env.globals["reboot_labels"] = ps.REBOOT_LABELS
     templates.env.globals["reboot_badges"] = ps.REBOOT_BADGES
     templates.env.globals["queue_item_badges"] = ps.ITEM_BADGES
     templates.env.globals["default_staging_template"] = staging.DEFAULT_LOCAL_TEMPLATE
+    templates.env.globals["auth_methods"] = AUTH_METHODS
     app.state.analyzer = analyzer
     app.state.patcher = patcher
+    app.state.passwords = passwords
 
-    def run_ssh_test(name: str, ip: str, pem: str, user: str) -> ssh_service.SSHTestResult:
+    def run_ssh_test(
+        name: str, ip: str, pem: str, user: str, password: str | None = None
+    ) -> ssh_service.SSHTestResult:
+        kwargs = {"user": user, "password": password}
         if ssh_runner is not None:
-            return ssh_service.check_connection(name, ip, pem, runner=ssh_runner, user=user)
-        return ssh_service.check_connection(name, ip, pem, user=user)
+            kwargs["runner"] = ssh_runner
+        return ssh_service.check_connection(name, ip, pem, **kwargs)
 
     def render(request: Request, template: str, active: str, status_code: int = 200, **ctx):
         ctx.setdefault("notice", None)
@@ -243,9 +278,11 @@ def create_app(
 
     def servers_page(request: Request, status_code: int = 200, **ctx):
         ctx.setdefault("notice", notice_from_query(request))
+        servers = db.list_servers()
         return render(
             request, "servers.html", "servers", status_code=status_code,
-            servers=db.list_servers(), confirm_text=CLEAR_CONFIRMATION_TEXT, **ctx,
+            servers=servers, confirm_text=CLEAR_CONFIRMATION_TEXT,
+            password_ids={s.id for s in servers if passwords.has(s.id)}, **ctx,
         )  # fmt: skip
 
     @app.get("/servers", response_class=HTMLResponse)
@@ -253,9 +290,11 @@ def create_app(
         return servers_page(request)
 
     def server_form(request: Request, server_id: int | None, form: dict, status_code=200, **ctx):
+        # The password field is always rendered empty; only "entered this session" is shown.
         return render(
             request, "server_form.html", "servers", status_code=status_code,
-            server_id=server_id, form=form, errors=ctx.pop("errors", {}), **ctx,
+            server_id=server_id, form=form, errors=ctx.pop("errors", {}),
+            has_session_password=passwords.has(server_id), **ctx,
         )  # fmt: skip
 
     def handle_server_form(
@@ -268,35 +307,58 @@ def create_app(
         tag_keys: list[str] | None,
         tag_values: list[str] | None,
         ssh_user: str,
+        auth_method: str = AUTH_PEM,
+        ssh_password: str = "",
     ):
-        form = {"name": name, "ip_address": ip, "pem_path": pem, "ssh_user": ssh_user}
+        form = {
+            "name": name, "ip_address": ip, "pem_path": pem, "ssh_user": ssh_user,
+            "auth_method": auth_method,
+        }  # fmt: skip
         form["tags"] = tag_rows(tag_keys, tag_values)
+        use_password = auth_method == AUTH_PASSWORD
         if action == "test":
-            result = run_ssh_test(name.strip() or "(unsaved)", ip.strip(), pem, ssh_user.strip())
+            password = (ssh_password or passwords.get(server_id)) if use_password else None
+            if use_password and not password:
+                result = ssh_service.SSHTestResult(
+                    False, name.strip() or "(unsaved)", ip.strip(),
+                    error="Enter the SSH password to test the connection.",
+                )  # fmt: skip
+            else:
+                result = run_ssh_test(
+                    name.strip() or "(unsaved)", ip.strip(), pem, ssh_user.strip(), password
+                )
+            if result.success and use_password and ssh_password and server_id is not None:
+                passwords.set(server_id, ssh_password)  # memory only
             return server_form(request, server_id, form, ssh_result=result)
 
         data = validate_server_input(
             db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values,
-            ssh_user=ssh_user,
+            ssh_user=ssh_user, auth_method=auth_method,
         )  # fmt: skip
         if not data.is_valid:
             return server_form(request, server_id, form, status_code=422, errors=data.errors)
         try:
             if server_id is None:
-                db.create_server(
+                server = db.create_server(
                     data.name, data.ip_address, data.pem_path, tags=data.tags,
-                    ssh_user=data.ssh_user,
+                    ssh_user=data.ssh_user, auth_method=data.auth_method,
                 )  # fmt: skip
+                if data.auth_method == AUTH_PASSWORD and ssh_password:
+                    passwords.set(server.id, ssh_password)  # memory only
                 logger.info(
-                    "Server created: %s (%s@%s), %d tag(s)",
-                    data.name, data.ssh_user, data.ip_address, len(data.tags),
+                    "Server created: %s (%s@%s, %s login), %d tag(s)",
+                    data.name, data.ssh_user, data.ip_address, data.auth_method, len(data.tags),
                 )  # fmt: skip
                 return redirect("/servers", notice="created", name=data.name)
             if not db.update_server(
                 server_id, data.name, data.ip_address, data.pem_path, tags=data.tags,
-                ssh_user=data.ssh_user,
+                ssh_user=data.ssh_user, auth_method=data.auth_method,
             ):  # fmt: skip
                 return redirect("/servers", notice="not_found")
+            if data.auth_method != AUTH_PASSWORD:
+                passwords.forget(server_id)
+            elif ssh_password:
+                passwords.set(server_id, ssh_password)  # memory only
             logger.info(
                 "Server edited: id=%s %s (%s), %d tag(s)",
                 server_id, data.name, data.ip_address, len(data.tags),
@@ -311,7 +373,10 @@ def create_app(
 
     @app.get("/servers/new", response_class=HTMLResponse)
     def new_server(request: Request):
-        form = {"name": "", "ip_address": "", "pem_path": "", "ssh_user": DEFAULT_SSH_USER}
+        form = {
+            "name": "", "ip_address": "", "pem_path": "", "ssh_user": DEFAULT_SSH_USER,
+            "auth_method": AUTH_PEM,
+        }  # fmt: skip
         return server_form(request, None, {**form, "tags": []})
 
     @app.post("/servers/new", response_class=HTMLResponse)
@@ -324,10 +389,13 @@ def create_app(
         ssh_user: str = Form(DEFAULT_SSH_USER),
         tag_key: list[str] | None = Form(None),  # noqa: B008
         tag_value: list[str] | None = Form(None),  # noqa: B008
+        auth_method: str = Form(AUTH_PEM),
+        ssh_password: str = Form(""),
     ):
         return handle_server_form(
-            request, None, action, name, ip_address, pem_path, tag_key, tag_value, ssh_user
-        )
+            request, None, action, name, ip_address, pem_path, tag_key, tag_value, ssh_user,
+            auth_method, ssh_password,
+        )  # fmt: skip
 
     @app.get("/servers/{server_id}/edit", response_class=HTMLResponse)
     def edit_server(request: Request, server_id: int):
@@ -339,6 +407,7 @@ def create_app(
             "ip_address": server.ip_address,
             "pem_path": server.pem_path,
             "ssh_user": server.ssh_user,
+            "auth_method": server.auth_method,
             "tags": [{"key": t.key, "value": t.value} for t in server.tags],
         }
         return server_form(request, server_id, form)
@@ -354,20 +423,25 @@ def create_app(
         ssh_user: str | None = Form(None),  # absent: keep the server's current user
         tag_key: list[str] | None = Form(None),  # noqa: B008
         tag_value: list[str] | None = Form(None),  # noqa: B008
+        auth_method: str | None = Form(None),  # absent: keep the server's login method
+        ssh_password: str = Form(""),
     ):
         server = db.get_server(server_id)
         if server is None:
             return redirect("/servers", notice="not_found")
         user = server.ssh_user if ssh_user is None else ssh_user
+        method = server.auth_method if auth_method is None else auth_method
         return handle_server_form(
-            request, server_id, action, name, ip_address, pem_path, tag_key, tag_value, user
-        )
+            request, server_id, action, name, ip_address, pem_path, tag_key, tag_value, user,
+            method, ssh_password,
+        )  # fmt: skip
 
     @app.post("/servers/{server_id}/delete")
     def delete_server(server_id: int):
         server = db.get_server(server_id)
         if server is None or not db.delete_server(server_id):
             return redirect("/servers", notice="not_found")
+        passwords.forget(server_id)
         logger.info("Server deleted: id=%s %s", server_id, server.name)
         return redirect("/servers", notice="deleted", name=server.name)
 
@@ -376,8 +450,35 @@ def create_app(
         server = db.get_server(server_id)
         if server is None:
             return redirect("/servers", notice="not_found")
-        result = run_ssh_test(server.name, server.ip_address, server.pem_path, server.ssh_user)
+        password, error = ssh_service.server_password(server, passwords)
+        if error:
+            result = ssh_service.SSHTestResult(False, server.name, server.ip_address, error=error)
+        else:
+            result = run_ssh_test(
+                server.name, server.ip_address, server.pem_path, server.ssh_user, password
+            )
         return servers_page(request, ssh_result=result, tested_id=server_id)
+
+    @app.post("/servers/{server_id}/password")
+    def set_session_password(server_id: int, ssh_password: str = Form("")):
+        """Keep the SSH password of a password-login server in memory for this app session."""
+        server = db.get_server(server_id)
+        if server is None or not server.uses_password:
+            return redirect("/servers", notice="not_found")
+        if not ssh_password:
+            return redirect("/servers", notice="password_empty", name=server.name)
+        passwords.set(server_id, ssh_password)
+        logger.info("SSH password entered for this session: server=%s", server.name)
+        return redirect("/servers", notice="password_set", name=server.name)
+
+    @app.post("/servers/{server_id}/password/forget")
+    def forget_session_password(server_id: int):
+        server = db.get_server(server_id)
+        if server is None:
+            return redirect("/servers", notice="not_found")
+        passwords.forget(server_id)
+        logger.info("SSH password forgotten: server=%s", server.name)
+        return redirect("/servers", notice="password_forgotten", name=server.name)
 
     @app.post("/servers/clear", response_class=HTMLResponse)
     def clear_servers(request: Request, confirm_text: str = Form("")):
@@ -385,6 +486,7 @@ def create_app(
             error = f"Servers were NOT cleared. Type {CLEAR_CONFIRMATION_TEXT} exactly to confirm."
             return servers_page(request, status_code=400, error=error)
         count = db.clear_servers()
+        passwords.clear()
         logger.info("All servers cleared (%d removed)", count)
         return redirect("/servers", notice="cleared", count=count)
 
@@ -675,6 +777,7 @@ def create_app(
         template = ctx.pop("template", None) or patcher.staging_template()
         names = sorted(db.server_names(), key=str.casefold)
         preview_name = ctx.pop("preview_name", None) or (names[0] if names else "ip-10-0-0-1")
+        log_dir_value = ctx.pop("log_dir_value", None) or str(log_dir())
         preview, preview_error = None, None
         try:
             preview = staging.resolve_local(template, preview_name)
@@ -685,7 +788,12 @@ def create_app(
             staging_template=template, saved_template=patcher.staging_template(), preview=preview,
             preview_error=preview_error, preview_name=preview_name, server_names=names,
             remote_example=f"{staging.REMOTE_BASE}/{preview_name}",
-            metadata_status=metadata.status(), **ctx,
+            metadata_status=metadata.status(), log_dir_value=log_dir_value,
+            default_log_dir=config.get_default_log_dir(),
+            active_log_file=logging_setup.active_log_file(),
+            log_file=logging_setup.log_file_in(log_dir()),
+            log_max_mb=logging_setup.LOG_MAX_BYTES // (1024 * 1024),
+            log_backups=logging_setup.LOG_BACKUP_COUNT, **ctx,
         )  # fmt: skip
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -715,6 +823,8 @@ def create_app(
         if confirm_text != "RESET":
             return settings_page(request, status_code=400, error="Type RESET exactly to confirm.")
         db.reset()
+        passwords.clear()
+        apply_log_dir()  # the saved log directory was removed with the settings
         return redirect("/settings", notice="database_reset")
 
     @app.post("/settings/staging", response_class=HTMLResponse)
@@ -729,6 +839,23 @@ def create_app(
         db.set_setting(patch_service.STAGING_SETTING, template.strip())
         logger.info("Local patch download directory set to %s", template.strip())
         return redirect("/settings", notice="saved")
+
+    @app.post("/settings/log-dir", response_class=HTMLResponse)
+    def save_log_dir(request: Request, action: str = Form("save"), log_dir_path: str = Form("")):
+        if action == "reset":
+            db.delete_setting(logging_setup.LOG_DIR_SETTING)
+            apply_log_dir()
+            logger.info("Log directory reset to default (%s)", log_dir())
+            return redirect("/settings", notice="log_dir_reset")
+        directory, error = logging_setup.check_log_dir(log_dir_path)
+        if error:
+            return settings_page(
+                request, status_code=422, log_dir_value=log_dir_path, log_dir_error=error
+            )
+        db.set_setting(logging_setup.LOG_DIR_SETTING, str(directory))
+        apply_log_dir()
+        logger.info("Log directory set to %s", directory)
+        return redirect("/settings", notice="log_dir_saved")
 
     # --- shutdown ------------------------------------------------------------
 

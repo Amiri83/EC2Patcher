@@ -7,7 +7,7 @@
 <div class="card">
   <div class="card-header">
     <h2>Analysis Status</h2>
-    {% set r = run %}{% include "_run_status.html" %}
+    <span class="badge-group">{% include "_nvd_key_badge.html" %}{% set r = run %}{% include "_run_status.html" %}</span>
   </div>
   <dl class="kv">
     <dt>Report</dt><dd>{{ run.report_filename }} (uploaded {{ run.report_uploaded_at|timestamp }})</dd>

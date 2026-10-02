@@ -5,7 +5,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
-from platformdirs import user_data_dir
+from platformdirs import user_data_dir, user_log_dir
 
 APP_NAME = "ec2patcher"
 DEFAULT_HOST = "127.0.0.1"
@@ -13,6 +13,8 @@ DEFAULT_PORT = 8080
 DB_FILENAME = "ec2patcher.db"
 LOG_FILENAME = "ec2patcher.log"
 DATA_DIR_ENV = "EC2PATCHER_DATA_DIR"
+# Default log directory (the Settings page can choose another one, stored in the database).
+LOG_DIR_ENV = "EC2PATCHER_LOG_DIR"
 
 # Private APT state used to resolve candidates and .deb plans on the workstation.
 APT_STATE_DIRNAME = "apt"  # under the data directory
@@ -32,6 +34,13 @@ def get_data_dir(override: str | None = None) -> Path:
     path = Path(raw).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def get_default_log_dir() -> Path:
+    """Default log directory: $EC2PATCHER_LOG_DIR, else the per-user log dir from platformdirs
+    (e.g. ~/.local/state/ec2patcher/log on Linux). Not created here."""
+    raw = os.environ.get(LOG_DIR_ENV) or user_log_dir(APP_NAME, appauthor=False)
+    return Path(raw).expanduser()
 
 
 def get_apt_state_dir(data_dir: Path, override: str | None = None) -> Path:
