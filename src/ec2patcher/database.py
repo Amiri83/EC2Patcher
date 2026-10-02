@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ec2patcher.models import (
+    AUTH_PEM,
     DEFAULT_SSH_USER,
     AnalysisRun,
     CveFindingRow,
@@ -28,7 +29,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -335,6 +336,11 @@ _MIGRATIONS = {
             fetched_at  TEXT NOT NULL
         );
     """,
+    # Per-server login method: 'pem' (key file, existing servers) or 'password'. Only the
+    # method is stored; a password is never written to the database.
+    13: """
+        ALTER TABLE servers ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'pem';
+    """,
 }
 
 
@@ -369,6 +375,7 @@ def _row_to_server(row: sqlite3.Row) -> Server:
         ip_address=row["ip_address"],
         pem_path=row["pem_path"],
         ssh_user=row["ssh_user"],
+        auth_method=row["auth_method"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -706,6 +713,7 @@ class Database:
         pem_path: str,
         tags: list[tuple[str, str]] | None = None,
         ssh_user: str = DEFAULT_SSH_USER,
+        auth_method: str = AUTH_PEM,
     ) -> Server:
         """Insert a server (and optionally its tags) in one transaction."""
         _check_duplicate_keys(tags or [])
@@ -713,9 +721,9 @@ class Database:
         try:
             with self.connect() as conn:
                 cur = conn.execute(
-                    "INSERT INTO servers (name, ip_address, pem_path, ssh_user, created_at, "
-                    "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (name, ip_address, pem_path, ssh_user, now, now),
+                    "INSERT INTO servers (name, ip_address, pem_path, ssh_user, auth_method, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (name, ip_address, pem_path, ssh_user, auth_method, now, now),
                 )
                 server_id = cur.lastrowid
                 if tags:
@@ -732,17 +740,19 @@ class Database:
         pem_path: str,
         tags: list[tuple[str, str]] | None = None,
         ssh_user: str | None = None,
+        auth_method: str | None = None,
     ) -> bool:
         """Update a server. If ``tags`` is given, it replaces the server's full tag set; the
-        SSH user is only changed when ``ssh_user`` is given."""
+        SSH user and login method are only changed when given."""
         if tags is not None:
             _check_duplicate_keys(tags)
         try:
             with self.connect() as conn:
                 cur = conn.execute(
                     "UPDATE servers SET name = ?, ip_address = ?, pem_path = ?, "
-                    "ssh_user = COALESCE(?, ssh_user), updated_at = ? WHERE id = ?",
-                    (name, ip_address, pem_path, ssh_user, _now(), server_id),
+                    "ssh_user = COALESCE(?, ssh_user), auth_method = COALESCE(?, auth_method), "
+                    "updated_at = ? WHERE id = ?",
+                    (name, ip_address, pem_path, ssh_user, auth_method, _now(), server_id),
                 )
                 if cur.rowcount == 1 and tags is not None:
                     self._replace_tags(conn, server_id, tags)

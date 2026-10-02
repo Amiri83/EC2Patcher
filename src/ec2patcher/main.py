@@ -1,7 +1,6 @@
 """Command line entry point: `ec2patcher` or `python -m ec2patcher`."""
 
 import argparse
-import logging
 import os
 import sys
 import threading
@@ -16,18 +15,9 @@ from ec2patcher.config import (
     DEFAULT_APT_MAX_AGE_HOURS,
     DEFAULT_HOST,
     DEFAULT_PORT,
-    LOG_FILENAME,
     get_data_dir,
 )
-
-
-def setup_logging(log_path) -> None:
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    for handler in (logging.StreamHandler(sys.stderr), logging.FileHandler(log_path)):
-        handler.setFormatter(fmt)
-        root.addHandler(handler)
+from ec2patcher.logging_setup import active_log_file, setup_console_logging
 
 
 def _can_open_browser() -> bool:
@@ -65,7 +55,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--apt-max-age-hours must be a non-negative number")
 
     data_dir = get_data_dir(args.data_dir)
-    setup_logging(data_dir / LOG_FILENAME)
+    setup_console_logging()  # the rotating log file is set up by create_app (Settings)
 
     server: uvicorn.Server | None = None
 
@@ -82,6 +72,7 @@ def main(argv: list[str] | None = None) -> None:
         allowed_hosts=allowed_hosts,
         apt_state_dir=args.apt_state_dir,
         apt_max_age_hours=args.apt_max_age_hours,
+        file_logging=True,
     )
     config = uvicorn.Config(
         app, host=args.host, port=args.port, log_config=None, log_level="info", access_log=False
@@ -90,7 +81,10 @@ def main(argv: list[str] | None = None) -> None:
 
     url_host = f"[{args.host}]" if ":" in args.host else args.host
     url = f"http://{url_host}:{args.port}/"
+    log_file = active_log_file()
     print(f"EC2 Patcher {__version__} - open {url} (data: {data_dir})", flush=True)
+    if log_file is not None:
+        print(f"Log file: {log_file}", flush=True)
     if not args.no_browser and _can_open_browser():
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 

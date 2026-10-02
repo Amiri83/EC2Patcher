@@ -289,6 +289,8 @@ class _Context:
     packages: list[PatchPackageResult]
     debs: dict[str, dict]  # filename -> {uri, size, sha256, package_ids}
     user: str = DEFAULT_SSH_USER  # SSH login user of the server
+    # Session password for password login (memory only, never stored or shown); None = key.
+    password: str | None = field(default=None, repr=False)
     adapter: os_adapters.OsAdapter = os_adapters.DEFAULT  # OS the analysis was made for
     notes: list[str] = field(default_factory=list)
     reboot_required: bool = False  # /run/reboot-required seen by the post-install check
@@ -314,8 +316,10 @@ class PatchService:
         analysis_running: Callable[[], bool] = lambda: False,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        passwords: ssh_service.SessionPasswords | None = None,
     ):
         self.db = db
+        self.passwords = passwords or ssh_service.SessionPasswords()  # memory only
         self.runner = runner
         self.starter = starter
         self.fetcher = fetcher or downloader.urllib_fetcher
@@ -415,6 +419,8 @@ class PatchService:
             reasons.append(
                 "The server's name or IP address changed since the analysis. Run a new analysis."
             )
+        elif ssh_service.server_password(server, self.passwords)[1]:
+            reasons.append(ssh_service.PASSWORD_MISSING)
         if self.analysis_running():
             reasons.append("An analysis is currently running. Wait for it to finish.")
         active = self.db.active_execution_id()
@@ -665,6 +671,9 @@ class PatchService:
             )
         if execution.remote_staging_path != staging.remote_dir(execution.server_name):
             raise PatchAbort("Unexpected remote staging path.")
+        password, password_error = ssh_service.server_password(server, self.passwords)
+        if password_error:
+            raise PatchAbort(password_error)
         debs: dict[str, dict] = {}
         for plan in installable(analysis):  # at-target rows are dropped at revalidation
             sha = downloader.parse_sha256(plan.checksum)
@@ -682,13 +691,15 @@ class PatchService:
             packages=execution.packages,
             debs=debs,
             user=server.ssh_user,
+            password=password,
             adapter=_adapter(analysis),
         )
 
     def _remote(self, ctx: _Context, command: str, timeout: int) -> ssh_service.RemoteResult:
         return ssh_service.run_remote(
-            ctx.ip, ctx.pem, command, runner=self.runner, timeout=timeout, user=ctx.user
-        )
+            ctx.ip, ctx.pem, command, runner=self.runner, timeout=timeout, user=ctx.user,
+            password=ctx.password,
+        )  # fmt: skip
 
     def _packages_with(self, ctx: _Context, filename: str) -> list[PatchPackageResult]:
         return [p for p in ctx.packages if p.deb_filename == filename]
@@ -877,7 +888,7 @@ class PatchService:
         for attempt in range(1, SCP_ATTEMPTS + 1):
             sent = ssh_service.run_scp(
                 ctx.ip, ctx.pem, [str(ctx.local_dir / filename)], ctx.remote_dir,
-                runner=self.runner, timeout=timeout, user=ctx.user,
+                runner=self.runner, timeout=timeout, user=ctx.user, password=ctx.password,
             )  # fmt: skip
             ctx.transfer_attempts.append(
                 {

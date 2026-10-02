@@ -3,13 +3,24 @@
 <head>
   <meta charset="utf-8">
   <title>EC2 Patcher stopped</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {# Inline on purpose: the server is already stopped, so /static is no longer served. #}
   <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: #f4f5f7;
-           color: #1f2933; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-    .box { background: #fff; border: 1px solid #d9dde3; border-radius: 8px; padding: 32px 40px; max-width: 480px; }
+    :root { color-scheme: light dark; --bg: #f4f6f8; --surface: #fff; --border: #d9dee4;
+            --text: #1c2630; --muted: #5f6b78; --code: #f7f8fa; --success: #1b7546; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0f151b; --surface: #172029; --border: #2d3b48; --text: #dbe2e9;
+              --muted: #94a2b0; --code: #1d2832; --success: #5fcf8f; }
+    }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg);
+           color: var(--text); display: flex; align-items: center; justify-content: center; min-height: 100vh;
+           margin: 0; padding: 16px; box-sizing: border-box; line-height: 1.5; }
+    .box { background: var(--surface); border: 1px solid var(--border); border-top: 4px solid var(--success);
+           border-radius: 10px; padding: 32px 40px; max-width: 480px; box-shadow: 0 1px 3px rgba(16, 24, 32, 0.06); }
     h1 { font-size: 20px; margin: 0 0 12px; }
-    p { margin: 0 0 8px; color: #52606d; }
-    code { background: #f0f2f5; padding: 2px 6px; border-radius: 4px; }
+    p { margin: 0 0 8px; color: var(--muted); }
+    code { background: var(--code); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px;
+           font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
   </style>
 </head>
 <body>

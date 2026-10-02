@@ -16,6 +16,7 @@ def isolated_metadata_cache(tmp_path: Path, monkeypatch):
     """Never read or write the user's real Canonical metadata cache or data directory."""
     monkeypatch.setenv("EC2PATCHER_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv(config.DATA_DIR_ENV, str(tmp_path / "appdata"))
+    monkeypatch.setenv(config.LOG_DIR_ENV, str(tmp_path / "logs"))
     monkeypatch.delenv(config.APT_STATE_DIR_ENV, raising=False)
     monkeypatch.delenv(config.APT_MAX_AGE_ENV, raising=False)
 
