@@ -15,7 +15,7 @@ from ec2patcher.services import cve_resolver as cr
 from ec2patcher.services.downloader import DownloadError
 from ec2patcher.services.staging import MARKER
 
-SERVER = "ip-10-0-0-245"
+SERVER = "ip-10-0-0-3"
 IP = "192.0.2.245"
 SEC = "http://security.ubuntu.com/ubuntu/pool/main"
 KERNEL_FIXED = "6.8.0-1024.26"
@@ -278,9 +278,7 @@ class FakeUbuntu:
             self._down -= 1
             return _done(args, rc=255, stderr="ssh: connect to host port 22: Connection refused")
         if self.unreachable:
-            return _done(
-                args, rc=255, stderr="ssh: connect to host 192.0.2.245 port 22: timed out"
-            )
+            return _done(args, rc=255, stderr="ssh: connect to host 192.0.2.245 port 22: timed out")
         handler = getattr(self, f"_op_{op.replace('-', '_')}", None)
         if handler is None:
             raise AssertionError(f"unexpected remote command: {command}")

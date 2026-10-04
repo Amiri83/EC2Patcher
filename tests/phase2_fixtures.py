@@ -62,8 +62,8 @@ def vex_doc(cve, *statements, wrapped=False):
 
 # The user's real report shape.
 REAL_REPORT = {
-    "ip-10-0-0-245": ["CVE-2026-63076", "CVE-2026-54874", "CVE-2026-63075"],
-    "ip-10-0-0-215": ["CVE-2026-63076"],
+    "ip-10-0-0-3": ["CVE-2026-63076", "CVE-2026-54874", "CVE-2026-63075"],
+    "ip-10-0-0-2": ["CVE-2026-63076"],
 }
 
 KERNEL_FIXED = "6.8.0-1024.26"
@@ -307,7 +307,7 @@ def facts_output(
     lines = []
     if motd:
         lines += ["Welcome to Ubuntu 24.04.3 LTS (GNU/Linux 6.8.0-1021-aws x86_64)", ""]
-    lines += ["@@EC2P hostname", "ip-10-0-0-245", "@@EC2P os-release", os_release]
+    lines += ["@@EC2P hostname", "ip-10-0-0-3", "@@EC2P os-release", os_release]
     lines += ["@@EC2P arch", arch, "@@EC2P kernel", kernel, "@@EC2P reboot", reboot, *reboot_pkgs]
     lines += ["@@EC2P reboot-hooks"] + [f"/var/lib/dpkg/info/{n}.postinst" for n in reboot_hooks]
     lines += ["@@EC2P dpkg"] + ["\t".join(p) for p in packages]
