@@ -1,13 +1,33 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ec2patcher"
-version = "0.1.0"
-description = "Personal GUI for recurring Ubuntu EC2 security patching (inventory, SSH test, report upload, read-only pre-patch analysis, Excel export)"
+# Single source of truth for the version; ec2patcher.__version__ reads the installed metadata.
+version = "1.0.0"
+description = "Local web GUI that analyzes Ubuntu and Amazon Linux 2023 EC2 servers for CVE fixes and patches Ubuntu servers over SSH from an approved .deb plan"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Amir Amiri" }]
 requires-python = ">=3.10"
+keywords = ["ec2", "aws", "ubuntu", "amazon-linux", "cve", "security", "patching", "ssh", "apt"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+]
 dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
@@ -23,7 +43,14 @@ dev = [
     "pytest>=8",
     "httpx2",
     "ruff>=0.5",
+    "build>=1.2",
+    "twine>=6.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Amiri83/EC2Patcher"
+Source = "https://github.com/Amiri83/EC2Patcher"
+Issues = "https://github.com/Amiri83/EC2Patcher/issues"
 
 [project.scripts]
 ec2patcher = "ec2patcher.main:main"
