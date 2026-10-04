@@ -1,12 +1,13 @@
-{# NVD API key state (last persisted key check) and where the key comes from; never shows any part of the key. #}
+{# NVD API key state (last persisted key check) and where the key comes from (shown in every state while a key is configured); never shows any part of the key. #}
 {% set key_status = nvd_key_status() if nvd_key_status is defined else "not_set" %}
 {% set key_source = nvd_key_source() if nvd_key_source is defined else none %}
 {% set key_checked_at = nvd_key_checked_at() if nvd_key_checked_at is defined else none %}
-{% set source_text = " — from Settings" if key_source == "settings" else (" — from NVD_API_KEY env var" if key_source == "env" else "") %}
+{% set key_reason = nvd_key_reason() if nvd_key_reason is defined else none %}
+{% set source_text = " — from Settings (DB)" if key_source == "settings" else (" — from NVD_API_KEY env var" if key_source == "env" else "") %}
 {% set checked_text = " (checked " ~ (key_checked_at|timestamp) ~ ")" if key_checked_at else "" %}
 {% if key_status == "valid" %}<span class="badge badge-success nvd-key-badge" data-nvd-key="valid" data-nvd-key-source="{{ key_source }}">NVD API key: valid{{ checked_text }}{{ source_text }}</span>
 {% elif key_status == "rejected" %}<span class="badge badge-danger nvd-key-badge" data-nvd-key="rejected" data-nvd-key-source="{{ key_source }}" title="NVD rejected the key{{ checked_text }}: check the key in Settings or NVD_API_KEY">NVD API key rejected{{ source_text }}</span>
-{% elif key_status == "unreadable" %}<span class="badge badge-danger nvd-key-badge" data-nvd-key="unreadable" data-nvd-key-source="settings" title="The encryption key file is missing or does not match: enter the NVD API key again in Settings">NVD API key in Settings cannot be decrypted &mdash; re-enter it in Settings</span>
-{% elif key_status == "unknown" %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="unknown" data-nvd-key-source="{{ key_source }}" title="{% if key_checked_at %}NVD could not be reached at the last check{{ checked_text }}{% else %}Not checked yet{% endif %}: use Test key in Settings">NVD API key: unknown{{ source_text }}</span>
+{% elif key_status == "unreadable" %}<span class="badge badge-danger nvd-key-badge" data-nvd-key="unreadable" data-nvd-key-source="settings" title="The encryption key file is missing or does not match: enter the NVD API key again in Settings">NVD API key in Settings cannot be decrypted &mdash; from Settings (DB)</span>
+{% elif key_status == "unknown" %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="unknown" data-nvd-key-source="{{ key_source }}" data-nvd-key-reason="{{ key_reason or '' }}" title="{% if key_checked_at %}NVD could not be reached at the last check{{ checked_text }}: {{ key_reason }}{% else %}Not checked yet{% endif %}. Use Test key in Settings">NVD API key: unknown{{ source_text }}</span>
 {% else %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="not_set" title="Save an NVD API key in Settings (or set NVD_API_KEY) for faster CVSS lookups">NVD API key: not set</span>
 {% endif %}

@@ -291,10 +291,16 @@ class AnalysisRun:
     servers: list[ServerAnalysis] = field(default_factory=list)
     # Canonical lookup outcome per unique CVE of the run: ok / cached / failed.
     metadata_lookups: dict[str, str] = field(default_factory=dict)
+    # Per cache (nvd / canonical / amazon): {"cache": n, "live": n, "failed": n} lookups.
+    cache_stats: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def is_running(self) -> bool:
         return self.status == "running"
+
+    @property
+    def cache_tallies(self) -> dict[str, "CacheStats"]:
+        return {name: CacheStats.from_dict(self.cache_stats.get(name)) for name in CACHE_NAMES}
 
     @property
     def lookup_tally(self) -> "LookupTally":
@@ -303,6 +309,59 @@ class AnalysisRun:
     @property
     def failed_lookups(self) -> list[str]:
         return sorted(cve for cve, outcome in self.metadata_lookups.items() if outcome == "failed")
+
+
+CACHE_NVD, CACHE_CANONICAL, CACHE_AMAZON = "nvd", "canonical", "amazon"
+CACHE_NAMES = (CACHE_NVD, CACHE_CANONICAL, CACHE_AMAZON)
+# Where a lookup's data came from in one run (one count per CVE / repository and run).
+FROM_CACHE, FROM_LIVE, LOOKUP_FAILED = "cache", "live", "failed"
+_SOURCE_RANK = {LOOKUP_FAILED: 0, FROM_CACHE: 1, FROM_LIVE: 2}
+
+
+def record_source(sources: dict[str, str], key: str, source: str) -> None:
+    """Remember where ``key`` came from this run; a live answer wins over the cache, the
+    cache over a failure (a later lookup of the same key may only improve it)."""
+    previous = sources.get(key)
+    if previous is None or _SOURCE_RANK[source] > _SOURCE_RANK[previous]:
+        sources[key] = source
+
+
+@dataclass
+class CacheStats:
+    """Lookups of one cache in one analysis run: from cache (fresh, or a stale fallback when
+    the source was unreachable), live (fetched) and failed."""
+
+    cache: int = 0
+    live: int = 0
+    failed: int = 0
+
+    @classmethod
+    def from_sources(cls, sources: dict[str, str]) -> "CacheStats":
+        values = list(sources.values())
+        return cls(values.count(FROM_CACHE), values.count(FROM_LIVE), values.count(LOOKUP_FAILED))
+
+    @classmethod
+    def from_dict(cls, data) -> "CacheStats":
+        data = data if isinstance(data, dict) else {}
+        values = [data.get(k) for k in ("cache", "live", "failed")]
+        return cls(*(v if isinstance(v, int) and v >= 0 else 0 for v in values))
+
+    def as_dict(self) -> dict[str, int]:
+        return {"cache": self.cache, "live": self.live, "failed": self.failed}
+
+    def __add__(self, other: "CacheStats") -> "CacheStats":
+        return CacheStats(
+            self.cache + other.cache, self.live + other.live, self.failed + other.failed
+        )
+
+    @property
+    def total(self) -> int:
+        return self.cache + self.live + self.failed
+
+    @property
+    def label(self) -> str:
+        text = f"{self.cache} from cache / {self.live} live"
+        return f"{text} / {self.failed} failed" if self.failed else text
 
 
 @dataclass

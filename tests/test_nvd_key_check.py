@@ -107,29 +107,32 @@ def test_save_with_a_rejected_key_persists_rejected(db_path, reply, caplog):
 
 
 @pytest.mark.parametrize(
-    "reply",
+    "replies, reason",
     [
-        OSError("Network is unreachable"),
-        TimeoutError("timed out"),
-        (404, {}, b"Not Found"),  # a 404 without the invalid-key message says nothing
-        (503, {}, b""),
-        (429, {"Retry-After": "5"}, b""),
+        ([OSError("Network is unreachable")], "network error: Network is unreachable"),
+        ([TimeoutError("timed out")], "network error: timed out"),
+        ([(404, {}, b"Not Found")], "HTTP 404"),  # a 404 without the invalid-key message
+        ([(503, {}, b"")] * 2, "HTTP 503 (after a retry)"),  # 429 / 5xx: retried once
+        ([(429, {"Retry-After": "5"}, b"")] * 2, "HTTP 429 (after a retry)"),
     ],
     ids=["oserror", "timeout", "plain-404", "503", "429"],
 )
-def test_save_when_nvd_cannot_tell_persists_unknown(db_path, reply):
-    client, fake = nvd_client(db_path, reply)
+def test_save_when_nvd_cannot_tell_persists_unknown(db_path, replies, reason):
+    client, fake = nvd_client(db_path, *replies)
     with web(db_path, client) as c:
         r = c.post("/settings/nvd-key", data={"nvd_api_key": API_KEY})
         assert "NVD could not be reached, so the key is not checked yet." in r.text
-        assert len(fake.calls) == 1  # one request, no retry
+        assert f"Reason: {reason}." in r.text
+        assert len(fake.calls) == len(replies)
         assert persisted(db_path) == {
             "result": nvd.KEY_UNKNOWN, "checked_at": CHECKED, "source": nvd.KEY_SOURCE_SETTINGS,
+            "reason": reason,
         }  # fmt: skip
         reports = c.get("/reports").text
-        assert "NVD API key: unknown — from Settings" in badge(reports)
+        assert "NVD API key: unknown — from Settings (DB)" in badge(reports)
         assert "badge-neutral" in badge(reports)
         assert "NVD could not be reached at the last check" in badge(reports)
+        assert reason in badge(reports)
 
 
 def test_save_with_the_default_offline_client_is_unknown(db_path):

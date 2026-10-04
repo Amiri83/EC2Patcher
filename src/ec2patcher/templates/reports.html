@@ -100,7 +100,7 @@
 <div class="card" id="analysis">
   <div class="card-header">
     <h2>Pre-Patch Analysis</h2>
-    <span class="badge-group">{% include "_nvd_key_badge.html" %}{% if analysis_running %}<span class="badge badge-warning">RUNNING</span>{% endif %}</span>
+    <span class="badge-group">{% include "_nvd_key_badge.html" %}{% include "_cache_badges.html" %}{% if analysis_running %}<span class="badge badge-warning">RUNNING</span>{% endif %}</span>
   </div>
   <p class="muted small">Connects to each server in the latest report (read-only, as the server's SSH user, no sudo),
     detects the OS, checks installed packages against Canonical's Ubuntu security metadata and APT, and builds a per-server
