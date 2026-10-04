@@ -485,7 +485,7 @@ def test_settings_key_overrides_the_environment_and_badge_shows_source(db_path, 
     app = create_app(db_path=db_path, nvd_client=client, shutdown_handler=lambda: None)
     with TestClient(app, base_url="http://127.0.0.1") as c:
         page = c.get("/reports").text
-        assert "NVD API key: set (not used yet) — from NVD_API_KEY env var" in page
+        assert "NVD API key: unknown — from NVD_API_KEY env var" in page
         assert 'data-nvd-key-source="env"' in page
         assert "NVD_API_KEY env var</dt><dd>set" in c.get("/settings").text
 
@@ -495,7 +495,7 @@ def test_settings_key_overrides_the_environment_and_badge_shows_source(db_path, 
         assert fake.calls[-1][1]["apiKey"] == API_KEY  # the Settings key wins
         assert API_KEY not in fake.calls[-1][0] and ENV_KEY not in fake.calls[-1][0]
         reports = c.get("/reports").text
-        assert "NVD API key: in use — from Settings" in reports
+        assert re.search(r"NVD API key: valid \(checked [^)]+\) — from Settings", reports)
         settings = c.get("/settings").text
         assert "(overridden by the saved key)" in settings
 
@@ -505,7 +505,7 @@ def test_settings_key_overrides_the_environment_and_badge_shows_source(db_path, 
         client.lookup("CVE-2026-54874")
         assert fake.calls[-1][1]["apiKey"] == ENV_KEY
         after = c.get("/reports").text
-        assert "NVD API key: in use — from NVD_API_KEY env var" in after
+        assert re.search(r"NVD API key: valid \(checked [^)]+\) — from NVD_API_KEY env", after)
     for text in (page, reports, settings, after):
         assert API_KEY not in text and ENV_KEY not in text and ENV_KEY[-4:] not in text
 
@@ -517,9 +517,9 @@ def test_saved_nvd_key_is_used_after_a_restart_and_reset_clears_it(db_path, monk
     app = create_app(db_path=db_path, shutdown_handler=lambda: None)
     nvd_client = app.state.analyzer.nvd
     assert nvd_client.key_source == nvd.KEY_SOURCE_SETTINGS
-    assert nvd_client.key_status == nvd.KEY_SET and nvd_client.interval == nvd.INTERVAL_WITH_KEY
+    assert nvd_client.key_status == nvd.KEY_UNKNOWN and nvd_client.interval == nvd.INTERVAL_WITH_KEY
     with TestClient(app, base_url="http://127.0.0.1") as c:
-        assert "NVD API key: set (not used yet) — from Settings" in c.get("/reports").text
+        assert "NVD API key: unknown — from Settings" in c.get("/reports").text
         c.post("/settings/reset-database", data={"confirm_text": "RESET"})
         assert nvd_client.key_status == nvd.KEY_NOT_SET and nvd_client.key_source is None
         assert "NVD API key: not set" in c.get("/reports").text
@@ -543,7 +543,7 @@ def test_unreadable_saved_nvd_key_is_a_clear_error(db_path, tmp_path, caplog):
         assert 'class="text-danger nvd-key-error"' in settings and "is missing" in settings
         r = c.post("/settings/nvd-key", data={"nvd_api_key": API_KEY})  # re-enter it
         assert MASKED in r.text and nvd_client.key_source == nvd.KEY_SOURCE_SETTINGS
-        assert nvd_client.key_status == nvd.KEY_SET
+        assert nvd_client.key_status == nvd.KEY_UNKNOWN  # NVD offline in tests
     assert API_KEY not in reports + settings + caplog.text
 
 

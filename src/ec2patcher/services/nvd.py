@@ -9,7 +9,8 @@ One request per CVE (``cveId`` query parameter), sequential and rate limited: NV
 5 requests per rolling 30 s without an API key and 50 with one, so requests are spaced 6 s /
 0.6 s apart. The optional API key (saved encrypted in Settings, else the ``NVD_API_KEY``
 environment variable) is sent in the ``apiKey`` request header, as the 2.0 API requires; it is
-never shown, logged or exported. Responses
+never shown, logged or exported. What NVD last said about the key (valid / rejected / unknown)
+is persisted in the settings table, never the key. Responses
 are cached per CVE in the application database (table ``nvd_cache``; raw ``metrics`` kept, so
 the selection is recomputed on reuse): entries younger than 30 days are used without a
 request, older entries are refreshed and used as a fallback (marked stale) when NVD cannot be
@@ -54,12 +55,21 @@ NO_CVSS = "no_cvss"  # NVD knows the CVE but has no usable CVSS metric
 NOT_FOUND = "not_found"  # NVD returned zero vulnerabilities
 FAILED = "failed"  # lookup failed and nothing was cached
 
-# API key state for the UI badge (this process only; the key itself is never shown).
+# API key state for the UI badge (the key itself is never shown). The result of the last
+# keyed request (key check or live lookup) is persisted in the settings table, so it survives
+# restarts and cached lookups that send no request.
 KEY_NOT_SET = "not_set"  # no key in Settings or NVD_API_KEY
-KEY_SET = "set"  # key configured, no keyed request answered yet
-KEY_IN_USE = "in_use"  # the last keyed request succeeded
-KEY_REJECTED = "rejected"  # NVD answered HTTP 403 to the last keyed request
+KEY_UNKNOWN = "unknown"  # key configured, not checked yet or NVD unreachable at the check
+KEY_VALID = "valid"  # NVD accepted the key (HTTP 200)
+KEY_REJECTED = "rejected"  # HTTP 403, or 404 with NVD's invalid-apiKey message
 KEY_UNREADABLE = "unreadable"  # a key is saved in Settings but cannot be decrypted
+_KEY_RESULTS = (KEY_UNKNOWN, KEY_VALID, KEY_REJECTED)
+
+# Settings row with the last key check: {"result", "checked_at", "source"}; never the key.
+KEY_CHECK_SETTING = "nvd_api_key_check"
+KEY_CHECK_CVE = "CVE-2021-44228"  # any well-known CVE: one small keyed request
+# NVD answers an invalid key with HTTP 404 and a "message: Invalid apiKey." header.
+_INVALID_KEY_RE = re.compile(rb"invalid\s*api\s*-?key|api\s*-?key\s+(?:is\s+)?invalid", re.I)
 
 # Where the key in use comes from: a key saved in Settings overrides NVD_API_KEY.
 KEY_SOURCE_SETTINGS = "settings"
@@ -253,7 +263,11 @@ def http_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, di
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers or {}), b""
+        try:
+            body = exc.read()  # an error body may explain it (e.g. an invalid API key)
+        except OSError:
+            body = b""
+        return exc.code, dict(exc.headers or {}), body or b""
 
 
 def _now() -> datetime:
@@ -266,6 +280,20 @@ def _retry_after(headers: dict[str, str], fallback: float) -> float:
         return min(max(float(value), 0.0), MAX_RETRY_AFTER)
     except (TypeError, ValueError):
         return fallback
+
+
+def key_verdict(status: int, headers: dict[str, str], body: bytes) -> str | None:
+    """What a reply to a keyed request says about the key: KEY_VALID, KEY_REJECTED or None
+    (nothing, e.g. 429 / 5xx)."""
+    if status == 200:
+        return KEY_VALID
+    if status == 403:
+        return KEY_REJECTED
+    if status == 404:
+        text = b" ".join([str(v).encode("utf-8", "replace") for v in headers.values()] + [body])
+        if _INVALID_KEY_RE.search(text):
+            return KEY_REJECTED
+    return None
 
 
 class NvdClient:
@@ -308,7 +336,9 @@ class NvdClient:
         self._api_key = key or None
         self.key_source = source if self._api_key or state else None
         self.interval = INTERVAL_WITH_KEY if self._api_key else INTERVAL_PUBLIC
-        self._key_state = state or (KEY_SET if self._api_key else KEY_NOT_SET)
+        # None: the last persisted key check is read on first use (see key_status).
+        self._key_state = state or (None if self._api_key else KEY_NOT_SET)
+        self._key_checked_at: str | None = None
 
     def use_settings_key(self, key: str | None, unreadable: bool = False) -> None:
         """Apply the key saved in Settings; it overrides NVD_API_KEY. ``None`` (no key saved)
@@ -322,10 +352,82 @@ class NvdClient:
             self._use_key(self._default_key, KEY_SOURCE_ENV)
 
     @property
+    def has_key(self) -> bool:
+        return self._api_key is not None
+
+    @property
     def key_status(self) -> str:
-        """KEY_NOT_SET / KEY_SET / KEY_IN_USE / KEY_REJECTED / KEY_UNREADABLE (never the key
+        """KEY_NOT_SET / KEY_UNKNOWN / KEY_VALID / KEY_REJECTED / KEY_UNREADABLE (never the key
         itself)."""
+        if self._key_state is None:
+            self._key_state, self._key_checked_at = self._load_key_check()
         return self._key_state
+
+    @property
+    def key_checked_at(self) -> str | None:
+        """UTC ISO time of the last key check behind :attr:`key_status`, or None."""
+        return self._key_checked_at if self.key_status in _KEY_RESULTS else None
+
+    def _load_key_check(self) -> tuple[str, str | None]:
+        """The persisted result of the last key check, if it was made with a key from the
+        current source (a check of the NVD_API_KEY key says nothing about a Settings key)."""
+        try:
+            value = self._cache().get_setting(KEY_CHECK_SETTING)
+            check = json.loads(value) if value else {}
+            if (
+                isinstance(check, dict)
+                and check.get("source") == self.key_source
+                and check.get("result") in _KEY_RESULTS
+            ):
+                return check["result"], _text(check.get("checked_at"))
+        except Exception as exc:  # noqa: BLE001 - the badge then just shows "unknown"
+            logger.warning("Ignoring the unreadable NVD API key check: %s", exc)
+        return KEY_UNKNOWN, None
+
+    def _record_key_check(self, result: str) -> None:
+        """Remember (and persist) what NVD said about the key: result, time and key source."""
+        self._key_state, self._key_checked_at = result, self.now().isoformat()
+        check = {"result": result, "checked_at": self._key_checked_at, "source": self.key_source}
+        try:
+            self._cache().set_setting(KEY_CHECK_SETTING, json.dumps(check))
+        except Exception as exc:  # noqa: BLE001 - the in-memory state is still right
+            logger.warning("Could not save the NVD API key check: %s", exc)
+
+    def forget_key_check(self) -> None:
+        """Drop the persisted key check (e.g. the checked key was removed)."""
+        try:
+            self._cache().delete_setting(KEY_CHECK_SETTING)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not remove the NVD API key check: %s", exc)
+        if self._api_key:
+            self._key_state, self._key_checked_at = KEY_UNKNOWN, None
+
+    def _key_label(self) -> str:
+        return "Settings" if self.key_source == KEY_SOURCE_SETTINGS else API_KEY_ENV
+
+    def check_key(self) -> str:
+        """Send one keyed request now and persist what it says about the key: KEY_VALID
+        (HTTP 200), KEY_REJECTED (403, or 404 with the invalid-apiKey message) or KEY_UNKNOWN
+        (NVD unreachable or any other answer). Without a usable key nothing is sent and
+        KEY_NOT_SET / KEY_UNREADABLE is returned."""
+        if not self._api_key:
+            return self.key_status
+        url = f"{API_URL}?{urllib.parse.urlencode({'cveId': KEY_CHECK_CVE})}"
+        self._throttle()
+        self.requests += 1
+        try:
+            transport = self.transport or http_get
+            status, headers, body = transport(url, self._headers(), REQUEST_TIMEOUT_SECONDS)
+        except (OSError, TimeoutError) as exc:
+            logger.warning("NVD API key check from %s: NVD unreachable: %s", self._key_label(), exc)
+            result = KEY_UNKNOWN
+        else:
+            result = key_verdict(status, headers, body) or KEY_UNKNOWN
+            logger.info(
+                "NVD API key check from %s: HTTP %s -> %s", self._key_label(), status, result
+            )
+        self._record_key_check(result)
+        return result
 
     def start_run(self) -> None:
         """Forget per-run state: the in-run memo and the 'NVD unreachable' circuit breaker."""
@@ -387,12 +489,17 @@ class NvdClient:
                 self.sleep(wait)
         self._last_request = self.monotonic()
 
-    def fetch(self, cve_id: str) -> dict | None:
-        """Query NVD for one CVE; the ``cve`` object or None if NVD has no such CVE."""
-        url = f"{API_URL}?{urllib.parse.urlencode({'cveId': cve_id})}"
+    def _headers(self) -> dict[str, str]:
         headers = {"User-Agent": "ec2patcher", "Accept": "application/json"}
         if self._api_key:
             headers["apiKey"] = self._api_key
+        return headers
+
+    def fetch(self, cve_id: str) -> dict | None:
+        """Query NVD for one CVE; the ``cve`` object or None if NVD has no such CVE (an empty
+        HTTP 200 answer: any other status, e.g. a 404 for an invalid key, raises)."""
+        url = f"{API_URL}?{urllib.parse.urlencode({'cveId': cve_id})}"
+        headers = self._headers()
         for attempt in range(1, MAX_ATTEMPTS + 1):
             self._throttle()
             self.requests += 1
@@ -401,14 +508,15 @@ class NvdClient:
                 status, response_headers, body = transport(url, headers, REQUEST_TIMEOUT_SECONDS)
             except (OSError, TimeoutError) as exc:  # URLError is an OSError
                 raise NvdUnreachable(f"NVD unreachable: {exc}") from exc
-            if self._api_key and status == 200:
-                self._key_state = KEY_IN_USE
-            elif self._api_key and status == 403:
-                self._key_state = KEY_REJECTED
+            verdict = key_verdict(status, response_headers, body) if self._api_key else None
+            if verdict:
+                self._record_key_check(verdict)
+            if verdict == KEY_REJECTED:
                 logger.warning(
-                    "NVD rejected the configured API key from %s (HTTP 403)",
-                    "Settings" if self.key_source == KEY_SOURCE_SETTINGS else API_KEY_ENV,
-                )
+                    "NVD rejected the configured API key from %s (HTTP %s)",
+                    self._key_label(), status,
+                )  # fmt: skip
+                raise NvdError(f"NVD rejected the API key (HTTP {status})")
             if status == 200:
                 return parse_response(body, cve_id)
             backoff = self.interval * 2**attempt

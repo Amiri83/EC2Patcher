@@ -46,6 +46,7 @@
     </div>
     <div class="form-actions">
       <button type="submit" name="action" value="save" class="btn btn-primary">{{ "Replace" if nvd_key.saved else "Save" }}</button>
+      {% if nvd_key.testable %}<button type="submit" name="action" value="test" class="btn btn-secondary" title="Send one request with the key in use to NVD now">Test key</button>{% endif %}
       {% if nvd_key.saved %}<button type="submit" name="action" value="clear" class="btn btn-secondary">Clear</button>{% endif %}
     </div>
   </form>

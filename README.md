@@ -191,11 +191,15 @@ export NVD_API_KEY=...   # your own key; it is sent only in the apiKey request h
 Request a free key at https://nvd.nist.gov/developers/request-an-api-key.
 
 A key saved in Settings **overrides** `NVD_API_KEY`; Clear falls back to the environment. The
-key is never logged, exported or shown in full. The Pre-Patch Analysis pages show only its state
-and source: *NVD API key: not set*, *set (not used yet)*, *in use* (green, after a successful
-keyed request in this app session) or *NVD API key rejected* (red, NVD answered HTTP 403), each
-followed by *from Settings* or *from NVD_API_KEY env var*. If the saved key cannot be decrypted
-the badge is red and asks to enter it again in Settings (no key is sent until then).
+key is never logged, exported or shown in full. Saving a key, and the **Test key** button, send
+one keyed request to NVD right away (cached CVSS lookups send none). The result and its time are
+kept in the settings table (never the key itself) and updated by every keyed lookup, so they
+survive restarts. The Pre-Patch Analysis pages show only the state and source: *NVD API key: not
+set*, *unknown* (not checked yet, or NVD could not be reached), *valid (checked <time>)* (green,
+HTTP 200) or *NVD API key rejected* (red, HTTP 403, or HTTP 404 with NVD's invalid-apiKey
+message), each followed by *from Settings* or *from NVD_API_KEY env var*. A rejected key never
+marks a CVE as unknown to NVD and is never cached. If the saved key cannot be decrypted the badge
+is red and asks to enter it again in Settings (no key is sent until then).
 
 ### Secrets at rest
 
