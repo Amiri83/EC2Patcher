@@ -9,9 +9,11 @@ version, release, arch, source rpm).
 
 Only advisories that reference a CVE are kept, slimmed to what the analysis needs, and cached
 per repository in the application database (table ``amazon_updateinfo_cache``) with the NVD
-rules: entries younger than 30 days are used without a request, older entries are refreshed
-and used as a fallback (marked stale) when the download fails. Failed downloads are never
-cached, and a cache error never fails a lookup (it falls back to the network).
+rules: entries younger than the TTL (default 24 h, set in Settings -> Caches) are used without
+a request, older entries are refreshed and used as a fallback (marked stale) when the download
+fails. Failed downloads are never cached, and a cache error never fails a lookup (it falls
+back to the network). Each run counts its repositories answered from the cache / live /
+failed (:meth:`UpdateInfoSource.run_cache_stats`).
 """
 
 import bz2
@@ -32,7 +34,8 @@ from pathlib import Path
 
 from ec2patcher import config
 from ec2patcher.database import Database
-from ec2patcher.services import nvd, rpmversion
+from ec2patcher.models import FROM_CACHE, FROM_LIVE, LOOKUP_FAILED, CacheStats, record_source
+from ec2patcher.services import rpmversion
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +43,7 @@ MIRROR_LIST_URL = "https://cdn.amazonlinux.com/al2023/core/mirrors/{releasever}/
 LATEST = "latest"
 RELEASEVER_RE = re.compile(r"^2023\.\d+\.\d{8}$")
 ARCHITECTURES = ("x86_64", "aarch64")
-CACHE_MAX_AGE = nvd.CACHE_MAX_AGE  # same TTL as the NVD cache
+CACHE_MAX_AGE = timedelta(hours=24)  # default; Settings -> Caches overrides it
 REQUEST_TIMEOUT_SECONDS = 60
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 MAX_XML_BYTES = 1024 * 1024 * 1024  # decompressed updateinfo.xml
@@ -93,6 +96,7 @@ class UpdateInfo:
     repo_url: str | None = None
     fetched_at: str | None = None
     error: str | None = None
+    from_cache: bool = False  # True when answered by a fresh cache entry (no download)
     _by_cve: dict[str, list[Advisory]] | None = field(default=None, repr=False)
 
     @property
@@ -340,6 +344,11 @@ class UpdateInfoSource:
         self._memo: dict[str, UpdateInfo] = {}
         self._unreachable: str | None = None
         self._force = force_refresh
+        self._sources: dict[str, str] = {}  # repository -> cache / live / failed, this run
+
+    def run_cache_stats(self) -> CacheStats:
+        """Repositories since :meth:`start_run`: from cache (fresh or stale) / live / failed."""
+        return CacheStats.from_sources(self._sources)
 
     # --- cache -------------------------------------------------------------------------
 
@@ -413,14 +422,20 @@ class UpdateInfoSource:
             except Exception as exc:  # noqa: BLE001 - one repository must not break analysis
                 logger.exception("updateinfo lookup for %s failed unexpectedly", key)
                 self._memo[key] = UpdateInfo(key, FAILED, error=str(exc))
+            status = self._memo[key].status
+            source = {OK: FROM_LIVE, STALE: FROM_CACHE}.get(status, LOOKUP_FAILED)
+            if status == OK and self._memo[key].from_cache:
+                source = FROM_CACHE
+            record_source(self._sources, key, source)
         return self._memo[key]
 
     def _lookup(self, releasever: str, arch: str, key: str) -> UpdateInfo:
         cached = self._read_cache(key)
         if cached and not self._force and self.now() - cached["fetched"] < self.max_age:
             return UpdateInfo(
-                key, OK, cached["advisories"], cached["repo_url"], cached["fetched_at"]
-            )
+                key, OK, cached["advisories"], cached["repo_url"], cached["fetched_at"],
+                from_cache=True,
+            )  # fmt: skip
         error = self._unreachable
         if error is None:
             try:

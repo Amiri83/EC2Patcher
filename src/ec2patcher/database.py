@@ -29,7 +29,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -346,6 +346,11 @@ _MIGRATIONS = {
     14: """
         ALTER TABLE servers ADD COLUMN password_encrypted TEXT;
     """,
+    # Per analysis run: how many lookups of each cache (nvd / canonical / amazon) were
+    # answered from the cache, live or failed, as JSON. Older runs keep '{}' (not recorded).
+    15: """
+        ALTER TABLE analysis_runs ADD COLUMN cache_stats TEXT NOT NULL DEFAULT '{}';
+    """,
 }
 
 
@@ -390,6 +395,7 @@ def _row_to_server(row: sqlite3.Row) -> Server:
 _RUN_COLUMNS = {
     "completed_at", "status", "progress_message", "metadata_source", "metadata_updated_at",
     "metadata_checked_at", "metadata_stale", "metadata_warning", "error", "metadata_lookups",
+    "cache_stats",
 }  # fmt: skip
 _SERVER_ANALYSIS_COLUMNS = {
     "status", "error", "started_at", "completed_at", "remote_hostname", "os_pretty_name",
@@ -421,6 +427,7 @@ def _row_to_run(row: sqlite3.Row) -> AnalysisRun:
         metadata_warning=row["metadata_warning"],
         error=row["error"],
         metadata_lookups=json.loads(row["metadata_lookups"] or "{}"),
+        cache_stats=json.loads(row["cache_stats"] or "{}"),
     )
 
 
@@ -1142,6 +1149,33 @@ class Database:
     def clear_updateinfo_cache(self) -> int:
         with self.connect() as conn:
             return conn.execute("DELETE FROM amazon_updateinfo_cache").rowcount
+
+    # --- cache summaries (Settings -> Caches, cache badges) -----------------------------
+
+    _CACHE_TABLES = {
+        "nvd": "nvd_cache", "canonical": "cve_metadata_cache",
+        "amazon": "amazon_updateinfo_cache",
+    }  # fmt: skip
+
+    def cache_summary(self, name: str) -> tuple[int, str | None]:
+        """(entries, oldest fetched_at or None) of one cache: nvd / canonical / amazon."""
+        table = self._CACHE_TABLES[name]
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*), MIN(fetched_at) FROM {table}"  # noqa: S608 - fixed names
+            ).fetchone()
+        return row[0], row[1]
+
+    def latest_cache_stats(self) -> tuple[int, dict] | None:
+        """(run id, cache_stats) of the latest analysis run, or None without runs."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id, cache_stats FROM analysis_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if row is None:
+            return None
+        stats = json.loads(row["cache_stats"] or "{}")
+        return row["id"], stats if isinstance(stats, dict) else {}
 
     def get_latest_report(self) -> StoredReport | None:
         with self.connect() as conn:

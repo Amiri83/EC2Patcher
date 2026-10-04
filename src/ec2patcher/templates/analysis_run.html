@@ -7,7 +7,7 @@
 <div class="card">
   <div class="card-header">
     <h2>Analysis Status</h2>
-    <span class="badge-group">{% include "_nvd_key_badge.html" %}{% set r = run %}{% include "_run_status.html" %}</span>
+    <span class="badge-group">{% include "_nvd_key_badge.html" %}{% include "_cache_badges.html" %}{% set r = run %}{% include "_run_status.html" %}</span>
   </div>
   <dl class="kv">
     <dt>Report</dt><dd>{{ run.report_filename }} (uploaded {{ run.report_uploaded_at|timestamp }})</dd>
@@ -21,6 +21,8 @@
         </form>
         <div class="muted small">Queries ubuntu.com again for the failed CVEs only and re-analyzes the servers that reported them.</div>
       {% endif %}</dd>
+    <dt>Cache lookups</dt>
+    <dd>{% set r = run %}{% include "_cache_stats.html" %}</dd>
   </dl>
   {% if run.is_running and run.progress_message %}
     <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>

@@ -17,13 +17,14 @@ from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from ec2patcher import __version__, config, logging_setup
+from ec2patcher import __version__, config, logging_setup, models
 from ec2patcher.config import DB_FILENAME, get_apt_max_age, get_apt_state_dir, get_data_dir
 from ec2patcher.database import Database, DuplicateServerNameError, DuplicateTagKeyError
 from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.models import AUTH_METHODS, AUTH_PASSWORD, AUTH_PEM, DEFAULT_SSH_USER
 from ec2patcher.services import (
     analysis_service,
+    cache_settings,
     cve_resolver,
     downloader,
     excel_export,
@@ -74,9 +75,30 @@ NOTICES = {
     "reset": "Settings reset to default.",
     "rejected": "Patching was rejected for this report. No action was taken.",
     "nvd_key_saved": "NVD API key saved (encrypted). It is used instead of NVD_API_KEY.",
+    "nvd_key_saved_valid": (
+        "NVD API key saved (encrypted). It is used instead of NVD_API_KEY. NVD accepted it."
+    ),
+    "nvd_key_saved_rejected": (
+        "NVD API key saved (encrypted), but NVD rejected it. Check the key and save it again."
+    ),
+    "nvd_key_saved_unknown": (
+        "NVD API key saved (encrypted). NVD could not be reached, so the key is not checked yet."
+        " Reason: {reason}."
+    ),
+    "nvd_key_valid": "NVD accepted the API key.",
+    "nvd_key_rejected": "NVD rejected the API key. Check the key in Settings or NVD_API_KEY.",
+    "nvd_key_unknown": (
+        "NVD could not be reached, so the API key could not be checked. Reason: {reason}."
+    ),
+    "nvd_key_missing": "There is no NVD API key to test.",
     "nvd_key_cleared": "NVD API key removed from Settings.",
     "log_dir_saved": "Log directory saved. The application now logs to the new location.",
     "log_dir_reset": "Log directory reset to default.",
+    "cache_ttl_saved": (
+        "Cache TTLs saved. No entries were deleted; expired ones are refreshed on their next "
+        "lookup."
+    ),
+    "cache_ttl_reset": "Cache TTLs reset to default. No entries were deleted.",
 }
 
 
@@ -117,10 +139,14 @@ def create_app(
     patch_fetcher: downloader.Fetcher | None = None,
     file_logging: bool = False,
     secret_key_path: Path | None = None,
+    startup_key_check: bool = False,
+    key_check_starter: analysis_service.Starter | None = None,
 ) -> FastAPI:
     """``file_logging``: log to the rotating file of the configured log directory (the CLI
     enables it). ``secret_key_path``: Fernet key file of the stored secrets (default: in the
-    config directory)."""
+    config directory). ``startup_key_check``: at start, check a configured NVD API key again
+    in the background (``key_check_starter``) when its last check is unknown or older than
+    24 h (the CLI enables it)."""
     db = Database(db_path or get_data_dir() / DB_FILENAME)
     # Server passwords and the NVD API key, encrypted in the database.
     credentials = secret_store.SecretStore(db, secret_store.SecretBox(secret_key_path))
@@ -174,6 +200,24 @@ def create_app(
         analyzer.nvd.use_settings_key(key)
 
     apply_nvd_key(startup=True)
+    # Cache TTLs saved in Settings (the clients' own TTLs are the defaults).
+    ttls = cache_settings.CacheTtls(db, metadata, analyzer.nvd, analyzer.advisories)
+
+    def recheck_nvd_key() -> str | None:
+        """Check the NVD API key again if its last check is unknown or older than 24 h;
+        the result (or None when no check was due) is persisted like a Test key."""
+        if not analyzer.nvd.key_check_due():
+            return None
+        result = analyzer.nvd.check_key()
+        logger.info("NVD API key re-checked at start: %s", result)
+        return result
+
+    def recheck_nvd_key_safely() -> None:
+        try:
+            recheck_nvd_key()
+        except Exception:
+            logger.exception("NVD API key check at start failed")
+
     interrupted = db.mark_interrupted_executions()
     if interrupted:
         logger.warning("Marked %d unfinished patch execution(s) as interrupted", interrupted)
@@ -192,6 +236,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("EC2Patcher %s started (database: %s)", __version__, db.path)
+        if startup_key_check:
+            (key_check_starter or analysis_service.thread_starter)(recheck_nvd_key_safely)
         yield
         logger.info("EC2Patcher stopped")
 
@@ -213,9 +259,15 @@ def create_app(
     templates.env.globals["apt_state_dir"] = apt.root
     templates.env.globals["apt_max_age_hours"] = apt.max_age.total_seconds() / 3600
     templates.env.globals["nvd_status_labels"] = nvd.STATUS_LABELS
-    templates.env.globals["nvd_cache_days"] = analyzer.nvd.max_age.days
     templates.env.globals["nvd_key_status"] = lambda: analyzer.nvd.key_status
     templates.env.globals["nvd_key_source"] = lambda: analyzer.nvd.key_source
+    templates.env.globals["nvd_key_checked_at"] = lambda: analyzer.nvd.key_checked_at
+    templates.env.globals["nvd_key_reason"] = lambda: analyzer.nvd.key_reason
+    templates.env.globals["cache_badges"] = lambda: cache_settings.badges(db, ttls)
+    templates.env.globals["cache_labels"] = {
+        models.CACHE_NVD: "NVD", models.CACHE_CANONICAL: "Canonical",
+        models.CACHE_AMAZON: "Amazon updateinfo",
+    }  # fmt: skip
     templates.env.globals["patch_labels"] = ps.LABELS
     templates.env.globals["patch_badges"] = ps.BADGES
     templates.env.globals["reboot_labels"] = ps.REBOOT_LABELS
@@ -226,6 +278,8 @@ def create_app(
     app.state.analyzer = analyzer
     app.state.patcher = patcher
     app.state.credentials = credentials
+    app.state.cache_ttls = ttls
+    app.state.recheck_nvd_key = recheck_nvd_key
 
     def run_ssh_test(
         name: str, ip: str, pem: str, user: str, password: str | None = None
@@ -254,6 +308,8 @@ def create_app(
         return template.format(
             name=request.query_params.get("name", "")[:64],
             count=request.query_params.get("count", "0")[:6],
+            # from the persisted key check, never from the URL
+            reason=analyzer.nvd.key_reason or "no details recorded",
         )
 
     # --- basic CSRF protection for a localhost app without authentication ---
@@ -823,7 +879,10 @@ def create_app(
             log_file=logging_setup.log_file_in(log_dir()),
             log_max_mb=logging_setup.LOG_MAX_BYTES // (1024 * 1024),
             log_backups=logging_setup.LOG_BACKUP_COUNT, nvd_key=nvd_key_view(),
-            secret_key_path=credentials.box.key_path, **ctx,
+            secret_key_path=credentials.box.key_path,
+            cache_ttl_values=ctx.pop("cache_ttl_values", None) or ttls.form_values(),
+            cache_ttl_errors=ctx.pop("cache_ttl_errors", {}),
+            cache_ttl_labels=cache_settings.LABELS, cache_ttl_saved=bool(ttls.saved()), **ctx,
         )  # fmt: skip
 
     def nvd_key_view() -> dict:
@@ -831,7 +890,7 @@ def create_app(
         nothing of NVD_API_KEY."""
         view = {
             "saved": credentials.has_nvd_key(), "masked": None, "error": None,
-            "env_set": bool(os.environ.get(nvd.API_KEY_ENV)),
+            "env_set": bool(os.environ.get(nvd.API_KEY_ENV)), "testable": analyzer.nvd.has_key,
         }  # fmt: skip
         if view["saved"]:
             try:
@@ -845,8 +904,13 @@ def create_app(
         if action == "clear":
             credentials.clear_nvd_key()
             apply_nvd_key()
+            analyzer.nvd.forget_key_check()  # it was about the removed key
             logger.info("NVD API key removed from Settings")
             return redirect("/settings", notice="nvd_key_cleared")
+        if action == "test":  # one keyed request now, with the key in use
+            if not analyzer.nvd.has_key:
+                return redirect("/settings", notice="nvd_key_missing")
+            return redirect("/settings", notice=f"nvd_key_{analyzer.nvd.check_key()}")
         key = nvd_api_key.strip()
         error = check_nvd_api_key(key)
         if error is None:
@@ -858,7 +922,9 @@ def create_app(
             return settings_page(request, status_code=422, nvd_key_error=error)
         apply_nvd_key()
         logger.info("NVD API key saved in Settings (encrypted)")
-        return redirect("/settings", notice="nvd_key_saved")
+        if not analyzer.nvd.has_key:  # cannot happen unless the key cannot be read back
+            return redirect("/settings", notice="nvd_key_saved")
+        return redirect("/settings", notice=f"nvd_key_saved_{analyzer.nvd.check_key()}")
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings(request: Request):
@@ -866,6 +932,21 @@ def create_app(
         if staging.safe_name_error(preview_name):
             preview_name = None
         return settings_page(request, notice=notice_from_query(request), preview_name=preview_name)
+
+    @app.post("/settings/cache-ttl", response_class=HTMLResponse)
+    async def save_cache_ttl(request: Request):
+        form = await request.form()
+        if form.get("action") == "reset":
+            ttls.reset()
+            return redirect("/settings", notice="cache_ttl_reset")
+        values = {key: str(form.get(key, ""))[:32] for key in cache_settings.FIELDS}
+        hours, errors = cache_settings.validate_form(values)
+        if errors:
+            return settings_page(
+                request, status_code=422, cache_ttl_values=values, cache_ttl_errors=errors
+            )
+        ttls.save(hours)  # entries are kept; expired ones refresh on their next lookup
+        return redirect("/settings", notice="cache_ttl_saved")
 
     @app.post("/settings/clear-cache")
     def clear_security_cache():
@@ -889,6 +970,7 @@ def create_app(
         db.reset()
         apply_log_dir()  # the saved log directory was removed with the settings
         apply_nvd_key()  # so was a saved NVD API key: back to NVD_API_KEY
+        ttls.apply_saved()  # and the cache TTLs: back to the defaults
         return redirect("/settings", notice="database_reset")
 
     @app.post("/settings/staging", response_class=HTMLResponse)

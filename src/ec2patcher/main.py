@@ -73,6 +73,7 @@ def main(argv: list[str] | None = None) -> None:
         apt_state_dir=args.apt_state_dir,
         apt_max_age_hours=args.apt_max_age_hours,
         file_logging=True,
+        startup_key_check=True,
     )
     config = uvicorn.Config(
         app, host=args.host, port=args.port, log_config=None, log_level="info", access_log=False

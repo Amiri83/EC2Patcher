@@ -156,25 +156,36 @@ shown as **NOT RUN**. Only one patch execution or queue runs at a time.
 
 ### Settings
 
+- **Caches** (top of the page): one badge per cache (*NVD cache: <N> CVEs, oldest <age>, TTL
+  <ttl>*, same for Canonical and Amazon updateinfo; blue when the latest analysis answered
+  lookups from it, gray when unused or empty), the **Cache TTL** of each cache and **Clear
+  Security Cache**, which empties all three caches (`nvd_cache`, `cve_metadata_cache`,
+  `amazon_updateinfo_cache`) and the in-memory lookup state. TTLs are entered as hours (`24h`)
+  or days (`30d`), between 1 hour and 365 days, and stored in the database. Changing a TTL
+  deletes nothing; expired entries are refreshed on their next lookup. The same badges appear
+  next to the NVD API key badge on the Pre-Patch Analysis pages and link to this section.
 - **Local Patch Download Directory**: template, default `/tmp/${server_name}`; must contain
   `${server_name}` and resolve to a safe absolute path.
 - **Logging**: the **Log directory** (default: the per-user log directory from platformdirs, or
   `$EC2PATCHER_LOG_DIR`) and the current log file path. The directory is created if needed and
   must be writable, or it is not saved. Logs rotate at 5 MB, keeping 5 old files.
-- **Security Data**: Canonical and NVD cache details. **Clear Security Cache** empties the
-  in-memory lookup state and both caches (Canonical `cve_metadata_cache`, NVD `nvd_cache`), so
-  the next analysis queries Canonical and NVD again.
+- **Security Data**: Canonical request settings (timeout, pacing, retries, proxy).
 - **Reset Database**: type `RESET` to remove all stored data (refused while an analysis or
   patch is running).
 
 ### Caching and NVD API key
 
-Both caches live in the application SQLite database; failed lookups are never cached and a
-cache error never fails a lookup.
+All caches live in the application SQLite database; failed lookups are never cached and a
+cache error never fails a lookup. The TTLs below are the defaults (**Settings → Caches**; a
+saved Canonical TTL also overrides `EC2PATCHER_CANONICAL_CACHE_TTL_HOURS`). Each analysis run
+records, per cache, how many lookups came from the cache and how many were live (*NVD: x from
+cache / y live*, shown on the run page and the server report; re-analyses and retries add to
+it).
 
 - **Canonical** (`cve_metadata_cache`): reused for 24 h (1 h while a release is under
   investigation); older entries are refreshed and used as a marked fallback when ubuntu.com is
   unreachable.
+- **Amazon updateinfo** (`amazon_updateinfo_cache`): per repository, reused for 24 h.
 - **NVD** (`nvd_cache`): raw CVSS metrics per CVE, reused for **30 days**; older entries are
   refreshed and used as a *stale cache* fallback when NVD is unreachable. Without any data the
   severity is **Unknown**. (The old on-disk NVD cache under `~/.cache/ec2patcher/nvd/` is no
@@ -191,11 +202,19 @@ export NVD_API_KEY=...   # your own key; it is sent only in the apiKey request h
 Request a free key at https://nvd.nist.gov/developers/request-an-api-key.
 
 A key saved in Settings **overrides** `NVD_API_KEY`; Clear falls back to the environment. The
-key is never logged, exported or shown in full. The Pre-Patch Analysis pages show only its state
-and source: *NVD API key: not set*, *set (not used yet)*, *in use* (green, after a successful
-keyed request in this app session) or *NVD API key rejected* (red, NVD answered HTTP 403), each
-followed by *from Settings* or *from NVD_API_KEY env var*. If the saved key cannot be decrypted
-the badge is red and asks to enter it again in Settings (no key is sent until then).
+key is never logged, exported or shown in full. Saving a key, and the **Test key** button, send
+one keyed request to NVD right away (cached CVSS lookups send none). The result and its time are
+kept in the settings table (never the key itself) and updated by every keyed lookup, so they
+survive restarts. The Pre-Patch Analysis pages show only the state and source: *NVD API key: not
+set*, *unknown* (not checked yet, or NVD could not be reached), *valid (checked <time>)* (green,
+HTTP 200) or *NVD API key rejected* (red, HTTP 403, or HTTP 404 with NVD's invalid-apiKey
+message), each followed by *from Settings (DB)* or *from NVD_API_KEY env var* whenever a key is
+configured. For *unknown* the reason (HTTP status or network error, or *not checked yet*) is in
+the badge tooltip and the Settings notice; HTTP 429 / 5xx is retried once (after Retry-After)
+before a check ends as unknown. At start the app checks the key again in the background if its
+last check is unknown or older than 24 h. A rejected key never
+marks a CVE as unknown to NVD and is never cached. If the saved key cannot be decrypted the badge
+is red and asks to enter it again in Settings (no key is sent until then).
 
 ### Secrets at rest
 
