@@ -219,7 +219,7 @@ def test_only_one_active_execution(h, db, pem_file):
     started = []
     h.service.starter = started.append  # approved but not yet running
     first = h.analysis()
-    other = db.create_server("ip-10-0-0-215", "192.0.2.215", str(pem_file))
+    other = db.create_server("ip-10-0-0-2", "192.0.2.215", str(pem_file))
     second = make_analysis(db, other)
     h.service.approve(first.id)
     with pytest.raises(PatchNotAllowedError, match="Another patch execution"):
