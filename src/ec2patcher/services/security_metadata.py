@@ -8,9 +8,11 @@ memo / cache hits never wait).
 
 Every fetched CVE document (or Canonical's confirmed 404) is cached in the application
 database (table ``cve_metadata_cache``): entries younger than the TTL are used without a
-request - 24 h, or 1 h while Canonical still has a release of the CVE under investigation -
-older ones are refreshed and only used as a fallback, marked with their age, when ubuntu.com
-cannot be reached. Failed lookups are never cached, and a cache error never fails a lookup.
+request - by default 24 h, or 1 h while Canonical still has a release of the CVE under
+investigation (both set in Settings -> Caches) - older ones are refreshed and only used as a
+fallback, marked with their age, when ubuntu.com cannot be reached. Failed lookups are never
+cached, and a cache error never fails a lookup. Each run counts its lookups answered from the
+cache (memo, table or stale fallback) / live / failed (:meth:`SecurityMetadata.run_cache_stats`).
 
 Lookup order: memo -> cache (skipped on force refresh) -> circuit breaker -> pacing -> HTTP.
 
@@ -33,6 +35,7 @@ from pathlib import Path
 
 from ec2patcher import config
 from ec2patcher.database import Database
+from ec2patcher.models import FROM_CACHE, FROM_LIVE, LOOKUP_FAILED, CacheStats, record_source
 from ec2patcher.services.server_state import SUPPORTED_RELEASES
 
 logger = logging.getLogger(__name__)
@@ -263,6 +266,7 @@ class SecurityMetadata:
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = _now,
         monotonic: Callable[[], float] = time.monotonic,
+        investigating_max_age: timedelta | None = None,
     ):
         # cache_db: the application Database (or its path); None = the default data dir DB,
         # opened on first use. None elsewhere = the module default, read here (not at
@@ -276,6 +280,9 @@ class SecurityMetadata:
                 Path(cache_db) if cache_db else config.get_data_dir() / config.DB_FILENAME
             )
         self.max_age = CACHE_TTL if max_age is None else max_age
+        self.investigating_max_age = (
+            INVESTIGATING_CACHE_TTL if investigating_max_age is None else investigating_max_age
+        )
         self.timeout = REQUEST_TIMEOUT_SECONDS if timeout is None else timeout
         self.fetcher = fetcher or partial(http_get, timeout=self.timeout)
         self.attempts = max(1, MAX_ATTEMPTS if attempts is None else attempts)
@@ -293,6 +300,7 @@ class SecurityMetadata:
         self._unreachable: str | None = None
         self._consecutive_failures = 0
         self._outcomes: dict[str, str] = {}
+        self._sources: dict[str, str] = {}  # CVE -> cache / live / failed, this run
         self._force_refresh: frozenset[str] | None = frozenset()  # None = every CVE
         self._refreshed: set[str] = set()
 
@@ -309,6 +317,7 @@ class SecurityMetadata:
             self._unreachable = None
             self._consecutive_failures = 0
             self._outcomes = {}
+            self._sources = {}
             self._force_refresh = forced
             self._refreshed = set()
         with self._pace_lock:
@@ -323,11 +332,17 @@ class SecurityMetadata:
         with self._lock:
             return dict(self._outcomes)
 
+    def run_cache_stats(self) -> CacheStats:
+        """Lookups since :meth:`start_run`: from cache (memo, table or a stale fallback) /
+        live / failed, one count per CVE."""
+        with self._lock:
+            return CacheStats.from_sources(self._sources)
+
     def ttl(self, record: CveRecord | None) -> timedelta:
         """How long a cached answer is used without a request: shorter while any release
         of the CVE is still under investigation, as Canonical's verdict is likely to change."""
         if record is not None and any(e.status == "under_investigation" for e in record.entries):
-            return min(self.max_age, INVESTIGATING_CACHE_TTL)
+            return min(self.max_age, self.investigating_max_age)
         return self.max_age
 
     def lookup(
@@ -347,7 +362,7 @@ class SecurityMetadata:
             memo = None if forced else self._memo.get(cve)
             if memo is not None and (not network or now - memo[1] < self.ttl(memo[0])):
                 if network:
-                    self._record(cve, OK)
+                    self._record(cve, OK, FROM_CACHE)
                 return memo[0]
             skipped = self._unreachable
         cached = None if forced else self._read_cache(cve)
@@ -358,7 +373,7 @@ class SecurityMetadata:
                 with self._lock:
                     self._memo[cve] = cached
                     if network:
-                        self._record(cve, OK)
+                        self._record(cve, OK, FROM_CACHE)
                 return record
             if not network:
                 if record is not None:
@@ -381,7 +396,7 @@ class SecurityMetadata:
                 with self._lock:
                     self._memo[cve] = (record, self.now())
                     self._refreshed.add(cve)
-                    self._record(cve, OK)
+                    self._record(cve, OK, FROM_LIVE)
                 return record
         if forced:
             cached = self._read_cache(cve)
@@ -391,10 +406,10 @@ class SecurityMetadata:
                 record.cache_age = self.now() - fetched
             logger.warning("Canonical lookup of %s failed (%s); using cached data", cve, error)
             with self._lock:
-                self._record(cve, CACHED)
+                self._record(cve, CACHED, FROM_CACHE)
             return record
         with self._lock:
-            self._record(cve, FAILED)
+            self._record(cve, FAILED, LOOKUP_FAILED)
         raise error
 
     def _fetch(self, cve: str) -> CveRecord | None:
@@ -457,11 +472,12 @@ class SecurityMetadata:
                     "lookups this run: %s", self._consecutive_failures, self._unreachable,
                 )  # fmt: skip
 
-    def _record(self, cve: str, outcome: str) -> None:
+    def _record(self, cve: str, outcome: str, source: str) -> None:
         # Caller holds the lock. A CVE that failed for any server this run stays failed.
         previous = self._outcomes.get(cve)
         if previous is None or _OUTCOME_RANK[outcome] >= _OUTCOME_RANK[previous]:
             self._outcomes[cve] = outcome
+        record_source(self._sources, cve, source)
 
     # --- cache: table cve_metadata_cache (cve, document, fetched_at) ---------------------
     # "document" is the raw Canonical JSON, or NULL for a CVE Canonical answered 404 for.
@@ -500,7 +516,7 @@ class SecurityMetadata:
             cache_db=self.cache_db_path,
             cache_ttl_hours=self.max_age.total_seconds() / 3600,
             investigating_ttl_hours=(
-                min(self.max_age, INVESTIGATING_CACHE_TTL).total_seconds() / 3600
+                min(self.max_age, self.investigating_max_age).total_seconds() / 3600
             ),
             timeout_seconds=self.timeout,
             pace_seconds=self.pace,

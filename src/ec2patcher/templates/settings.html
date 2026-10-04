@@ -2,6 +2,33 @@
 {% block title %}Settings{% endblock %}
 {% block heading %}Settings{% endblock %}
 {% block content %}
+<div class="card form-card" id="caches">
+  <div class="card-header">
+    <h2>Caches</h2>
+    <span class="badge-group">{% include "_cache_badges.html" %}</span>
+  </div>
+  <p class="muted">Security lookups are cached in the application database: NVD CVSS data per CVE (table <code>nvd_cache</code>), Canonical security data per CVE (<code>cve_metadata_cache</code>) and Amazon Linux updateinfo per repository (<code>amazon_updateinfo_cache</code>). An entry younger than its TTL is used without a request; an older one is refreshed on its next lookup and only used as a fallback when the source cannot be reached. Changing a TTL never deletes entries. Failed lookups are never cached.</p>
+  <form method="post" action="/settings/cache-ttl">
+    <div class="ttl-grid">
+    {% for key, label in cache_ttl_labels.items() %}
+    <div class="field{% if cache_ttl_errors.get(key) %} has-error{% endif %}">
+      <label for="ttl_{{ key }}">{{ label }}</label>
+      <input type="text" id="ttl_{{ key }}" name="{{ key }}" value="{{ cache_ttl_values.get(key, '') }}" autocomplete="off" spellcheck="false" size="8" data-cache-ttl="{{ key }}">
+      {% if cache_ttl_errors.get(key) %}<div class="field-error">{{ cache_ttl_errors[key] }}</div>{% endif %}
+    </div>
+    {% endfor %}
+    </div>
+    <div class="hint">Hours (<code>24h</code>) or days (<code>30d</code>), between 1 hour and 365 days. Defaults: NVD 30d, Canonical 24h (1h while a release is under investigation), Amazon updateinfo 24h.{% if not cache_ttl_saved %} The defaults are in use.{% endif %}</div>
+    <div class="form-actions">
+      <button type="submit" name="action" value="save" class="btn btn-primary">Save TTLs</button>
+      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+    </div>
+  </form>
+  <p class="muted">Clear Security Cache empties all three caches (NVD, Canonical and Amazon updateinfo) and the in-memory lookup state.</p>
+  <form method="post" action="/settings/clear-cache">
+    <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
+  </form>
+</div>
 <div class="card form-card">
   <h2>Patch &amp; Download Settings</h2>
   <form method="post" action="/settings/staging">
@@ -46,6 +73,7 @@
     </div>
     <div class="form-actions">
       <button type="submit" name="action" value="save" class="btn btn-primary">{{ "Replace" if nvd_key.saved else "Save" }}</button>
+      {% if nvd_key.testable %}<button type="submit" name="action" value="test" class="btn btn-secondary" title="Send one request with the key in use to NVD now">Test key</button>{% endif %}
       {% if nvd_key.saved %}<button type="submit" name="action" value="clear" class="btn btn-secondary">Clear</button>{% endif %}
     </div>
   </form>
@@ -81,18 +109,13 @@
 </div>
 <div class="card">
   <h2>Security Data</h2>
-  <p class="muted">Canonical security data is queried online per CVE during analysis. Each fetched CVE is also cached in the application database; while the copy is younger than the cache TTL it is used without a request, and an older copy is used (and marked with its age) only when ubuntu.com cannot be reached. Failed lookups are never cached.</p>
+  <p class="muted">Canonical security data is queried online per CVE during analysis. Each fetched CVE is also cached in the application database (see <a href="#caches">Caches</a> for the TTLs); an expired copy is used (and marked with its age) only when ubuntu.com cannot be reached.</p>
   <dl class="kv">
     <dt>Cache</dt><dd>table <code>cve_metadata_cache</code> in <code>{{ metadata_status.cache_db }}</code></dd>
-    <dt>Cache TTL</dt><dd>{{ "%g"|format(metadata_status.cache_ttl_hours) }} hours ({{ "%g"|format(metadata_status.investigating_ttl_hours) }} hour{{ "" if metadata_status.investigating_ttl_hours == 1 else "s" }} while a release is under investigation)</dd>
+    <dt>Cache TTL</dt><dd>{{ "%g"|format(metadata_status.cache_ttl_hours) }} hours ({{ "%g"|format(metadata_status.investigating_ttl_hours) }} hour{{ "" if metadata_status.investigating_ttl_hours == 1 else "s" }} while a release is under investigation) &mdash; <a href="#caches">change</a></dd>
     <dt>Requests</dt><dd>{{ "%g"|format(metadata_status.timeout_seconds) }} s timeout, {{ "%g"|format(metadata_status.pace_seconds) }} s apart, up to {{ metadata_status.attempts }} attempts with backoff; lookups pause for the rest of the run after {{ metadata_status.breaker_threshold }} consecutive failures</dd>
     <dt>Proxy</dt><dd>HTTPS_PROXY / NO_PROXY from the environment</dd>
-    <dt>NVD CVSS cache</dt><dd>table <code>nvd_cache</code> in the same database; entries are reused for {{ nvd_cache_days }} days (failed lookups are never cached)</dd>
   </dl>
-  <p class="muted">Clear Security Cache empties both caches (Canonical and NVD) and the in-memory lookup state.</p>
-  <form method="post" action="/settings/clear-cache">
-    <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
-  </form>
 </div>
 <div class="card">
   <h2>APT Resolution</h2>

@@ -15,6 +15,9 @@ Canonical's metadata alone decides applicability, fixed versions and statuses. N
 queried afterwards for the CVSS severity of the server's CVEs (each unique CVE once per run,
 shared by all servers); an NVD failure leaves the severity Unknown and nothing else changes.
 
+Each run records how many lookups of the NVD, Canonical and Amazon updateinfo caches were
+answered from the cache, live or failed (``cache_stats``; follow-ups add theirs).
+
 Servers are analyzed sequentially in one background thread; one failing server (or CVE)
 never aborts the others.
 """
@@ -30,7 +33,14 @@ from datetime import datetime, timezone
 
 from ec2patcher import config
 from ec2patcher.database import Database
-from ec2patcher.models import ServerAnalysis, StoredReport
+from ec2patcher.models import (
+    CACHE_AMAZON,
+    CACHE_CANONICAL,
+    CACHE_NVD,
+    CacheStats,
+    ServerAnalysis,
+    StoredReport,
+)
 from ec2patcher.services import (
     amazon_updateinfo,
     cve_resolver,
@@ -215,7 +225,10 @@ class AnalysisService:
             if not self.analyze_server(analysis, lambda m, label=label: progress(f"{label}: {m}")):
                 failures += 1
             # Tallies after every server, so the status panel follows the run.
-            self.db.update_analysis_run(run_id, metadata_lookups=self.metadata.run_outcomes())
+            self.db.update_analysis_run(
+                run_id, metadata_lookups=self.metadata.run_outcomes(),
+                cache_stats=self._cache_stats(),
+            )  # fmt: skip
         self.db.update_analysis_run(
             run_id,
             status="completed_with_errors" if failures else "completed",
@@ -342,6 +355,7 @@ class AnalysisService:
             progress_message=None,
             metadata_checked_at=_now(),
             metadata_lookups=lookups,
+            cache_stats=self._cache_stats(run.cache_stats),
         )
         logger.info(
             "Retried lookups of run %s: %d of %d still failed", run_id,
@@ -413,7 +427,22 @@ class AnalysisService:
             progress_message=None,
             metadata_checked_at=_now(),
             metadata_lookups=lookups,
+            cache_stats=self._cache_stats(run.cache_stats),
         )
+
+    def _cache_stats(self, stored: dict | None = None) -> dict:
+        """Cache / live / failed lookups per cache since the clients' start_run, added to the
+        ``stored`` statistics of the run (follow-up actions)."""
+        stored = stored or {}
+        current = {
+            CACHE_NVD: self.nvd.run_cache_stats(),
+            CACHE_CANONICAL: self.metadata.run_cache_stats(),
+            CACHE_AMAZON: self.advisories.run_cache_stats(),
+        }
+        return {
+            name: (CacheStats.from_dict(stored.get(name)) + stats).as_dict()
+            for name, stats in current.items()
+        }
 
     # --- one server -----------------------------------------------------------------
 

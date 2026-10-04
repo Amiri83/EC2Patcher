@@ -1,0 +1,2 @@
+{# One badge per lookup cache (entries, oldest entry, TTL); blue when the latest analysis run answered lookups from it, gray when unused or empty. Each links to Settings -> Caches. #}
+{% if cache_badges is defined %}{% for b in cache_badges() %}<a href="/settings#caches" class="badge {{ b.css }} cache-badge" data-cache="{{ b.name }}" data-cache-used="{{ 'yes' if b.used_cache else 'no' }}"{% if b.empty %} data-cache-empty{% endif %} title="{{ b.title }}">{{ b.text }}</a>{% endfor %}{% endif %}
