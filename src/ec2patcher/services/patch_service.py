@@ -56,6 +56,7 @@ from ec2patcher.services import (
     downloader,
     os_adapters,
     patch_remote,
+    secret_store,
     server_state,
     ssh_service,
     staging,
@@ -289,7 +290,7 @@ class _Context:
     packages: list[PatchPackageResult]
     debs: dict[str, dict]  # filename -> {uri, size, sha256, package_ids}
     user: str = DEFAULT_SSH_USER  # SSH login user of the server
-    # Session password for password login (memory only, never stored or shown); None = key.
+    # Decrypted stored password for password login (never shown or logged); None = key.
     password: str | None = field(default=None, repr=False)
     adapter: os_adapters.OsAdapter = os_adapters.DEFAULT  # OS the analysis was made for
     notes: list[str] = field(default_factory=list)
@@ -316,10 +317,10 @@ class PatchService:
         analysis_running: Callable[[], bool] = lambda: False,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
-        passwords: ssh_service.SessionPasswords | None = None,
+        credentials: secret_store.SecretStore | None = None,
     ):
         self.db = db
-        self.passwords = passwords or ssh_service.SessionPasswords()  # memory only
+        self.credentials = credentials or secret_store.SecretStore(db)  # encrypted passwords
         self.runner = runner
         self.starter = starter
         self.fetcher = fetcher or downloader.urllib_fetcher
@@ -419,8 +420,8 @@ class PatchService:
             reasons.append(
                 "The server's name or IP address changed since the analysis. Run a new analysis."
             )
-        elif ssh_service.server_password(server, self.passwords)[1]:
-            reasons.append(ssh_service.PASSWORD_MISSING)
+        elif password_error := ssh_service.server_password(server, self.credentials)[1]:
+            reasons.append(password_error)
         if self.analysis_running():
             reasons.append("An analysis is currently running. Wait for it to finish.")
         active = self.db.active_execution_id()
@@ -671,7 +672,7 @@ class PatchService:
             )
         if execution.remote_staging_path != staging.remote_dir(execution.server_name):
             raise PatchAbort("Unexpected remote staging path.")
-        password, password_error = ssh_service.server_password(server, self.passwords)
+        password, password_error = ssh_service.server_password(server, self.credentials)
         if password_error:
             raise PatchAbort(password_error)
         debs: dict[str, dict] = {}

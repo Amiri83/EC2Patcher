@@ -318,7 +318,7 @@ def columns(path, table):
 def test_fresh_database_is_v12_with_the_updateinfo_cache(db_path):
     db = Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 13
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
     conn.close()
     assert columns(db_path, "amazon_updateinfo_cache") == {
         "repo": ("TEXT", 0, 1),
@@ -371,7 +371,7 @@ def test_v11_database_upgrades_to_v12_keeping_data(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 13
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
     check.close()
     assert db.get_server_by_name("keep").ssh_user == "ec2-user"
     assert db.get_nvd_cache("CVE-1") == (None, None, "t")
@@ -388,7 +388,7 @@ def test_full_upgrade_path_from_v1_reaches_v12(db_path):
     _legacy_db(db_path, 1).close()
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 13
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
     check.close()
     server = db.get_server_by_name("keep")
     assert (server.ip_address, server.ssh_user) == ("10.0.0.1", "ubuntu")

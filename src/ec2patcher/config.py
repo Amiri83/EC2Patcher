@@ -5,7 +5,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
-from platformdirs import user_data_dir, user_log_dir
+from platformdirs import user_config_dir, user_data_dir, user_log_dir
 
 APP_NAME = "ec2patcher"
 DEFAULT_HOST = "127.0.0.1"
@@ -15,6 +15,9 @@ LOG_FILENAME = "ec2patcher.log"
 DATA_DIR_ENV = "EC2PATCHER_DATA_DIR"
 # Default log directory (the Settings page can choose another one, stored in the database).
 LOG_DIR_ENV = "EC2PATCHER_LOG_DIR"
+# Config directory holding the Fernet key file of the stored secrets (never the database).
+CONFIG_DIR_ENV = "EC2PATCHER_CONFIG_DIR"
+SECRET_KEY_FILENAME = "secret.key"  # noqa: S105 - a file name, not a secret
 
 # Private APT state used to resolve candidates and .deb plans on the workstation.
 APT_STATE_DIRNAME = "apt"  # under the data directory
@@ -34,6 +37,18 @@ def get_data_dir(override: str | None = None) -> Path:
     path = Path(raw).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def get_config_dir() -> Path:
+    """Per-user config directory (e.g. ~/.config/ec2patcher on Linux), or
+    $EC2PATCHER_CONFIG_DIR. Not created here."""
+    raw = os.environ.get(CONFIG_DIR_ENV) or user_config_dir(APP_NAME, appauthor=False)
+    return Path(raw).expanduser()
+
+
+def get_secret_key_path() -> Path:
+    """Fernet key file that encrypts the stored secrets (kept outside the database)."""
+    return get_config_dir() / SECRET_KEY_FILENAME
 
 
 def get_default_log_dir() -> Path:

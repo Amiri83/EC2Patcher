@@ -29,6 +29,27 @@
   </form>
   {% endif %}
 </div>
+<div class="card form-card" id="nvd-key">
+  <h2>NVD API Key</h2>
+  <p class="muted">Optional key for faster CVSS lookups (50 instead of 5 NVD requests per 30 s). A key saved here is stored encrypted and is used instead of the <code>NVD_API_KEY</code> environment variable. Only its last 4 characters are ever shown.</p>
+  <dl class="kv">
+    <dt>Saved key</dt><dd>{% if nvd_key.error %}<span class="text-danger nvd-key-error">{{ nvd_key.error }}</span>{% elif nvd_key.saved %}<code class="nvd-key-masked">{{ nvd_key.masked }}</code>{% else %}<span class="muted">none</span>{% endif %}</dd>
+    <dt>NVD_API_KEY env var</dt><dd>{% if nvd_key.env_set %}set{% if nvd_key.saved %} <span class="muted small">(overridden by the saved key)</span>{% endif %}{% else %}<span class="muted">not set</span>{% endif %}</dd>
+    <dt>Status</dt><dd>{% include "_nvd_key_badge.html" %}</dd>
+  </dl>
+  <form method="post" action="/settings/nvd-key">
+    <div class="field{% if nvd_key_error %} has-error{% endif %}">
+      <label for="nvd_api_key">{{ "Replace with a new key" if nvd_key.saved else "NVD API key" }}</label>
+      {# Never pre-filled: the key is never sent back to the browser. #}
+      <input type="password" id="nvd_api_key" name="nvd_api_key" value="" autocomplete="off" spellcheck="false">
+      {% if nvd_key_error %}<div class="field-error">{{ nvd_key_error }}</div>{% endif %}
+    </div>
+    <div class="form-actions">
+      <button type="submit" name="action" value="save" class="btn btn-primary">{{ "Replace" if nvd_key.saved else "Save" }}</button>
+      {% if nvd_key.saved %}<button type="submit" name="action" value="clear" class="btn btn-secondary">Clear</button>{% endif %}
+    </div>
+  </form>
+</div>
 <div class="card form-card" id="logging">
   <h2>Logging</h2>
   <form method="post" action="/settings/log-dir">
@@ -54,7 +75,8 @@
     <dt>Version</dt><dd>{{ version }}</dd>
     <dt>Database</dt><dd><code>{{ db_path }}</code></dd>
     <dt>SSH user</dt><dd>Per server (default <code>ubuntu</code>)</dd>
-    <dt>SSH login</dt><dd>Per server: PEM key (default) or username + password via <code>sshpass</code>; passwords are kept in memory for this app session only</dd>
+    <dt>SSH login</dt><dd>Per server: PEM key (default) or username + password via <code>sshpass</code>; passwords are stored per server, encrypted</dd>
+    <dt>Encryption key</dt><dd><code>{{ secret_key_path }}</code> <span class="muted small">(mode 0600, never in the database; without it stored secrets must be entered again)</span></dd>
   </dl>
 </div>
 <div class="card">
