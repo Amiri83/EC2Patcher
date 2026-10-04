@@ -1,0 +1,3 @@
+{# Per-run lookups per cache: "NVD: x from cache / y live" (r = the analysis run). #}
+{% if r.cache_stats %}<ul class="cache-stats">{% for name, stats in r.cache_tallies.items() %}<li data-cache-stats="{{ name }}">{{ cache_labels[name] }}: {{ stats.label }}</li>{% endfor %}</ul>
+{% else %}<span class="muted">not recorded</span>{% endif %}

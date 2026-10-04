@@ -152,8 +152,8 @@ def test_fetch_follows_mirror_list_repomd_and_updateinfo(tmp_path):
 # --- cache (same rules as NVD) ---------------------------------------------------------
 
 
-def test_ttl_is_the_nvd_ttl():
-    assert au.CACHE_MAX_AGE == timedelta(days=30)
+def test_default_ttl_is_24_hours():  # Settings -> Caches can change it
+    assert au.CACHE_MAX_AGE == timedelta(hours=24)
 
 
 def test_cache_miss_then_hit_and_memo(tmp_path):
@@ -175,11 +175,11 @@ def test_ttl_expiry_refetches(tmp_path):
     cdn, clock = FakeCdn(), Clock()
     src = source(tmp_path, cdn, clock)
     src.lookup(RELEASEVER, "x86_64")
-    clock.now = T0 + timedelta(days=29, hours=23)
+    clock.now = T0 + timedelta(hours=23, minutes=59)
     src.start_run()
     src.lookup(RELEASEVER, "x86_64")
     assert cdn.downloads == 1
-    clock.now = T0 + timedelta(days=30)
+    clock.now = T0 + timedelta(hours=24)
     src.start_run()
     info = src.lookup(RELEASEVER, "x86_64")
     assert info.status == au.OK and cdn.downloads == 2 and info.fetched_at == clock.now.isoformat()
@@ -318,7 +318,7 @@ def columns(path, table):
 def test_fresh_database_is_v12_with_the_updateinfo_cache(db_path):
     db = Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 15
     conn.close()
     assert columns(db_path, "amazon_updateinfo_cache") == {
         "repo": ("TEXT", 0, 1),
@@ -371,7 +371,7 @@ def test_v11_database_upgrades_to_v12_keeping_data(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 15
     check.close()
     assert db.get_server_by_name("keep").ssh_user == "ec2-user"
     assert db.get_nvd_cache("CVE-1") == (None, None, "t")
@@ -388,7 +388,7 @@ def test_full_upgrade_path_from_v1_reaches_v12(db_path):
     _legacy_db(db_path, 1).close()
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 14
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 15
     check.close()
     server = db.get_server_by_name("keep")
     assert (server.ip_address, server.ssh_user) == ("10.0.0.1", "ubuntu")

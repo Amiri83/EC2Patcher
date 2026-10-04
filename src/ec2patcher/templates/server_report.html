@@ -95,6 +95,8 @@
     <dd>{% include "_metadata_status.html" %}
         <div class="muted small">{{ run.metadata_source or "" }}</div></dd>
     {% endif %}
+    <dt>Cache Lookups <span class="muted small">(whole run)</span></dt>
+    <dd>{% set r = run %}{% include "_cache_stats.html" %}</dd>
     <dt>APT Metadata</dt>
     <dd>{% if analysis.apt_updated_at %}Workstation private lists{% if analysis.os_codename %} ({{ analysis.os_codename }}, {{ analysis.os_codename }}-updates, {{ analysis.os_codename }}-security{% if analysis.architecture %}; {{ analysis.architecture }}{% endif %}){% endif %} updated {{ analysis.apt_updated_at|timestamp }}{% if analysis.apt_age_hours is not none %} ({{ "%.1f"|format(analysis.apt_age_hours) }} hours before analysis){% endif %}{% else %}<span class="muted">not used</span>{% endif %}</dd>
     <dt>Current Reboot Required</dt>
