@@ -8,7 +8,7 @@ from ec2patcher.services import server_state as st
 
 def test_parse_noble_facts():
     facts = st.parse_facts(facts_output())
-    assert facts.hostname == "ip-10-0-0-245"
+    assert facts.hostname == "ip-10-0-0-3"
     assert (facts.version_id, facts.codename, facts.os_id) == ("24.04", "noble", "ubuntu")
     assert facts.pretty_name == "Ubuntu 24.04.3 LTS"
     assert facts.architecture == "amd64"
