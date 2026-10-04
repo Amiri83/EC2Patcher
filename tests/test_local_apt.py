@@ -249,12 +249,12 @@ def test_plan_refuses_unsafe_requests_without_running_apt(apt, backend):
 
 @pytest.fixture
 def one_server(db, pem_file):
-    db.create_server("ip-10-143-76-245", "10.143.76.245", str(pem_file))
+    db.create_server("ip-10-0-0-3", "192.0.2.245", str(pem_file))
     return db
 
 
 def analyze(db, tmp_path, backend, cves):
-    db.save_report("r.json", {"ip-10-143-76-245": cves}, "VALID")
+    db.save_report("r.json", {"ip-10-0-0-3": cves}, "VALID")
     ssh = ScriptedSSH()
     apt = local_apt.LocalApt(tmp_path / "private-apt", timedelta(hours=6), runner=backend)
     service = AnalysisService(db, make_metadata(tmp_path), runner=ssh, starter=lambda fn: fn(),

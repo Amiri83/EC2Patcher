@@ -303,7 +303,7 @@ def test_dead_analysis_worker_does_not_keep_buttons_disabled(analysis_env, db_pa
 
 def test_dead_patch_worker_does_not_lock_patching(h, db, pem_file, db_path):
     first = h.analysis()
-    other = db.create_server("ip-10-143-76-215", "10.143.76.215", str(pem_file))
+    other = db.create_server("ip-10-0-0-2", "192.0.2.215", str(pem_file))
     second = make_analysis(db, other)
     h.service.starter = dead_starter
     execution_id = h.service.approve(first.id)

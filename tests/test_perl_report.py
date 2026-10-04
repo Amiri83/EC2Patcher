@@ -30,7 +30,7 @@ from ec2patcher.services.security_metadata import SecurityMetadata
 
 REPORT_FILE = FIXTURES / "perl_vulnerability_findings.json"
 METADATA = json.loads((FIXTURES / "perl_canonical_metadata.json").read_text())
-SERVERS = {"ip-10-143-76-245": "10.143.76.245", "ip-10-143-76-215": "10.143.76.215"}
+SERVERS = {"ip-10-0-0-3": "192.0.2.245", "ip-10-0-0-2": "192.0.2.215"}
 PERL_CVE = "CVE-2026-40001"
 INSTALLED, FIXED = "5.38.2-3.2ubuntu0.3", "5.38.2-3.2ubuntu0.4"
 SECURITY = "http://security.ubuntu.com/ubuntu noble-security/main"

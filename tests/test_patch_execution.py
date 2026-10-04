@@ -219,7 +219,7 @@ def test_only_one_active_execution(h, db, pem_file):
     started = []
     h.service.starter = started.append  # approved but not yet running
     first = h.analysis()
-    other = db.create_server("ip-10-143-76-215", "10.143.76.215", str(pem_file))
+    other = db.create_server("ip-10-0-0-2", "192.0.2.215", str(pem_file))
     second = make_analysis(db, other)
     h.service.approve(first.id)
     with pytest.raises(PatchNotAllowedError, match="Another patch execution"):
@@ -242,7 +242,7 @@ def test_analysis_running_blocks_approval(h):
 
 def test_server_ip_changed_blocks(h, db):
     analysis = h.analysis()
-    db.update_server(h.server.id, SERVER, "10.143.76.99", h.server.pem_path)
+    db.update_server(h.server.id, SERVER, "192.0.2.99", h.server.pem_path)
     assert not h.service.eligibility(analysis).allowed
     with pytest.raises(PatchNotAllowedError, match="IP address changed"):
         h.service.approve(analysis.id)

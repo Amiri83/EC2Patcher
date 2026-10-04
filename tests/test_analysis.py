@@ -27,9 +27,9 @@ from ec2patcher.services import server_state
 from ec2patcher.services.analysis_service import AnalysisService, investigate_cves, summarize
 from ec2patcher.services.security_metadata import SecurityMetadata
 
-GOOD, BAD = "ip-10-143-76-245", "ip-10-143-76-215"
-GOOD_IP, BAD_IP = "10.143.76.245", "10.143.76.215"
-AUTH_FAILURE = {BAD_IP: (255, "ubuntu@10.143.76.215: Permission denied (publickey).")}
+GOOD, BAD = "ip-10-0-0-3", "ip-10-0-0-2"
+GOOD_IP, BAD_IP = "192.0.2.245", "192.0.2.215"
+AUTH_FAILURE = {BAD_IP: (255, "ubuntu@192.0.2.215: Permission denied (publickey).")}
 
 
 def sync(fn):
@@ -74,9 +74,7 @@ def test_real_report_shape_end_to_end(setup, metadata):
         "amd64",
         "6.8.0-1021-aws",
     )
-    assert (
-        good.remote_hostname == "ip-10-143-76-245" and good.os_pretty_name == "Ubuntu 24.04.3 LTS"
-    )
+    assert good.remote_hostname == "ip-10-0-0-3" and good.os_pretty_name == "Ubuntu 24.04.3 LTS"
     assert good.current_reboot_required is False and good.expected_reboot is True
     summary = summarize(good)
     assert summary.reported == 3
@@ -121,9 +119,7 @@ def test_no_install_download_or_reboot_anywhere(setup, metadata, monkeypatch):
 
 def test_unreachable_server(setup, metadata):
     ssh = ScriptedSSH(
-        failures={
-            GOOD_IP: (255, "ssh: connect to host 10.143.76.245 port 22: Connection timed out")
-        }
+        failures={GOOD_IP: (255, "ssh: connect to host 192.0.2.245 port 22: Connection timed out")}
     )
     good = run_analysis(setup, metadata, ssh).servers[0]
     assert good.status == "failed" and "Connection timed out" in good.error
@@ -410,7 +406,7 @@ def test_private_apt_update_failure_is_reported_not_faked(setup, metadata, fake_
 
 
 def test_display_name_never_matches_report(db, pem_file, metadata):
-    db.create_server("app-01", GOOD_IP, str(pem_file), tags=[("display_name", "ip-10-143-76-245")])
+    db.create_server("app-01", GOOD_IP, str(pem_file), tags=[("display_name", "ip-10-0-0-3")])
     db.save_report("r.json", {"app-01": ["CVE-2026-63076"]}, "VALID")
     run = run_analysis(db, metadata, ScriptedSSH(), report={"app-01": ["CVE-2026-63076"]})
     assert [s.server_name for s in run.servers] == ["app-01"]
@@ -599,7 +595,7 @@ def test_report_subset_only_analyzes_named_inventory_servers(web, pem_file, db_p
     omitted = "inventory-only"
     c = web(ssh=ScriptedSSH())
     add_servers(c, pem_file)
-    save(c, omitted, "10.143.76.216", pem_file)
+    save(c, omitted, "192.0.2.216", pem_file)
     report = {name: ["CVE-2026-63076"] for name in included}
     assert upload(c, report).status_code == 200
     db = Database(db_path)
@@ -615,7 +611,7 @@ def test_one_of_many_inventory_servers_is_valid_and_only_it_is_analyzed(web, pem
     ssh = ScriptedSSH()
     c = web(ssh=ssh)
     add_servers(c, pem_file)
-    save(c, "inventory-only", "10.143.76.216", pem_file)
+    save(c, "inventory-only", "192.0.2.216", pem_file)
     r = upload(c, {GOOD: ["CVE-2026-63076"]})
     assert r.status_code == 200 and "VALIDATION FAILED" not in r.text
     assert re.search(r"<dt>Servers in report</dt><dd>1</dd>", r.text)
@@ -742,10 +738,10 @@ def test_analysis_progress_and_reports(web, pem_file):
         assert len(links) == 2
         report = c.get(links[0]).text
         # Header
-        assert "Pre-Patch Report: ip-10-143-76-245" in report
-        assert "<dt>Server Name</dt><dd>ip-10-143-76-245</dd>" in report
+        assert "Pre-Patch Report: ip-10-0-0-3" in report
+        assert "<dt>Server Name</dt><dd>ip-10-0-0-3</dd>" in report
         assert "<dt>Display Name</dt><dd>Billing API</dd>" in report
-        assert "<dt>Remote Hostname</dt><dd>ip-10-143-76-245</dd>" in report
+        assert "<dt>Remote Hostname</dt><dd>ip-10-0-0-3</dd>" in report
         assert "<dt>Ubuntu</dt><dd>Ubuntu 24.04.3 LTS</dd>" in report
         assert "<dt>Codename</dt><dd>noble</dd>" in report
         assert "<dt>Running Kernel</dt><dd>6.8.0-1021-aws</dd>" in report
@@ -815,13 +811,13 @@ def test_running_analysis_page_auto_refreshes(web, pem_file, db_path):
             report, [(GOOD, db.get_server_by_name(GOOD), None), (BAD, None, None)]
         )
         first, second = db.get_analysis_run(run_id).servers
-        db.update_analysis_run(run_id, progress_message="Analyzing ip-10-143-76-245 (1 of 2)")
+        db.update_analysis_run(run_id, progress_message="Analyzing ip-10-0-0-3 (1 of 2)")
         db.update_server_analysis(first.id, status="analyzing")
         c.app.state.analyzer._running = True  # a live worker owns the run
         page = c.get(f"/analysis/{run_id}").text
         c.app.state.analyzer._running = False
     assert '<meta http-equiv="refresh" content="3">' in page
-    assert "RUNNING" in page and "Analyzing ip-10-143-76-245 (1 of 2)" in page
+    assert "RUNNING" in page and "Analyzing ip-10-0-0-3 (1 of 2)" in page
     assert "&#9679;" in page and "&#9675;" in page  # analyzing + waiting markers
     assert "Analyzing" in page and "Waiting" in page
     # An app restart turns the orphaned run into an explicit "interrupted" state.

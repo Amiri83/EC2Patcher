@@ -109,7 +109,7 @@ def test_unsafe_server_names_rejected(name):
 
 
 def test_real_server_names_stay_readable():
-    for name in ("ip-10-143-76-245", "app_prod.01"):
+    for name in ("ip-10-0-0-3", "app_prod.01"):
         assert staging.safe_component(name) == name
         assert staging.resolve_local("/tmp/${server_name}", name) == Path(f"/tmp/{name}")
 

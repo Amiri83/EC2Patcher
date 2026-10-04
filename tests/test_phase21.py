@@ -248,7 +248,7 @@ def test_export_response(web, analyzed):
     assert r.headers["content-type"] == XLSX
     date = datetime.fromisoformat(good.completed_at).astimezone().strftime("%Y-%m-%d")
     assert r.headers["content-disposition"] == (
-        f'attachment; filename="ec2patcher_ip-10-143-76-245_{date}.xlsx"'
+        f'attachment; filename="ec2patcher_ip-10-0-0-3_{date}.xlsx"'
     )
     assert wb.sheetnames == ["Summary", "CVE Findings", "Package Plan"]
     assert "Billing API" not in r.headers["content-disposition"]
@@ -261,8 +261,8 @@ def test_export_summary_matches_stored_snapshot(web, analyzed):
     summary = analysis_service.summarize(good)
     assert s["Server Name"] == GOOD
     assert s["Display Name"] == "Billing API"
-    assert s["IP"] == "10.143.76.245"
-    assert s["Remote Hostname"] == "ip-10-143-76-245"
+    assert s["IP"] == "192.0.2.245"
+    assert s["Remote Hostname"] == "ip-10-0-0-3"
     assert s["Ubuntu"] == "Ubuntu 24.04.3 LTS"
     assert s["Ubuntu Version"] == "24.04"
     assert s["Codename"] == "noble"
@@ -396,7 +396,7 @@ def test_export_404s(web, analyzed, pem_file):
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        ("ip-10-143-76-245", "ip-10-143-76-245"),
+        ("ip-10-0-0-3", "ip-10-0-0-3"),
         ("../../etc/passwd", "etc_passwd"),
         ('web "prod"/01;rm -rf', "web_prod_01_rm_-rf"),
         ("Café Server", "Caf_Server"),
