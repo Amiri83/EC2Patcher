@@ -29,7 +29,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -341,6 +341,11 @@ _MIGRATIONS = {
     13: """
         ALTER TABLE servers ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'pem';
     """,
+    # Stored SSH password of password-login servers, Fernet-encrypted (services.secret_store;
+    # the key file is outside the database). NULL = no password stored.
+    14: """
+        ALTER TABLE servers ADD COLUMN password_encrypted TEXT;
+    """,
 }
 
 
@@ -376,6 +381,7 @@ def _row_to_server(row: sqlite3.Row) -> Server:
         pem_path=row["pem_path"],
         ssh_user=row["ssh_user"],
         auth_method=row["auth_method"],
+        has_password=row["password_encrypted"] is not None,  # never the (encrypted) value
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -714,17 +720,21 @@ class Database:
         tags: list[tuple[str, str]] | None = None,
         ssh_user: str = DEFAULT_SSH_USER,
         auth_method: str = AUTH_PEM,
+        password_encrypted: str | None = None,
     ) -> Server:
-        """Insert a server (and optionally its tags) in one transaction."""
+        """Insert a server (and optionally its tags) in one transaction.
+        ``password_encrypted``: the already encrypted SSH password (password login)."""
         _check_duplicate_keys(tags or [])
         now = _now()
         try:
             with self.connect() as conn:
                 cur = conn.execute(
                     "INSERT INTO servers (name, ip_address, pem_path, ssh_user, auth_method, "
-                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (name, ip_address, pem_path, ssh_user, auth_method, now, now),
-                )
+                    "password_encrypted, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (name, ip_address, pem_path, ssh_user, auth_method, password_encrypted,
+                     now, now),
+                )  # fmt: skip
                 server_id = cur.lastrowid
                 if tags:
                     self._replace_tags(conn, server_id, tags)
@@ -758,6 +768,23 @@ class Database:
                     self._replace_tags(conn, server_id, tags)
         except sqlite3.IntegrityError as exc:
             raise DuplicateServerNameError(name) from exc
+        return cur.rowcount == 1
+
+    def get_server_password(self, server_id: int) -> str | None:
+        """The encrypted SSH password of a server (decrypt with services.secret_store)."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT password_encrypted FROM servers WHERE id = ?", (server_id,)
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def set_server_password(self, server_id: int, password_encrypted: str | None) -> bool:
+        """Store (or with None remove) the encrypted SSH password of a server."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE servers SET password_encrypted = ?, updated_at = ? WHERE id = ?",
+                (password_encrypted, _now(), server_id),
+            )
         return cur.rowcount == 1
 
     def delete_server(self, server_id: int) -> bool:

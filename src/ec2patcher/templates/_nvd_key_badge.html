@@ -1,7 +1,10 @@
-{# NVD_API_KEY state of this process; never shows any part of the key. #}
+{# NVD API key state of this process and where the key comes from; never shows any part of the key. #}
 {% set key_status = nvd_key_status() if nvd_key_status is defined else "not_set" %}
-{% if key_status == "in_use" %}<span class="badge badge-success nvd-key-badge" data-nvd-key="in_use">NVD API key: in use</span>
-{% elif key_status == "rejected" %}<span class="badge badge-danger nvd-key-badge" data-nvd-key="rejected" title="NVD answered HTTP 403: check NVD_API_KEY">NVD API key rejected</span>
-{% elif key_status == "set" %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="set">NVD API key: set (not used yet)</span>
-{% else %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="not_set" title="Set the NVD_API_KEY environment variable for faster CVSS lookups">NVD API key: not set</span>
+{% set key_source = nvd_key_source() if nvd_key_source is defined else none %}
+{% set source_text = " — from Settings" if key_source == "settings" else (" — from NVD_API_KEY env var" if key_source == "env" else "") %}
+{% if key_status == "in_use" %}<span class="badge badge-success nvd-key-badge" data-nvd-key="in_use" data-nvd-key-source="{{ key_source }}">NVD API key: in use{{ source_text }}</span>
+{% elif key_status == "rejected" %}<span class="badge badge-danger nvd-key-badge" data-nvd-key="rejected" data-nvd-key-source="{{ key_source }}" title="NVD answered HTTP 403: check the key in Settings or NVD_API_KEY">NVD API key rejected{{ source_text }}</span>
+{% elif key_status == "unreadable" %}<span class="badge badge-danger nvd-key-badge" data-nvd-key="unreadable" data-nvd-key-source="settings" title="The encryption key file is missing or does not match: enter the NVD API key again in Settings">NVD API key in Settings cannot be decrypted &mdash; re-enter it in Settings</span>
+{% elif key_status == "set" %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="set" data-nvd-key-source="{{ key_source }}">NVD API key: set (not used yet){{ source_text }}</span>
+{% else %}<span class="badge badge-neutral nvd-key-badge" data-nvd-key="not_set" title="Save an NVD API key in Settings (or set NVD_API_KEY) for faster CVSS lookups">NVD API key: not set</span>
 {% endif %}

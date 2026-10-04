@@ -47,15 +47,17 @@ files of a plan you approved.
 - **SSH test** runs `ssh -i <pem> <user>@<ip>` with `BatchMode=yes`, `ConnectTimeout=10` and a
   30 s overall limit, and shows hostname, OS release and architecture or a short error. New host
   keys are accepted on first connect (`accept-new`); a changed host key is an error.
-- **Login method** per server: **PEM key** (default) or **username + password**. A password is
-  **never stored** (not in the database, files or logs): it is entered once per app session (on
-  the server form or the Servers list), kept in memory only and forgotten on restart, delete,
-  Clear All Servers, Reset Database or a switch back to PEM. Password login runs `sshpass -e
-  ssh|scp ...`; the password reaches sshpass only through the `SSHPASS` environment variable,
-  never the command line. Install `sshpass` on the workstation (`sudo apt install sshpass`);
-  without it the connection fails with a clear message. Analysis or patching of a password
-  server without a session password is refused. `sudo` on the server must still be
-  passwordless (`sudo -n`).
+- **Login type** per server (dropdown on the server form): **PEM key** (default) or
+  **username + password**. The password is **stored per server, encrypted** (Fernet, see
+  [Secrets at rest](#secrets-at-rest)); it is never shown, logged or exported, and the form
+  field is always empty: when editing, leave it empty to keep the stored password. Switching a
+  server to PEM, deleting it, Clear All Servers or Reset Database removes its password.
+  Password login runs `sshpass -e ssh|scp ...`; the password reaches sshpass only through the
+  `SSHPASS` environment variable of the child process, never the command line. Install
+  `sshpass` on the workstation (`sudo apt install sshpass`); without it the connection fails
+  with a clear message. Analysis or patching of a password server without a usable stored
+  password is refused with a clear message. `sudo` on the server must still be passwordless
+  (`sudo -n`).
 
 ### Report upload
 
@@ -179,16 +181,31 @@ cache error never fails a lookup.
   longer read or written and can be deleted.)
 
 NVD requests are spaced 6 s apart (public limit). With an API key they are spaced 0.6 s apart.
-Provide the key **only through the environment**, never in a file in this repository:
+Enter the key on **Settings → NVD API Key** (stored encrypted; shown only as its last 4
+characters, with **Replace** / **Clear**), or provide it through the environment — never in a
+file in this repository:
 
 ```bash
 export NVD_API_KEY=...   # your own key; it is sent only in the apiKey request header
 ```
 Request a free key at https://nvd.nist.gov/developers/request-an-api-key.
 
-The key is never stored, logged, exported or shown. The Pre-Patch Analysis pages show only its
-state: *NVD API key: not set*, *set (not used yet)*, *in use* (green, after a successful keyed
-request in this app session) or *NVD API key rejected* (red, NVD answered HTTP 403).
+A key saved in Settings **overrides** `NVD_API_KEY`; Clear falls back to the environment. The
+key is never logged, exported or shown in full. The Pre-Patch Analysis pages show only its state
+and source: *NVD API key: not set*, *set (not used yet)*, *in use* (green, after a successful
+keyed request in this app session) or *NVD API key rejected* (red, NVD answered HTTP 403), each
+followed by *from Settings* or *from NVD_API_KEY env var*. If the saved key cannot be decrypted
+the badge is red and asks to enter it again in Settings (no key is sent until then).
+
+### Secrets at rest
+
+Server passwords and the Settings NVD API key are encrypted with Fernet (`cryptography`). The
+key file is `~/.config/ec2patcher/secret.key` (or `$EC2PATCHER_CONFIG_DIR/secret.key`), created
+with mode `0600` on first use and never stored in the database or the repository. If it is
+missing or does not match, nothing fails silently: the Servers / Settings pages, Test SSH,
+analysis and patching show a clear error asking you to enter the secret again (it is then
+encrypted with the current key). Back up the key file together with the database if you move
+them to another machine.
 
 ## Requirements (workstation)
 
@@ -224,7 +241,8 @@ available). Stop with **Shutdown App** in the sidebar or Ctrl+C.
 | `--apt-max-age-hours` | `6` | Refresh the private APT lists when older; `0` = every run (also `$EC2PATCHER_APT_MAX_AGE_HOURS`) |
 | `--no-browser` | off | Do not open a browser |
 
-Other environment variables: `NVD_API_KEY`, `EC2PATCHER_LOG_DIR` (default log directory),
+Other environment variables: `NVD_API_KEY` (a key saved in Settings overrides it),
+`EC2PATCHER_CONFIG_DIR` (location of the secret key file), `EC2PATCHER_LOG_DIR` (default log directory),
 `EC2PATCHER_CANONICAL_TIMEOUT_SECONDS` (20),
 `EC2PATCHER_CANONICAL_CACHE_TTL_HOURS` (24), `EC2PATCHER_CANONICAL_BREAKER_THRESHOLD` (3).
 
@@ -233,6 +251,7 @@ Other environment variables: `NVD_API_KEY`, `EC2PATCHER_LOG_DIR` (default log di
 | What | Path |
 |---|---|
 | SQLite database (incl. Canonical and NVD caches) | `~/.local/share/ec2patcher/ec2patcher.db` |
+| Secret key file (encrypts stored passwords / NVD key; mode 0600) | `~/.config/ec2patcher/secret.key` |
 | Log file (rotating, 5 × 5 MB; directory configurable in Settings) | `~/.local/state/ec2patcher/log/ec2patcher.log` |
 | Private APT state | `~/.local/share/ec2patcher/apt/<codename>-<arch>/` |
 
@@ -273,6 +292,7 @@ Overrides: `EC2P_IT_HOST`, `EC2P_IT_UBUNTU_PORT`, `EC2P_IT_AMAZON_PORT`, `EC2P_I
   versions and paths are validated against strict patterns.
 - Analysis uses no sudo and changes nothing. Patching uses `sudo -n` only for the sudo check,
   the `apt-get` simulation/install of the explicit `.deb` files and the optional reboot.
-- PEM contents are never read; the NVD API key and SSH passwords are never stored or logged
-  (passwords live in memory for the app session and reach sshpass via `SSHPASS` only). Unexpected errors
+- PEM contents are never read; the NVD API key and SSH passwords are stored only encrypted
+  (key file outside the database, mode 0600) and never appear in HTML, logs, exports, error
+  messages or command lines (passwords reach sshpass via `SSHPASS` only). Unexpected errors
   show a generic message in the GUI; details go to the log.

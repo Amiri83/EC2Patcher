@@ -228,15 +228,12 @@ input[type="radio"], input[type="checkbox"] { accent-color: var(--primary); widt
 .inline { display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center; }
 .inline input { max-width: 260px; }
 .clear-form label { display: block; margin-bottom: 6px; }
-.tags-field, .auth-field { border: 0; padding: 0; margin: 0 0 var(--space-4); min-width: 0; }
-.tags-field legend, .auth-field legend { font-weight: 600; padding: 0; margin-bottom: var(--space-1); }
-.radio-row { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-5); }
+.tags-field { border: 0; padding: 0; margin: 0 0 var(--space-4); min-width: 0; }
+.tags-field legend { font-weight: 600; padding: 0; margin-bottom: var(--space-1); }
 .tag-rows { margin: var(--space-2) 0; }
 .tag-row { display: flex; gap: var(--space-2); margin-bottom: 6px; }
 .tag-row input[name="tag_key"] { flex: 2; }
 .tag-row input[name="tag_value"] { flex: 3; }
-.password-form { margin-top: var(--space-2); }
-.password-form input { max-width: 220px; padding: 5px 9px; font-size: 13px; }
 select { width: auto; padding: 6px 8px; }
 .card form > input[type="text"] { display: block; max-width: 320px; margin: var(--space-1) 0 var(--space-3); }
 

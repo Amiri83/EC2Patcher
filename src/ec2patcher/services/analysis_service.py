@@ -39,6 +39,7 @@ from ec2patcher.services import (
     nvd,
     os_adapters,
     rpmversion,
+    secret_store,
     server_state,
     ssh_service,
 )
@@ -84,10 +85,10 @@ class AnalysisService:
         nvd_client: nvd.NvdClient | None = None,
         apt: local_apt.LocalApt | None = None,
         advisories: amazon_updateinfo.UpdateInfoSource | None = None,
-        passwords: ssh_service.SessionPasswords | None = None,
+        credentials: secret_store.SecretStore | None = None,
     ):
         self.db = db
-        self.passwords = passwords or ssh_service.SessionPasswords()  # memory only
+        self.credentials = credentials or secret_store.SecretStore(db)  # encrypted passwords
         self.metadata = metadata
         self.nvd = nvd_client or nvd.NvdClient(db)
         self.apt = apt or local_apt.LocalApt(
@@ -435,7 +436,7 @@ class AnalysisService:
         return True
 
     def _remote(self, server, command: str, timeout: int) -> ssh_service.RemoteResult:
-        password, error = ssh_service.server_password(server, self.passwords)
+        password, error = ssh_service.server_password(server, self.credentials)
         if error:
             return ssh_service.RemoteResult(ok=False, error=error)
         return ssh_service.run_remote(
