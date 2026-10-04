@@ -1,17 +1,29 @@
 # EC2 Patcher
 
 A small, local, single-user web GUI (FastAPI + Jinja2 + SQLite) for recurring security
-patching of Ubuntu EC2 servers. You keep an inventory of servers, upload the security team's
-CVE report, get a **read-only** per-server analysis with an exact package / `.deb` plan, and
-then patch an approved plan on one server or on all eligible servers of an analysis
-(**Patch All**), with an optional reboot afterwards.
+patching of EC2 servers. You keep an inventory of servers, upload the security team's CVE
+report, get a **read-only** per-server analysis, and then patch an approved plan on one server
+or on all eligible servers of an analysis (**Patch All**), with an optional reboot afterwards.
+
+- **Ubuntu**: analysis (Canonical security data) with an exact package / `.deb` plan, and
+  patching of the approved plan.
+- **Amazon Linux 2023**: read-only analysis (Amazon's ALAS advisories); patching is not
+  supported yet.
+- The OS is **detected automatically** from `/etc/os-release`; any other OS is listed as
+  *OS not supported yet*.
+
+```bash
+pipx install ec2patcher
+ec2patcher
+```
 
 EC2Patcher never runs `apt upgrade` / `apt dist-upgrade`: it installs only the exact `.deb`
 files of a plan you approved.
 
 ## Workflow at a glance
 
-1. **Servers**: add each server (name, IP, PEM path, optional tags) and run the SSH test.
+1. **Servers**: add each server (name, IP, SSH user, login type: PEM key or password,
+   optional tags) and run the SSH test.
 2. **Reports**: pick or drop the CVE report JSON; it is uploaded and validated automatically.
 3. **Analyze Report**: read-only analysis of every server in the report.
 4. Review each **server report** (Severity, CVSS, Ubuntu priority, package plan, reboot
@@ -22,14 +34,16 @@ files of a plan you approved.
 
 ## Target server requirements
 
-- Ubuntu, reachable over SSH as the server's **SSH user** (per server, default `ubuntu`) with
-  a PEM key (default; the PEM *path* is stored, its contents are never read, stored or logged)
-  or with username + password (see below). Other operating systems are detected and listed as
-  *OS not supported yet*.
+- Ubuntu (analysis + patching) or Amazon Linux 2023 (analysis only), reachable over SSH as
+  the server's **SSH user** (per server, default `ubuntu`; `ec2-user` on Amazon Linux) with a
+  PEM key (default; the PEM *path* is stored, its contents are never read, stored or logged)
+  or with username + password (see below). Other operating systems (including end-of-life
+  Amazon Linux 2) are detected and listed as *OS not supported yet* / *OS not supported*.
 - **Passwordless sudo** for that user for patching: every privileged command uses `sudo -n`,
   and patching aborts if `sudo -n true` fails. Analysis needs no sudo at all.
-- `dpkg`, `apt-get`, `sha256sum` and write access to `/tmp` (the standard Ubuntu image has
-  them).
+- Ubuntu: `dpkg`, `apt-get`, `sha256sum` and write access to `/tmp` (the standard Ubuntu image
+  has them). Amazon Linux 2023: `rpm` (read-only queries; `needs-restarting` from
+  `dnf-utils` is optional and used only for the reboot status).
 
 ## Features
 
@@ -86,8 +100,10 @@ Servers are analyzed one after another; one failure never affects the others.
   `dpkg-query` (binary → source package and versions) and `dpkg --audit`. Nothing is
   downloaded, copied, installed or restarted.
 - **OS detection**: the OS is taken from `/etc/os-release`; everything OS-specific (inventory,
-  Canonical lookups, APT planning, install, reboot check) sits behind an `OsAdapter`
-  (`services/os_adapters/`). Ubuntu is the only adapter: any other OS is shown as
+  security data lookups, planning, install, reboot check) sits behind an `OsAdapter`
+  (`services/os_adapters/`). Adapters: **Ubuntu** (analysis + patching) and **Amazon Linux
+  2023** (analysis only). For Amazon Linux a second fixed read-only command collects the `rpm`
+  inventory and the dnf releasever. Any other OS is shown as
   `OS not supported yet: <name> <version>` (not a failure, never patchable).
 - **On the workstation**: APT candidates and the `.deb` plan are resolved against a private
   APT state per release and architecture (`<data dir>/apt/<codename>-<arch>/`, pockets
@@ -98,6 +114,12 @@ Servers are analyzed one after another; one failure never affects the others.
 - **Canonical** (`https://ubuntu.com/security/cves/<CVE>.json`) decides applicability, fixed
   version and status, per source package and Ubuntu release, with Debian version comparison.
   Kernel CVEs are checked against the *running* kernel.
+- **Amazon Linux 2023**: the repository `updateinfo.xml` (ALAS advisories) of the server's
+  releasever and of the latest release is fetched on the workstation (via
+  `cdn.amazonlinux.com` mirror lists) and compared with the installed rpm versions (EVR
+  comparison). Statuses: patch available, fix only in a newer releasever, already fixed,
+  package not installed, or no advisory (investigate). No plan is built and the server is
+  never patchable (*Patching not supported yet for Amazon Linux 2023*).
 - **NVD** (CVE API 2.0) supplies only the CVSS **Severity** (Critical/High/Medium/Low/Unknown)
   and score; it never changes a finding's status or plan. Canonical's priority is shown as
   **Ubuntu Priority**.
@@ -231,11 +253,24 @@ them to another machine.
 - Python 3.10+
 - OpenSSH client (`ssh`, `scp`) on `PATH`
 - APT (`apt-get`, `apt-cache`) and `/usr/share/keyrings/ubuntu-archive-keyring.gpg`
+- `sshpass` only for servers with password login (`sudo apt install sshpass`)
 - Internet access to the Ubuntu archive (`archive.ubuntu.com` / `security.ubuntu.com`, or
-  `ports.ubuntu.com` for arm64), `ubuntu.com` and `services.nvd.nist.gov` (optional: without it
-  severities are Unknown). `HTTPS_PROXY` / `NO_PROXY` are honoured.
+  `ports.ubuntu.com` for arm64), `ubuntu.com`, `cdn.amazonlinux.com` (Amazon Linux servers)
+  and `services.nvd.nist.gov` (optional: without it severities are Unknown).
+  `HTTPS_PROXY` / `NO_PROXY` are honoured.
 
 ## Install
+
+With [pipx](https://pipx.pypa.io/) (recommended; installs the `ec2patcher` command in its own
+virtual environment):
+
+```bash
+pipx install ec2patcher                                           # from PyPI
+pipx install git+https://github.com/Amiri83/EC2Patcher.git        # latest main from GitHub
+pipx upgrade ec2patcher                                           # later updates
+```
+
+From a checkout, for development:
 
 ```bash
 python3 -m venv .venv
@@ -245,7 +280,8 @@ python3 -m venv .venv
 ## Run
 
 ```bash
-.venv/bin/ec2patcher                  # or: .venv/bin/python -m ec2patcher
+ec2patcher                            # from a checkout: .venv/bin/ec2patcher or .venv/bin/python -m ec2patcher
+ec2patcher --version
 ```
 
 Open <http://127.0.0.1:8080/> (a browser opens automatically when a desktop session is
@@ -259,6 +295,7 @@ available). Stop with **Shutdown App** in the sidebar or Ctrl+C.
 | `--apt-state-dir` | `<data dir>/apt` | Private APT state (also `$EC2PATCHER_APT_STATE_DIR`) |
 | `--apt-max-age-hours` | `6` | Refresh the private APT lists when older; `0` = every run (also `$EC2PATCHER_APT_MAX_AGE_HOURS`) |
 | `--no-browser` | off | Do not open a browser |
+| `--version` | | Print the version and exit |
 
 Other environment variables: `NVD_API_KEY` (a key saved in Settings overrides it),
 `EC2PATCHER_CONFIG_DIR` (location of the secret key file), `EC2PATCHER_LOG_DIR` (default log directory),
@@ -303,6 +340,22 @@ sh scripts/test-targets/down.sh
 
 Overrides: `EC2P_IT_HOST`, `EC2P_IT_UBUNTU_PORT`, `EC2P_IT_AMAZON_PORT`, `EC2P_IT_KEY`.
 
+GitHub Actions (`.github/workflows/tests.yml`) runs ruff, the test suite (without integration
+tests) and a package build check on every pull request.
+
+## Release
+
+The version lives only in `pyproject.toml` (`ec2patcher --version` reads the installed
+metadata). To release:
+
+1. Bump `version` in `pyproject.toml` and merge it to `main`.
+2. Check locally: `.venv/bin/python -m build && .venv/bin/twine check dist/*`.
+3. Push a tag `v<version>` (e.g. `v1.0.0`). `.github/workflows/publish.yml` checks that the
+   tag matches the version, runs the tests, builds the sdist + wheel and publishes them to
+   PyPI with **Trusted Publishing** (OIDC, environment `pypi`): no API token is stored in the
+   repository or in GitHub secrets. The trusted publisher must be configured once on PyPI for
+   this repository and workflow.
+
 ## Security notes
 
 - Binds to `127.0.0.1` by default; requests with a non-local `Host` header and cross-site POSTs
@@ -315,3 +368,9 @@ Overrides: `EC2P_IT_HOST`, `EC2P_IT_UBUNTU_PORT`, `EC2P_IT_AMAZON_PORT`, `EC2P_I
   (key file outside the database, mode 0600) and never appear in HTML, logs, exports, error
   messages or command lines (passwords reach sshpass via `SSHPASS` only). Unexpected errors
   show a generic message in the GUI; details go to the log.
+- The Fernet key file lives in the config directory, never in the package, the database or
+  this repository; the built wheel and sdist contain no secrets, keys or server data.
+
+## License
+
+MIT, see [LICENSE](https://github.com/Amiri83/EC2Patcher/blob/main/LICENSE).
