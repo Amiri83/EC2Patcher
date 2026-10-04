@@ -74,6 +74,19 @@ NOTICES = {
     "reset": "Settings reset to default.",
     "rejected": "Patching was rejected for this report. No action was taken.",
     "nvd_key_saved": "NVD API key saved (encrypted). It is used instead of NVD_API_KEY.",
+    "nvd_key_saved_valid": (
+        "NVD API key saved (encrypted). It is used instead of NVD_API_KEY. NVD accepted it."
+    ),
+    "nvd_key_saved_rejected": (
+        "NVD API key saved (encrypted), but NVD rejected it. Check the key and save it again."
+    ),
+    "nvd_key_saved_unknown": (
+        "NVD API key saved (encrypted). NVD could not be reached, so the key is not checked yet."
+    ),
+    "nvd_key_valid": "NVD accepted the API key.",
+    "nvd_key_rejected": "NVD rejected the API key. Check the key in Settings or NVD_API_KEY.",
+    "nvd_key_unknown": "NVD could not be reached, so the API key could not be checked.",
+    "nvd_key_missing": "There is no NVD API key to test.",
     "nvd_key_cleared": "NVD API key removed from Settings.",
     "log_dir_saved": "Log directory saved. The application now logs to the new location.",
     "log_dir_reset": "Log directory reset to default.",
@@ -216,6 +229,7 @@ def create_app(
     templates.env.globals["nvd_cache_days"] = analyzer.nvd.max_age.days
     templates.env.globals["nvd_key_status"] = lambda: analyzer.nvd.key_status
     templates.env.globals["nvd_key_source"] = lambda: analyzer.nvd.key_source
+    templates.env.globals["nvd_key_checked_at"] = lambda: analyzer.nvd.key_checked_at
     templates.env.globals["patch_labels"] = ps.LABELS
     templates.env.globals["patch_badges"] = ps.BADGES
     templates.env.globals["reboot_labels"] = ps.REBOOT_LABELS
@@ -831,7 +845,7 @@ def create_app(
         nothing of NVD_API_KEY."""
         view = {
             "saved": credentials.has_nvd_key(), "masked": None, "error": None,
-            "env_set": bool(os.environ.get(nvd.API_KEY_ENV)),
+            "env_set": bool(os.environ.get(nvd.API_KEY_ENV)), "testable": analyzer.nvd.has_key,
         }  # fmt: skip
         if view["saved"]:
             try:
@@ -845,8 +859,13 @@ def create_app(
         if action == "clear":
             credentials.clear_nvd_key()
             apply_nvd_key()
+            analyzer.nvd.forget_key_check()  # it was about the removed key
             logger.info("NVD API key removed from Settings")
             return redirect("/settings", notice="nvd_key_cleared")
+        if action == "test":  # one keyed request now, with the key in use
+            if not analyzer.nvd.has_key:
+                return redirect("/settings", notice="nvd_key_missing")
+            return redirect("/settings", notice=f"nvd_key_{analyzer.nvd.check_key()}")
         key = nvd_api_key.strip()
         error = check_nvd_api_key(key)
         if error is None:
@@ -858,7 +877,9 @@ def create_app(
             return settings_page(request, status_code=422, nvd_key_error=error)
         apply_nvd_key()
         logger.info("NVD API key saved in Settings (encrypted)")
-        return redirect("/settings", notice="nvd_key_saved")
+        if not analyzer.nvd.has_key:  # cannot happen unless the key cannot be read back
+            return redirect("/settings", notice="nvd_key_saved")
+        return redirect("/settings", notice=f"nvd_key_saved_{analyzer.nvd.check_key()}")
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings(request: Request):
