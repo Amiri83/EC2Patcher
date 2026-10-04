@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ec2patcher"
 # Single source of truth for the version; ec2patcher.__version__ reads the installed metadata.
-version = "1.0.0"
+version = "1.0.1"
 description = "Local web GUI that analyzes Ubuntu and Amazon Linux 2023 EC2 servers for CVE fixes and patches Ubuntu servers over SSH from an approved .deb plan"
 readme = "README.md"
 license = "MIT"
