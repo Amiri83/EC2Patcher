@@ -8,7 +8,13 @@ from itertools import zip_longest
 from pathlib import Path
 
 from ec2patcher.database import Database
-from ec2patcher.models import AUTH_METHODS, AUTH_PASSWORD, AUTH_PEM, DEFAULT_SSH_USER
+from ec2patcher.models import (
+    AUTH_METHODS,
+    AUTH_PASSWORD,
+    AUTH_PEM,
+    CONNECTION_TYPES,
+    DEFAULT_SSH_USER,
+)
 
 # Server names are later used to match CVE reports and to name per-server
 # directories, so keep them to a filesystem- and shell-safe character set.
@@ -25,6 +31,35 @@ MAX_TAGS_PER_SERVER = 50
 SSH_PASSWORD_MAX_LENGTH = 256
 # NVD API keys are UUIDs; accept any token of this alphabet (it goes into an HTTP header).
 NVD_API_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+# These three end up in an ssh ProxyCommand, which ssh runs through a shell after expanding its
+# % tokens: the allowlists leave out whitespace, shell metacharacters and '%'.
+INSTANCE_ID_RE = re.compile(r"i-[0-9a-f]{8,17}")
+AWS_REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]{1,2}")
+AWS_PROFILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_@+=:,./-]*")
+AWS_PROFILE_MAX_LENGTH = 128
+
+
+def check_instance_id(instance_id: str) -> str | None:
+    if not INSTANCE_ID_RE.fullmatch(instance_id or ""):
+        return "Instance ID must look like i-0123456789abcdef0."
+    return None
+
+
+def check_aws_region(region: str) -> str | None:
+    if not AWS_REGION_RE.fullmatch(region or ""):
+        return "AWS region must look like us-east-1."
+    return None
+
+
+def check_aws_profile(profile: str) -> str | None:
+    if not profile or len(profile) > AWS_PROFILE_MAX_LENGTH:
+        return f"AWS profile must be 1-{AWS_PROFILE_MAX_LENGTH} characters."
+    if not AWS_PROFILE_RE.fullmatch(profile):
+        return (
+            "AWS profile may only contain letters, digits and _ @ + = : , . / - "
+            "and must start with a letter, digit or '_'."
+        )
+    return None
 
 
 def check_ssh_password(password: str) -> str | None:
@@ -59,6 +94,19 @@ class ServerInput:
     errors: dict[str, str] = field(default_factory=dict)
     ssh_user: str = DEFAULT_SSH_USER
     auth_method: str = AUTH_PEM
+    connection_type: str = ""  # empty: follow the default connection type of Settings
+    instance_id_override: str = ""
+    aws_profile: str = ""  # empty: the default of Settings
+    aws_region: str = ""  # empty: the default of Settings
+
+    @property
+    def transport(self) -> dict[str, str]:
+        return {
+            "connection_type": self.connection_type,
+            "instance_id_override": self.instance_id_override,
+            "aws_profile": self.aws_profile,
+            "aws_region": self.aws_region,
+        }
 
     @property
     def is_valid(self) -> bool:
@@ -172,6 +220,10 @@ def validate_server_input(
     tag_values: list[str] | None = None,
     ssh_user: str = DEFAULT_SSH_USER,
     auth_method: str = AUTH_PEM,
+    connection_type: str = "",
+    instance_id_override: str = "",
+    aws_profile: str = "",
+    aws_region: str = "",
 ) -> ServerInput:
     """Validate and normalize server form input. Uniqueness is checked against the DB.
 
@@ -183,6 +235,10 @@ def validate_server_input(
         pem_path=(pem_path or "").strip(),
         ssh_user=(ssh_user or "").strip(),
         auth_method=(auth_method or AUTH_PEM).strip(),
+        connection_type=(connection_type or "").strip(),
+        instance_id_override=(instance_id_override or "").strip(),
+        aws_profile=(aws_profile or "").strip(),
+        aws_region=(aws_region or "").strip(),
     )
     if result.auth_method not in AUTH_METHODS:
         result.errors["auth_method"] = "Choose PEM key or username + password login."
@@ -211,6 +267,18 @@ def validate_server_input(
     user_error = check_ssh_user(result.ssh_user)
     if user_error:
         result.errors["ssh_user"] = user_error
+
+    if result.connection_type and result.connection_type not in CONNECTION_TYPES:
+        result.errors["connection_type"] = "Choose SSH (direct) or SSH over SSM."
+    if result.instance_id_override:
+        if error := check_instance_id(result.instance_id_override):
+            result.errors["instance_id_override"] = error
+    if result.aws_profile:
+        if error := check_aws_profile(result.aws_profile):
+            result.errors["aws_profile"] = error
+    if result.aws_region:
+        if error := check_aws_region(result.aws_region):
+            result.errors["aws_region"] = error
 
     rows = tag_rows(tag_keys, tag_values)
     tags_error = check_tags(rows)

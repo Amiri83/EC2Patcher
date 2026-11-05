@@ -29,7 +29,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -351,6 +351,25 @@ _MIGRATIONS = {
     15: """
         ALTER TABLE analysis_runs ADD COLUMN cache_stats TEXT NOT NULL DEFAULT '{}';
     """,
+    # Connection per server (NULL = follow the defaults in Settings, so existing servers stay
+    # on direct SSH), the instance IDs resolved for SSH over SSM per private IP / profile /
+    # region, and the transport each analysis and patch execution used (NULL: not recorded).
+    16: """
+        ALTER TABLE servers ADD COLUMN connection_type TEXT;
+        ALTER TABLE servers ADD COLUMN instance_id_override TEXT;
+        ALTER TABLE servers ADD COLUMN aws_profile TEXT;
+        ALTER TABLE servers ADD COLUMN aws_region TEXT;
+        ALTER TABLE server_analyses ADD COLUMN transport TEXT;
+        ALTER TABLE patch_executions ADD COLUMN transport TEXT;
+        CREATE TABLE ssm_instance_cache (
+            private_ip   TEXT NOT NULL,
+            profile      TEXT NOT NULL,
+            region       TEXT NOT NULL,
+            instance_id  TEXT NOT NULL,
+            resolved_at  TEXT NOT NULL,
+            PRIMARY KEY (private_ip, profile, region)
+        );
+    """,
 }
 
 
@@ -387,6 +406,10 @@ def _row_to_server(row: sqlite3.Row) -> Server:
         ssh_user=row["ssh_user"],
         auth_method=row["auth_method"],
         has_password=row["password_encrypted"] is not None,  # never the (encrypted) value
+        connection_type=row["connection_type"],
+        instance_id_override=row["instance_id_override"],
+        aws_profile=row["aws_profile"],
+        aws_region=row["aws_region"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -401,7 +424,7 @@ _SERVER_ANALYSIS_COLUMNS = {
     "status", "error", "started_at", "completed_at", "remote_hostname", "os_pretty_name",
     "os_version_id", "os_codename", "architecture", "running_kernel", "apt_updated_at",
     "apt_age_hours", "current_reboot_required", "reboot_required_packages", "expected_reboot",
-    "expected_reboot_reason", "apt_arguments", "warnings", "os_id",
+    "expected_reboot_reason", "apt_arguments", "warnings", "os_id", "transport",
 }  # fmt: skip
 
 
@@ -460,6 +483,7 @@ def _row_to_server_analysis(row: sqlite3.Row) -> ServerAnalysis:
         apt_arguments=json.loads(row["apt_arguments"] or "[]"),
         warnings=json.loads(row["warnings"] or "[]"),
         os_id=row["os_id"],
+        transport=row["transport"],
     )
 
 
@@ -519,7 +543,7 @@ _EXECUTION_COLUMNS = {
     "install_started_at", "install_finished_at", "install_exit_status", "install_output",
     "simulation_output", "audit_ok", "audit_output", "notes", "reboot_status", "reboot_detail",
     "reboot_requested_at", "reboot_finished_at", "post_reboot_uptime", "post_reboot_kernel",
-    "transfer_attempts",
+    "transfer_attempts", "transport",
 }  # fmt: skip
 _QUEUE_COLUMNS = {"finished_at", "state", "stop_reason"}
 _QUEUE_ITEM_COLUMNS = {"status", "execution_id", "detail"}
@@ -575,6 +599,7 @@ def _row_to_execution(row: sqlite3.Row) -> PatchExecution:
         post_reboot_uptime=row["post_reboot_uptime"],
         post_reboot_kernel=row["post_reboot_kernel"],
         queue_id=row["queue_id"],
+        transport=row["transport"],
         transfer_attempts=json.loads(row["transfer_attempts"] or "[]"),
     )
 
@@ -623,6 +648,14 @@ def _row_to_execution_cve(row: sqlite3.Row) -> PatchCveResult:
         result=row["result"],
         detail=row["detail"],
     )
+
+
+# Per-server connection columns; a missing or empty value is stored as NULL.
+_TRANSPORT_COLUMNS = ("connection_type", "instance_id_override", "aws_profile", "aws_region")
+
+
+def _transport_values(transport: dict[str, str | None] | None) -> list[str | None]:
+    return [(transport or {}).get(column) or None for column in _TRANSPORT_COLUMNS]
 
 
 def _check_duplicate_keys(tags: list[tuple[str, str]]) -> None:
@@ -728,19 +761,22 @@ class Database:
         ssh_user: str = DEFAULT_SSH_USER,
         auth_method: str = AUTH_PEM,
         password_encrypted: str | None = None,
+        transport: dict[str, str | None] | None = None,
     ) -> Server:
         """Insert a server (and optionally its tags) in one transaction.
-        ``password_encrypted``: the already encrypted SSH password (password login)."""
+        ``password_encrypted``: the already encrypted SSH password (password login).
+        ``transport``: its connection columns (absent = follow the defaults in Settings)."""
         _check_duplicate_keys(tags or [])
         now = _now()
         try:
             with self.connect() as conn:
                 cur = conn.execute(
                     "INSERT INTO servers (name, ip_address, pem_path, ssh_user, auth_method, "
-                    "password_encrypted, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "password_encrypted, connection_type, instance_id_override, aws_profile, "
+                    "aws_region, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (name, ip_address, pem_path, ssh_user, auth_method, password_encrypted,
-                     now, now),
+                     *_transport_values(transport), now, now),
                 )  # fmt: skip
                 server_id = cur.lastrowid
                 if tags:
@@ -758,9 +794,11 @@ class Database:
         tags: list[tuple[str, str]] | None = None,
         ssh_user: str | None = None,
         auth_method: str | None = None,
+        transport: dict[str, str | None] | None = None,
     ) -> bool:
         """Update a server. If ``tags`` is given, it replaces the server's full tag set; the
-        SSH user and login method are only changed when given."""
+        SSH user and login method are only changed when given. If ``transport`` is given, it
+        replaces all connection columns (a missing or empty value clears that column)."""
         if tags is not None:
             _check_duplicate_keys(tags)
         try:
@@ -771,11 +809,18 @@ class Database:
                     "updated_at = ? WHERE id = ?",
                     (name, ip_address, pem_path, ssh_user, auth_method, _now(), server_id),
                 )
-                if cur.rowcount == 1 and tags is not None:
+                updated = cur.rowcount == 1
+                if updated and tags is not None:
                     self._replace_tags(conn, server_id, tags)
+                if updated and transport is not None:
+                    conn.execute(
+                        "UPDATE servers SET connection_type = ?, instance_id_override = ?, "
+                        "aws_profile = ?, aws_region = ? WHERE id = ?",
+                        (*_transport_values(transport), server_id),
+                    )
         except sqlite3.IntegrityError as exc:
             raise DuplicateServerNameError(name) from exc
-        return cur.rowcount == 1
+        return updated
 
     def get_server_password(self, server_id: int) -> str | None:
         """The encrypted SSH password of a server (decrypt with services.secret_store)."""
@@ -807,6 +852,43 @@ class Database:
         with self.connect() as conn:
             conn.execute("DELETE FROM server_tags")
             cur = conn.execute("DELETE FROM servers")
+        return cur.rowcount
+
+    def clear_server_connection_types(self) -> int:
+        """Make every server follow the default connection type of Settings."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "UPDATE servers SET connection_type = NULL WHERE connection_type IS NOT NULL"
+            )
+        return cur.rowcount
+
+    # --- instance IDs resolved for SSH over SSM ---------------------------------
+
+    def get_instance_mapping(self, private_ip: str, profile: str, region: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT instance_id FROM ssm_instance_cache "
+                "WHERE private_ip = ? AND profile = ? AND region = ?",
+                (private_ip, profile, region),
+            ).fetchone()
+        return row[0] if row else None
+
+    def save_instance_mapping(
+        self, private_ip: str, profile: str, region: str, instance_id: str
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO ssm_instance_cache "
+                "(private_ip, profile, region, instance_id, resolved_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (private_ip, profile, region, instance_id, _now()),
+            )
+
+    def delete_instance_mapping(self, instance_id: str) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM ssm_instance_cache WHERE instance_id = ?", (instance_id,)
+            )
         return cur.rowcount
 
     # --- server tags -------------------------------------------------------

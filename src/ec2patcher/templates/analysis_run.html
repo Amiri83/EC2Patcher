@@ -47,6 +47,7 @@
               {% if s.status == "complete" %}Complete{% elif s.status == "analyzing" %}Analyzing{% elif s.status == "waiting" %}Waiting{% elif s.status == "unsupported" %}Not supported{% else %}Failed{% endif %}
             </span>
           </div>
+          {% if s.transport %}<div class="muted small server-transport">Transport: {{ s.transport }}</div>{% endif %}
           {% if s.status == "failed" %}
             <div class="progress-error">{{ s.error }}</div>
           {% elif s.status == "unsupported" %}

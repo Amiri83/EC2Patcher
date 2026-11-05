@@ -23,6 +23,11 @@ AUTH_PEM = "pem"
 AUTH_PASSWORD = "password"  # noqa: S105 - a login method name, not a secret
 AUTH_METHODS = {AUTH_PEM: "PEM key", AUTH_PASSWORD: "Username + password"}
 
+# How ssh/scp reach a server. Either way the login method above is unchanged.
+CONNECTION_SSH = "ssh"
+CONNECTION_SSM = "ssm"
+CONNECTION_TYPES = {CONNECTION_SSH: "SSH (direct)", CONNECTION_SSM: "SSH over SSM"}
+
 
 @dataclass
 class Server:
@@ -36,6 +41,10 @@ class Server:
     ssh_user: str = DEFAULT_SSH_USER  # login user of every ssh/scp to this server
     auth_method: str = AUTH_PEM  # AUTH_PEM (pem_path) or AUTH_PASSWORD (stored password)
     has_password: bool = False  # an encrypted SSH password is stored (the value never is here)
+    connection_type: str | None = None  # CONNECTION_*; None = the default from Settings
+    instance_id_override: str | None = None  # always wins over the resolved instance ID
+    aws_profile: str | None = None  # None = the default from Settings
+    aws_region: str | None = None  # None = the default from Settings
 
     @property
     def uses_password(self) -> bool:
@@ -148,6 +157,7 @@ class ServerAnalysis:
     findings: list[CveFindingRow] = field(default_factory=list)
     plan: list[PackagePlanRow] = field(default_factory=list)
     os_id: str | None = None  # OS adapter that analyzed it (None: before v11, i.e. Ubuntu)
+    transport: str | None = None  # how it was reached (None: before v16, not recorded)
 
 
 # --- Phase 3: patch decisions and executions (separate from the analysis snapshot) ------
@@ -231,6 +241,7 @@ class PatchExecution:
     post_reboot_uptime: str | None = None
     post_reboot_kernel: str | None = None
     queue_id: int | None = None  # set when started by "Patch All"
+    transport: str | None = None  # how it was reached (None: before v16, not recorded)
     # One entry per scp attempt: {filename, attempt, ok, exit_code, stderr, error}.
     transfer_attempts: list[dict] = field(default_factory=list)
     packages: list[PatchPackageResult] = field(default_factory=list)

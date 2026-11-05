@@ -4,15 +4,18 @@
     <dl class="kv">
       <dt>Server</dt><dd>{{ ssh_result.server_name }}</dd>
       <dt>IP</dt><dd>{{ ssh_result.ip_address }}</dd>
+      {% if ssh_result.transport %}<dt>Transport</dt><dd>{{ ssh_result.transport }}</dd>{% endif %}
       <dt>Hostname</dt><dd>{{ ssh_result.hostname }}</dd>
       <dt>OS</dt><dd>{{ ssh_result.os_release }}</dd>
       <dt>Architecture</dt><dd>{{ ssh_result.architecture }}</dd>
+      <dt>uname</dt><dd><code>{{ ssh_result.uname }}</code></dd>
     </dl>
   {% else %}
     <div class="ssh-title"><span class="badge badge-danger">SSH CONNECTION FAILED</span></div>
     <dl class="kv">
       <dt>Server</dt><dd>{{ ssh_result.server_name }}</dd>
       <dt>IP</dt><dd>{{ ssh_result.ip_address or "—" }}</dd>
+      {% if ssh_result.transport %}<dt>Transport</dt><dd>{{ ssh_result.transport }}</dd>{% endif %}
       <dt>Error</dt><dd>{{ ssh_result.error }}</dd>
     </dl>
   {% endif %}

@@ -81,6 +81,7 @@
     <dt>Server Name</dt><dd>{{ analysis.server_name }}</dd>
     {% if analysis.display_name %}<dt>Display Name</dt><dd>{{ analysis.display_name }}</dd>{% endif %}
     <dt>IP</dt><dd><code>{{ analysis.ip_address or "-" }}</code></dd>
+    {% if analysis.transport %}<dt>Transport</dt><dd>{{ analysis.transport }}</dd>{% endif %}
     <dt>Remote Hostname</dt><dd>{{ analysis.remote_hostname or "-" }}</dd>
     <dt>{{ "Ubuntu" if analysis.os_id in (none, "ubuntu") else "Operating System" }}</dt><dd>{{ analysis.os_pretty_name or "-" }}</dd>
     <dt>{{ "Releasever" if amazon else "Codename" }}</dt><dd>{{ analysis.os_codename or "-" }}</dd>

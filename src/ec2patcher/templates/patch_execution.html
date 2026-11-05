@@ -17,6 +17,7 @@
     <dt>Server Name</dt><dd>{{ ex.server_name }}</dd>
     {% if ex.display_name %}<dt>Display Name</dt><dd>{{ ex.display_name }}</dd>{% endif %}
     <dt>IP</dt><dd><code>{{ ex.ip_address or "-" }}</code></dd>
+    {% if ex.transport %}<dt>Transport</dt><dd>{{ ex.transport }}</dd>{% endif %}
     <dt>Decision</dt><dd>{{ ex.decision }} &middot; {{ ex.decided_at|timestamp }}</dd>
     {% if ex.started_at %}<dt>Started</dt><dd>{{ ex.started_at|timestamp }}</dd>{% endif %}
     {% if ex.finished_at %}<dt>Finished</dt><dd>{{ ex.finished_at|timestamp }}</dd>{% endif %}

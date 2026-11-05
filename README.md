@@ -58,8 +58,9 @@ files of a plan you approved.
   reports but never used for matching.
 - Each server has an **SSH user** (default `ubuntu`, e.g. `ec2-user` on Amazon Linux) used for
   every ssh/scp to it. It must be a plain POSIX user name (`[a-z_][a-z0-9_.-]*`, max 32).
-- **SSH test** runs `ssh -i <pem> <user>@<ip>` with `BatchMode=yes`, `ConnectTimeout=10` and a
-  30 s overall limit, and shows hostname, OS release and architecture or a short error. New host
+- **Test connection** runs `ssh -i <pem> <user>@<ip>` with `BatchMode=yes`, `ConnectTimeout=10`
+  and a 30 s overall limit, and shows the transport, hostname, OS release, architecture and
+  `uname`, or a short error. New host
   keys are accepted on first connect (`accept-new`); a changed host key is an error.
 - **Login type** per server (dropdown on the server form): **PEM key** (default) or
   **username + password**. The password is **stored per server, encrypted** (Fernet, see
@@ -72,6 +73,63 @@ files of a plan you approved.
   with a clear message. Analysis or patching of a password server without a usable stored
   password is refused with a clear message. `sudo` on the server must still be passwordless
   (`sudo -n`).
+- **Connection type** per server: **SSH (direct)** or **SSH over SSM**, see
+  [Connection types](#connection-types).
+
+### Connection types
+
+Direct SSH is the default. Choose **SSH over SSM** where only AWS Systems Manager is reachable.
+Only the transport changes: analysis, patching, verification and cleanup use the same ssh and
+scp commands and the same PEM or password login, plus this option:
+
+```text
+-o ProxyCommand=aws ssm start-session --target <instance-id> --document-name AWS-StartSSHSession
+   --parameters portNumber=<port> --profile <profile> --region <region>
+```
+
+**Prerequisites on the workstation**
+
+- AWS CLI v2 (`aws`) and the Session Manager plugin (`session-manager-plugin`) on `PATH`.
+- A working profile. For SSO, sign in first: `aws sso login --profile example`.
+- On the server: `sshd` running, the SSM agent connected, and your login still valid. SSM only
+  carries the connection; ssh still authenticates with the server's PEM key or password.
+
+**Settings**
+
+- **Settings → Connection** holds the default connection type, AWS profile and region. AWS
+  credentials stay in the AWS CLI configuration; EC2 Patcher only stores the profile name.
+- A server follows the default until it gets its own connection type on the server form, where
+  the profile and region can also be overridden.
+- **Save** changes the servers that follow the default. **Save and switch all servers** also
+  clears the connection type set on individual servers.
+
+**Instance ID**
+
+- For a server named `ip-a-b-c-d` (with or without a domain), EC2 Patcher looks up the instance
+  with `aws ec2 describe-instances`, filtered on `private-ip-address` = `a.b.c.d`. Any other
+  name uses the server's IPv4 address.
+- The result is cached in SQLite per private IP, profile and region. When SSM reports that the
+  instance is not connected, the cached ID is dropped and looked up again next time. **Test
+  connection** always looks it up again.
+- The **Instance ID** field on the server form is a manual override and always wins. Use it when
+  the lookup finds no instance or several, each of which is reported on that server.
+
+**Preflight and errors**
+
+- Before connecting, each analysis run and patch execution checks that `aws` and
+  `session-manager-plugin` are installed and that `aws sts get-caller-identity` works for the
+  profile and region. An analysis run checks each profile and region once.
+- An expired SSO session is reported as ``run `aws sso login --profile example` ``, not as a raw
+  ssh error, including when it expires during a run. A failed preflight only fails the servers
+  that use SSM; nothing is downloaded or changed on them.
+
+**Testing and logs**
+
+- **Test connection** on the Servers page and the server form runs `uname` (plus hostname, OS
+  and architecture) over the chosen transport. The form tests the values typed, without saving.
+- The transport of each server is written to the log and shown on the analysis run, the server
+  report and the patch execution, for example
+  `SSH over SSM (i-0123456789abcdef0, profile example, region us-east-1)`.
 
 ### Report upload
 
@@ -186,6 +244,8 @@ shown as **NOT RUN**. Only one patch execution or queue runs at a time.
   or days (`30d`), between 1 hour and 365 days, and stored in the database. Changing a TTL
   deletes nothing; expired entries are refreshed on their next lookup. The same badges appear
   next to the NVD API key badge on the Pre-Patch Analysis pages and link to this section.
+- **Connection**: default connection type, AWS profile and region (see
+  [Connection types](#connection-types)).
 - **Local Patch Download Directory**: template, default `/tmp/${server_name}`; must contain
   `${server_name}` and resolve to a safe absolute path.
 - **Logging**: the **Log directory** (default: the per-user log directory from platformdirs, or
@@ -243,7 +303,7 @@ is red and asks to enter it again in Settings (no key is sent until then).
 Server passwords and the Settings NVD API key are encrypted with Fernet (`cryptography`). The
 key file is `~/.config/ec2patcher/secret.key` (or `$EC2PATCHER_CONFIG_DIR/secret.key`), created
 with mode `0600` on first use and never stored in the database or the repository. If it is
-missing or does not match, nothing fails silently: the Servers / Settings pages, Test SSH,
+missing or does not match, nothing fails silently: the Servers / Settings pages, Test connection,
 analysis and patching show a clear error asking you to enter the secret again (it is then
 encrypted with the current key). Back up the key file together with the database if you move
 them to another machine.
@@ -254,6 +314,8 @@ them to another machine.
 - OpenSSH client (`ssh`, `scp`) on `PATH`
 - APT (`apt-get`, `apt-cache`) and `/usr/share/keyrings/ubuntu-archive-keyring.gpg`
 - `sshpass` only for servers with password login (`sudo apt install sshpass`)
+- AWS CLI v2 and `session-manager-plugin` only for servers using
+  [SSH over SSM](#connection-types)
 - Internet access to the Ubuntu archive (`archive.ubuntu.com` / `security.ubuntu.com`, or
   `ports.ubuntu.com` for arm64), `ubuntu.com`, `cdn.amazonlinux.com` (Amazon Linux servers)
   and `services.nvd.nist.gov` (optional: without it severities are Unknown).

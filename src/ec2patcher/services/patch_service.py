@@ -59,6 +59,7 @@ from ec2patcher.services import (
     secret_store,
     server_state,
     ssh_service,
+    ssm_service,
     staging,
 )
 from ec2patcher.services import patch_state as ps
@@ -293,6 +294,7 @@ class _Context:
     # Decrypted stored password for password login (never shown or logged); None = key.
     password: str | None = field(default=None, repr=False)
     adapter: os_adapters.OsAdapter = os_adapters.DEFAULT  # OS the analysis was made for
+    ssm: ssm_service.SsmTarget | None = None  # SSH over SSM; None = direct SSH
     notes: list[str] = field(default_factory=list)
     reboot_required: bool = False  # /run/reboot-required seen by the post-install check
     dropped: list[PatchPackageResult] = field(default_factory=list)  # already at target
@@ -322,6 +324,7 @@ class PatchService:
         self.db = db
         self.credentials = credentials or secret_store.SecretStore(db)  # encrypted passwords
         self.runner = runner
+        self.transports = ssm_service.TransportResolver(db, runner)
         self.starter = starter
         self.fetcher = fetcher or downloader.urllib_fetcher
         self.analysis_running = analysis_running
@@ -422,6 +425,8 @@ class PatchService:
             )
         elif password_error := ssh_service.server_password(server, self.credentials)[1]:
             reasons.append(password_error)
+        elif connection_error := ssm_service.config_error(self.db, server):
+            reasons.append(connection_error)  # no aws call here: this also renders pages
         if self.analysis_running():
             reasons.append("An analysis is currently running. Wait for it to finish.")
         active = self.db.active_execution_id()
@@ -675,6 +680,12 @@ class PatchService:
         password, password_error = ssh_service.server_password(server, self.credentials)
         if password_error:
             raise PatchAbort(password_error)
+        self.transports.start_run()  # sessions can expire between the servers of a Patch All
+        transport = self.transports.for_server(server)
+        self.db.update_execution(execution.id, transport=transport.label)
+        logger.info("Patch execution %s: transport: %s", execution.id, transport.label)
+        if transport.error:
+            raise PatchAbort(transport.error)
         debs: dict[str, dict] = {}
         for plan in installable(analysis):  # at-target rows are dropped at revalidation
             sha = downloader.parse_sha256(plan.checksum)
@@ -694,13 +705,17 @@ class PatchService:
             user=server.ssh_user,
             password=password,
             adapter=_adapter(analysis),
+            ssm=transport.target,
         )
 
     def _remote(self, ctx: _Context, command: str, timeout: int) -> ssh_service.RemoteResult:
-        return ssh_service.run_remote(
+        result = ssh_service.run_remote(
             ctx.ip, ctx.pem, command, runner=self.runner, timeout=timeout, user=ctx.user,
-            password=ctx.password,
+            password=ctx.password, ssm=ctx.ssm,
         )  # fmt: skip
+        if not result.ok:
+            self.transports.note_failure(ctx.ssm, result.stderr)
+        return result
 
     def _packages_with(self, ctx: _Context, filename: str) -> list[PatchPackageResult]:
         return [p for p in ctx.packages if p.deb_filename == filename]
@@ -890,7 +905,10 @@ class PatchService:
             sent = ssh_service.run_scp(
                 ctx.ip, ctx.pem, [str(ctx.local_dir / filename)], ctx.remote_dir,
                 runner=self.runner, timeout=timeout, user=ctx.user, password=ctx.password,
+                ssm=ctx.ssm,
             )  # fmt: skip
+            if not sent.ok:
+                self.transports.note_failure(ctx.ssm, sent.stderr)
             ctx.transfer_attempts.append(
                 {
                     "filename": filename,

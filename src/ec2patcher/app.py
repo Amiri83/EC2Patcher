@@ -9,11 +9,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
+from starlette.datastructures import FormData
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -35,6 +36,7 @@ from ec2patcher.services import (
     report_service,
     secret_store,
     ssh_service,
+    ssm_service,
     staging,
 )
 from ec2patcher.services import patch_state as ps
@@ -99,6 +101,13 @@ NOTICES = {
         "lookup."
     ),
     "cache_ttl_reset": "Cache TTLs reset to default. No entries were deleted.",
+    "connection_saved": (
+        "Connection defaults saved. Servers with their own connection type keep it."
+    ),
+    "connection_applied": (
+        "Connection defaults saved. Every server now follows them ({count} per-server connection "
+        "type(s) cleared)."
+    ),
 }
 
 
@@ -275,19 +284,33 @@ def create_app(
     templates.env.globals["queue_item_badges"] = ps.ITEM_BADGES
     templates.env.globals["default_staging_template"] = staging.DEFAULT_LOCAL_TEMPLATE
     templates.env.globals["auth_methods"] = AUTH_METHODS
+    templates.env.globals["connection_types"] = models.CONNECTION_TYPES
+    templates.env.globals["connection_defaults"] = lambda: ssm_service.load_defaults(db)
+    templates.env.globals["connection_view"] = lambda s: ssm_service.connection_view(db, s)
     app.state.analyzer = analyzer
     app.state.patcher = patcher
     app.state.credentials = credentials
     app.state.cache_ttls = ttls
     app.state.recheck_nvd_key = recheck_nvd_key
 
-    def run_ssh_test(
-        name: str, ip: str, pem: str, user: str, password: str | None = None
+    def run_connection_test(
+        server: models.Server, password: str | None = None
     ) -> ssh_service.SSHTestResult:
-        kwargs = {"user": user, "password": password}
-        if ssh_runner is not None:
-            kwargs["runner"] = ssh_runner
-        return ssh_service.check_connection(name, ip, pem, **kwargs)
+        """Test ``server`` over its transport. An explicit test looks a cached instance ID up
+        again, so it also repairs the mapping of a replaced instance."""
+        runner = ssh_runner or subprocess.run
+        transport = ssm_service.TransportResolver(db, runner).for_server(server, force_refresh=True)
+        if transport.error:
+            return ssh_service.SSHTestResult(
+                False, server.name, server.ip_address, error=transport.error,
+                transport=transport.label,
+            )  # fmt: skip
+        result = ssh_service.check_connection(
+            server.name, server.ip_address, server.pem_path, runner=runner, user=server.ssh_user,
+            password=password, ssm=transport.target,
+        )  # fmt: skip
+        result.transport = transport.label
+        return result
 
     def render(request: Request, template: str, active: str, status_code: int = 200, **ctx):
         ctx.setdefault("notice", None)
@@ -397,10 +420,12 @@ def create_app(
         ssh_user: str,
         auth_method: str = AUTH_PEM,
         ssh_password: str = "",
+        transport: dict[str, str] | None = None,
     ):
+        transport = transport or {}
         form = {
             "name": name, "ip_address": ip, "pem_path": pem, "ssh_user": ssh_user,
-            "auth_method": auth_method,
+            "auth_method": auth_method, **transport,
         }  # fmt: skip
         form["tags"] = tag_rows(tag_keys, tag_values)
         use_password = auth_method == AUTH_PASSWORD
@@ -417,14 +442,18 @@ def create_app(
                     False, name.strip() or "(unsaved)", ip.strip(), error=error
                 )
             else:
-                result = run_ssh_test(
-                    name.strip() or "(unsaved)", ip.strip(), pem, ssh_user.strip(), password
-                )
+                # What the form says right now, without saving it.
+                probe = models.Server(
+                    id=server_id or 0, name=name.strip() or "(unsaved)", ip_address=ip.strip(),
+                    pem_path=pem, created_at="", updated_at="", ssh_user=ssh_user.strip(),
+                    **{key: value.strip() or None for key, value in transport.items()},
+                )  # fmt: skip
+                result = run_connection_test(probe, password)
             return server_form(request, server_id, form, ssh_result=result)
 
         data = validate_server_input(
             db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values,
-            ssh_user=ssh_user, auth_method=auth_method,
+            ssh_user=ssh_user, auth_method=auth_method, **transport,
         )  # fmt: skip
         existing = db.get_server(server_id) if server_id is not None else None
         if data.auth_method == AUTH_PASSWORD:
@@ -449,7 +478,7 @@ def create_app(
                 db.create_server(
                     data.name, data.ip_address, data.pem_path, tags=data.tags,
                     ssh_user=data.ssh_user, auth_method=data.auth_method,
-                    password_encrypted=encrypted,
+                    password_encrypted=encrypted, transport=data.transport,
                 )  # fmt: skip
                 logger.info(
                     "Server created: %s (%s@%s, %s login), %d tag(s)",
@@ -458,7 +487,7 @@ def create_app(
                 return redirect("/servers", notice="created", name=data.name)
             if not db.update_server(
                 server_id, data.name, data.ip_address, data.pem_path, tags=data.tags,
-                ssh_user=data.ssh_user, auth_method=data.auth_method,
+                ssh_user=data.ssh_user, auth_method=data.auth_method, transport=data.transport,
             ):  # fmt: skip
                 return redirect("/servers", notice="not_found")
             if data.auth_method != AUTH_PASSWORD and existing.has_password:
@@ -483,7 +512,8 @@ def create_app(
     def new_server(request: Request):
         form = {
             "name": "", "ip_address": "", "pem_path": "", "ssh_user": DEFAULT_SSH_USER,
-            "auth_method": AUTH_PEM,
+            "auth_method": AUTH_PEM, "connection_type": "", "instance_id_override": "",
+            "aws_profile": "", "aws_region": "",
         }  # fmt: skip
         return server_form(request, None, {**form, "tags": []})
 
@@ -499,10 +529,18 @@ def create_app(
         tag_value: list[str] | None = Form(None),  # noqa: B008
         auth_method: str = Form(AUTH_PEM),
         ssh_password: str = Form(""),
+        connection_type: str = Form(""),
+        instance_id_override: str = Form(""),
+        aws_profile: str = Form(""),
+        aws_region: str = Form(""),
     ):
+        transport = {
+            "connection_type": connection_type, "instance_id_override": instance_id_override,
+            "aws_profile": aws_profile, "aws_region": aws_region,
+        }  # fmt: skip
         return handle_server_form(
             request, None, action, name, ip_address, pem_path, tag_key, tag_value, ssh_user,
-            auth_method, ssh_password,
+            auth_method, ssh_password, transport,
         )  # fmt: skip
 
     @app.get("/servers/{server_id}/edit", response_class=HTMLResponse)
@@ -516,9 +554,17 @@ def create_app(
             "pem_path": server.pem_path,
             "ssh_user": server.ssh_user,
             "auth_method": server.auth_method,
+            "connection_type": server.connection_type or "",
+            "instance_id_override": server.instance_id_override or "",
+            "aws_profile": server.aws_profile or "",
+            "aws_region": server.aws_region or "",
             "tags": [{"key": t.key, "value": t.value} for t in server.tags],
         }
         return server_form(request, server_id, form)
+
+    async def submitted_form(request: Request) -> FormData:
+        """The raw form: unlike Form(None), it tells an empty field from a missing one."""
+        return await request.form()
 
     @app.post("/servers/{server_id}/edit", response_class=HTMLResponse)
     def update_server(
@@ -533,15 +579,21 @@ def create_app(
         tag_value: list[str] | None = Form(None),  # noqa: B008
         auth_method: str | None = Form(None),  # absent: keep the server's login method
         ssh_password: str = Form(""),
+        submitted: FormData = Depends(submitted_form),  # noqa: B008
     ):
         server = db.get_server(server_id)
         if server is None:
             return redirect("/servers", notice="not_found")
         user = server.ssh_user if ssh_user is None else ssh_user
         method = server.auth_method if auth_method is None else auth_method
+        # A field left out keeps its value; an empty one clears it (back to the default).
+        transport = {
+            key: str(submitted.get(key, getattr(server, key) or ""))
+            for key in ("connection_type", "instance_id_override", "aws_profile", "aws_region")
+        }
         return handle_server_form(
             request, server_id, action, name, ip_address, pem_path, tag_key, tag_value, user,
-            method, ssh_password,
+            method, ssh_password, transport,
         )  # fmt: skip
 
     @app.post("/servers/{server_id}/delete")
@@ -561,9 +613,7 @@ def create_app(
         if error:
             result = ssh_service.SSHTestResult(False, server.name, server.ip_address, error=error)
         else:
-            result = run_ssh_test(
-                server.name, server.ip_address, server.pem_path, server.ssh_user, password
-            )
+            result = run_connection_test(server, password)
         return servers_page(request, ssh_result=result, tested_id=server_id)
 
     @app.post("/servers/clear", response_class=HTMLResponse)
@@ -863,6 +913,12 @@ def create_app(
         names = sorted(db.server_names(), key=str.casefold)
         preview_name = ctx.pop("preview_name", None) or (names[0] if names else "ip-10-0-0-1")
         log_dir_value = ctx.pop("log_dir_value", None) or str(log_dir())
+        defaults = ssm_service.load_defaults(db)
+        connection_form = ctx.pop("connection_form", None) or {
+            "connection_type": defaults.connection_type,
+            "aws_profile": defaults.profile or "",
+            "aws_region": defaults.region or "",
+        }
         preview, preview_error = None, None
         try:
             preview = staging.resolve_local(template, preview_name)
@@ -882,7 +938,9 @@ def create_app(
             secret_key_path=credentials.box.key_path,
             cache_ttl_values=ctx.pop("cache_ttl_values", None) or ttls.form_values(),
             cache_ttl_errors=ctx.pop("cache_ttl_errors", {}),
-            cache_ttl_labels=cache_settings.LABELS, cache_ttl_saved=bool(ttls.saved()), **ctx,
+            cache_ttl_labels=cache_settings.LABELS, cache_ttl_saved=bool(ttls.saved()),
+            connection_form=connection_form,
+            connection_errors=ctx.pop("connection_errors", {}), **ctx,
         )  # fmt: skip
 
     def nvd_key_view() -> dict:
@@ -898,6 +956,36 @@ def create_app(
             except SecretError as exc:
                 view["error"] = str(exc)
         return view
+
+    @app.post("/settings/connection", response_class=HTMLResponse)
+    def save_connection_defaults(
+        request: Request,
+        action: str = Form("save"),
+        connection_type: str = Form(""),
+        aws_profile: str = Form(""),
+        aws_region: str = Form(""),
+    ):
+        form = {
+            "connection_type": connection_type.strip(),
+            "aws_profile": aws_profile.strip(),
+            "aws_region": aws_region.strip(),
+        }
+        errors = ssm_service.check_defaults(*form.values())
+        if errors:
+            return settings_page(
+                request, status_code=422, connection_form=form, connection_errors=errors
+            )
+        ssm_service.save_defaults(db, *form.values())
+        logger.info(
+            "Default connection set to %s (profile=%s region=%s)",
+            models.CONNECTION_TYPES[form["connection_type"]],
+            form["aws_profile"] or "-", form["aws_region"] or "-",
+        )  # fmt: skip
+        if action != "apply_all":
+            return redirect("/settings", notice="connection_saved")
+        count = db.clear_server_connection_types()
+        logger.info("All servers follow the default connection (%d cleared)", count)
+        return redirect("/settings", notice="connection_applied", count=count)
 
     @app.post("/settings/nvd-key", response_class=HTMLResponse)
     def save_nvd_key(request: Request, action: str = Form("save"), nvd_api_key: str = Form("")):

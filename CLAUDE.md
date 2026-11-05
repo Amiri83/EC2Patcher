@@ -16,6 +16,7 @@ via argument-list subprocesses. Lint/format: ruff (line length 100).
 - `src/ec2patcher/services/` – `analysis_service` (runs), `cve_resolver` (statuses/plan),
   `security_metadata` (Canonical), `nvd` (CVSS), `local_apt`/`apt_planner` (workstation APT),
   `patch_service`/`patch_remote`/`downloader`/`staging` (patching), `ssh_service`,
+  `ssm_service` (SSH over SSM: ProxyCommand, preflight, instance IDs),
   `secret_store` (encrypted secrets, Fernet key file in the config dir)
 - `src/ec2patcher/templates/`, `static/` – UI
 - `tests/` – pytest; fixtures in `conftest.py`, `*_fixtures.py`, `tests/fixtures/`
