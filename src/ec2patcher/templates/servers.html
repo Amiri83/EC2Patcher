@@ -24,6 +24,12 @@
               {% else %}
               <span><span class="meta-label">PEM</span> <code>{{ s.pem_path }}</code></span>
               {% endif %}
+              {% set conn = connection_view(s) %}
+              <span class="server-connection"><span class="meta-label">Connection</span> {{ conn.label }}{% if conn.from_default %} <span class="muted small">(default)</span>{% endif %}</span>
+              {% if conn.type == "ssm" %}
+              <span><span class="meta-label">Instance</span> {% if conn.instance_id %}<code>{{ conn.instance_id }}</code> <span class="muted small">({{ conn.instance_source }})</span>{% else %}<span class="muted small">resolved on first use</span>{% endif %}</span>
+              <span><span class="meta-label">AWS</span> <code>{{ conn.profile or "no profile" }}</code> / <code>{{ conn.region or "no region" }}</code></span>
+              {% endif %}
             </div>
             {% if s.tags %}
               <div class="server-tags">
@@ -38,7 +44,7 @@
           </div>
           <div class="server-actions">
             <form method="post" action="/servers/{{ s.id }}/test">
-              <button type="submit" class="btn btn-secondary btn-sm">Test SSH</button>
+              <button type="submit" class="btn btn-secondary btn-sm">Test connection</button>
             </form>
             <a href="/servers/{{ s.id }}/edit" class="btn btn-secondary btn-sm">Edit</a>
             <form method="post" action="/servers/{{ s.id }}/delete"

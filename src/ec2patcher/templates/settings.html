@@ -56,6 +56,36 @@
   </form>
   {% endif %}
 </div>
+<div class="card form-card" id="connection">
+  <h2>Connection</h2>
+  <p class="muted">How servers without their own connection type are reached. SSH over SSM runs the same ssh and scp through <code>aws ssm start-session</code> as ProxyCommand; it needs the AWS CLI and the Session Manager plugin on this machine. AWS credentials stay in the AWS CLI configuration; only the profile name is stored here.</p>
+  <form method="post" action="/settings/connection">
+    <div class="field{% if connection_errors.connection_type %} has-error{% endif %}">
+      <label for="default_connection_type">Default connection type</label>
+      <select id="default_connection_type" name="connection_type">
+        {% for key, label in connection_types.items() %}
+          <option value="{{ key }}"{% if connection_form.connection_type == key %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      {% if connection_errors.connection_type %}<div class="field-error">{{ connection_errors.connection_type }}</div>{% endif %}
+    </div>
+    <div class="field{% if connection_errors.aws_profile %} has-error{% endif %}">
+      <label for="default_aws_profile">Default AWS profile</label>
+      <input type="text" id="default_aws_profile" name="aws_profile" value="{{ connection_form.aws_profile }}" placeholder="example" maxlength="128" autocomplete="off" spellcheck="false">
+      {% if connection_errors.aws_profile %}<div class="field-error">{{ connection_errors.aws_profile }}</div>{% endif %}
+    </div>
+    <div class="field{% if connection_errors.aws_region %} has-error{% endif %}">
+      <label for="default_aws_region">Default AWS region</label>
+      <input type="text" id="default_aws_region" name="aws_region" value="{{ connection_form.aws_region }}" placeholder="us-east-1" maxlength="32" autocomplete="off" spellcheck="false">
+      {% if connection_errors.aws_region %}<div class="field-error">{{ connection_errors.aws_region }}</div>{% endif %}
+    </div>
+    <div class="form-actions">
+      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
+      <button type="submit" name="action" value="apply_all" class="btn btn-secondary" title="Also clears the connection type set on individual servers">Save and switch all servers</button>
+    </div>
+    <div class="hint">Save changes the servers that follow the default. Save and switch all servers also clears the connection type set on individual servers.</div>
+  </form>
+</div>
 <div class="card form-card" id="nvd-key">
   <h2>NVD API Key</h2>
   <p class="muted">Optional key for faster CVSS lookups (50 instead of 5 NVD requests per 30 s). A key saved here is stored encrypted and is used instead of the <code>NVD_API_KEY</code> environment variable. Only its last 4 characters are ever shown.</p>

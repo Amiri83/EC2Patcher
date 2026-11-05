@@ -52,6 +52,7 @@ from ec2patcher.services import (
     secret_store,
     server_state,
     ssh_service,
+    ssm_service,
 )
 from ec2patcher.services.security_metadata import FAILED as FAILED_LOOKUP
 from ec2patcher.services.security_metadata import MetadataUnreachable, SecurityMetadata
@@ -106,6 +107,7 @@ class AnalysisService:
         )
         self.advisories = advisories or amazon_updateinfo.UpdateInfoSource(db)
         self.runner = runner
+        self.transports = ssm_service.TransportResolver(db, runner)
         self.starter = starter
         self._lock = threading.Lock()
         self._running = False
@@ -218,6 +220,7 @@ class AnalysisService:
         self.nvd.start_run()
         self.apt.start_run()
         self.advisories.start_run()
+        self.transports.start_run()
         failures = 0
         for index, analysis in enumerate(run.servers, start=1):
             label = f"{analysis.server_name} ({index} of {len(run.servers)})"
@@ -319,6 +322,7 @@ class AnalysisService:
         self.nvd.start_run()
         self.apt.start_run()
         self.advisories.start_run()
+        self.transports.start_run()
 
         def lookup(cve: str):
             if cve.strip().upper() in failed:
@@ -389,6 +393,7 @@ class AnalysisService:
         self.nvd.start_run()
         self.apt.start_run()
         self.advisories.start_run(force_refresh=True)
+        self.transports.start_run()
         label = analysis.server_name
 
         def progress(message: str) -> None:
@@ -464,14 +469,19 @@ class AnalysisService:
         logger.info("Analysis of %s complete", analysis.server_name)
         return True
 
-    def _remote(self, server, command: str, timeout: int) -> ssh_service.RemoteResult:
+    def _remote(
+        self, server, command: str, timeout: int, ssm: ssm_service.SsmTarget | None
+    ) -> ssh_service.RemoteResult:
         password, error = ssh_service.server_password(server, self.credentials)
         if error:
             return ssh_service.RemoteResult(ok=False, error=error)
-        return ssh_service.run_remote(
+        result = ssh_service.run_remote(
             server.ip_address, server.pem_path, command, runner=self.runner, timeout=timeout,
-            user=server.ssh_user, password=password,
+            user=server.ssh_user, password=password, ssm=ssm,
         )  # fmt: skip
+        if not result.ok:
+            self.transports.note_failure(ssm, result.stderr)
+        return result
 
     def _analyze(
         self,
@@ -487,7 +497,13 @@ class AnalysisService:
         if server is None:
             return "This server is no longer configured in EC2Patcher."
 
-        result = self._remote(server, os_adapters.DEFAULT.facts_command, FACTS_TIMEOUT_SECONDS)
+        transport = self.transports.for_server(server)
+        self.db.update_server_analysis(analysis.id, transport=transport.label)
+        logger.info("Analysis of %s: transport: %s", analysis.server_name, transport.label)
+        if transport.error:
+            return transport.error
+        ssm = transport.target
+        result = self._remote(server, os_adapters.DEFAULT.facts_command, FACTS_TIMEOUT_SECONDS, ssm)
         if not result.ok:
             return result.error
         os_release = os_adapters.os_release_from_output(result.stdout)
@@ -496,7 +512,7 @@ class AnalysisService:
             self._mark_unsupported(analysis, result.stdout, os_release)
             return None
         if adapter is not os_adapters.DEFAULT:  # the OS's own read-only facts command
-            result = self._remote(server, adapter.facts_command, FACTS_TIMEOUT_SECONDS)
+            result = self._remote(server, adapter.facts_command, FACTS_TIMEOUT_SECONDS, ssm)
             if not result.ok:
                 return result.error
         try:

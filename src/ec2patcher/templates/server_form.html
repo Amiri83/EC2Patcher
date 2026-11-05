@@ -58,6 +58,41 @@
       <div class="hint">Login user for every SSH/SCP connection to this server (default <code>ubuntu</code>; e.g. <code>ec2-user</code> on Amazon Linux).</div>
       {% if errors.ssh_user %}<div class="field-error">{{ errors.ssh_user }}</div>{% endif %}
     </div>
+    {% set defaults = connection_defaults() %}
+    <div class="field{% if errors.connection_type %} has-error{% endif %}">
+      <label for="connection_type">Connection type</label>
+      <select id="connection_type" name="connection_type" data-connection-type data-default="{{ defaults.connection_type }}">
+        <option value=""{% if not form.connection_type %} selected{% endif %}>Default from Settings: {{ connection_types[defaults.connection_type] }}</option>
+        {% for key, label in connection_types.items() %}
+          <option value="{{ key }}"{% if form.connection_type == key %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <div class="hint">Only how SSH and SCP reach the server. The login type above works the same over both.</div>
+      {% if errors.connection_type %}<div class="field-error">{{ errors.connection_type }}</div>{% endif %}
+    </div>
+    <div data-connection-only="ssm">
+      <div class="field{% if errors.instance_id_override %} has-error{% endif %}">
+        <label for="instance_id_override">Instance ID <span class="muted small">(optional)</span></label>
+        <input type="text" id="instance_id_override" name="instance_id_override" value="{{ form.instance_id_override }}"
+               placeholder="i-0123456789abcdef0" maxlength="19" autocomplete="off" spellcheck="false">
+        <div class="hint">Empty: found by private IP (from a name like <code>ip-10-0-0-1</code>, else the IP address above) and cached. A value here always wins.</div>
+        {% if errors.instance_id_override %}<div class="field-error">{{ errors.instance_id_override }}</div>{% endif %}
+      </div>
+      <div class="field{% if errors.aws_profile %} has-error{% endif %}">
+        <label for="aws_profile">AWS profile <span class="muted small">(optional)</span></label>
+        <input type="text" id="aws_profile" name="aws_profile" value="{{ form.aws_profile }}"
+               placeholder="{{ defaults.profile or 'example' }}" maxlength="128" autocomplete="off" spellcheck="false">
+        <div class="hint">Empty: the default from Settings{% if defaults.profile %} (<code>{{ defaults.profile }}</code>){% endif %}.</div>
+        {% if errors.aws_profile %}<div class="field-error">{{ errors.aws_profile }}</div>{% endif %}
+      </div>
+      <div class="field{% if errors.aws_region %} has-error{% endif %}">
+        <label for="aws_region">AWS region <span class="muted small">(optional)</span></label>
+        <input type="text" id="aws_region" name="aws_region" value="{{ form.aws_region }}"
+               placeholder="{{ defaults.region or 'us-east-1' }}" maxlength="32" autocomplete="off" spellcheck="false">
+        <div class="hint">Empty: the default from Settings{% if defaults.region %} (<code>{{ defaults.region }}</code>){% endif %}.</div>
+        {% if errors.aws_region %}<div class="field-error">{{ errors.aws_region }}</div>{% endif %}
+      </div>
+    </div>
 
     <fieldset class="field tags-field{% if errors.tags %} has-error{% endif %}">
       <legend>Tags <span class="muted small">(optional)</span></legend>

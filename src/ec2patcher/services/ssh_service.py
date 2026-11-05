@@ -7,6 +7,9 @@ Servers log in with a PEM key (default) or with username + password. A password 
 per server, encrypted (services.secret_store), decrypted only to connect and reaches ssh/scp
 through ``sshpass -e``, which reads it from the ``SSHPASS`` environment variable of the
 child process - never from the command line, a plain-text file or a log.
+
+Over SSM (services.ssm_service) the invocation is the same plus one ProxyCommand option; the
+login method and everything built on these functions do not change.
 """
 
 import logging
@@ -17,7 +20,9 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ec2patcher.models import AUTH_PASSWORD, DEFAULT_SSH_USER
+from ec2patcher.services import ssm_service
 from ec2patcher.services.secret_store import SecretError
+from ec2patcher.services.ssm_service import SsmTarget
 from ec2patcher.validation import (
     check_ip_address,
     check_pem_path,
@@ -39,7 +44,8 @@ REMOTE_COMMAND = (
     'echo "EC2P_HOSTNAME=$(hostname)"; '
     ". /etc/os-release 2>/dev/null; "
     'echo "EC2P_OS=${PRETTY_NAME:-unknown}"; '
-    'echo "EC2P_ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)"'
+    'echo "EC2P_ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)"; '
+    'echo "EC2P_UNAME=$(uname -srm)"'
 )
 
 Runner = Callable[..., subprocess.CompletedProcess]
@@ -86,6 +92,8 @@ class SSHTestResult:
     os_release: str | None = None
     architecture: str | None = None
     error: str | None = None
+    uname: str | None = None
+    transport: str | None = None  # label of the transport the test used
 
 
 @dataclass
@@ -116,17 +124,31 @@ def _port_options(flag: str, port: int | None) -> list[str]:
 
 
 def _check_target(
-    ip_address: str, pem_path: str, user: str, password: str | None = None
+    ip_address: str,
+    pem_path: str,
+    user: str,
+    password: str | None = None,
+    ssm: SsmTarget | None = None,
 ) -> tuple[str | None, str | None]:
-    """(normalized_ip, error) after validating IP, PEM path (key login only) and SSH user."""
+    """(normalized_ip, error) after validating IP, PEM path (key login only), SSH user and the
+    SSM target."""
     normalized_ip, ip_error = check_ip_address(ip_address)
     if ip_error:
         return None, ip_error
+    if ssm is not None and (ssm_error := ssm_service.target_error(ssm)):
+        return normalized_ip, ssm_error
     if password is not None:
         if not password:
             return normalized_ip, "SSH password is required."
         return normalized_ip, check_ssh_user(user)
     return normalized_ip, check_pem_path(pem_path) or check_ssh_user(user)
+
+
+def _proxy_options(ssm: SsmTarget | None, port: int | None) -> list[str]:
+    """``-o ProxyCommand=...`` for SSH over SSM; nothing for a direct connection."""
+    if ssm is None:
+        return []
+    return ["-o", f"ProxyCommand={ssm_service.build_proxy_command(ssm, port)}"]
 
 
 def _auth_prefix(binary: str, pem_path: str, password: str | None) -> list[str]:
@@ -142,6 +164,18 @@ def _run_kwargs(password: str | None) -> dict:
     if password is None:
         return {}
     return {"env": {**os.environ, SSHPASS_ENV: password}}
+
+
+def _connection_error(stderr: str, password: str | None, ssm: SsmTarget | None) -> str:
+    """User-facing message for a failed connection; over SSM, AWS failures come first (they
+    reach ssh's stderr through the ProxyCommand, followed by a meaningless ssh error)."""
+    aws_error = ssm_service.describe_aws_error(stderr, ssm.profile) if ssm else None
+    return aws_error or describe_ssh_error(stderr, password is not None)
+
+
+def _stderr(proc: subprocess.CompletedProcess, ssm: SsmTarget | None) -> str:
+    text = proc.stderr or ""
+    return ssm_service.clean_session_stderr(text) if ssm else text
 
 
 def _sshpass_error(returncode: int, password: str | None) -> str | None:
@@ -161,16 +195,19 @@ def build_ssh_command(
     user: str = SSH_USER,
     port: int | None = None,
     password: str | None = None,
+    ssm: SsmTarget | None = None,
 ) -> list[str]:
     """Build the ssh argument list. PEM path '~' is expanded here.
 
     ``remote_command`` is passed as a single argument and interpreted by the remote login
     shell, so callers must only pass constant text or values quoted with shlex.quote().
-    With a ``password`` the command runs through ``sshpass -e`` (password not on argv).
+    With a ``password`` the command runs through ``sshpass -e`` (password not on argv). With
+    ``ssm`` the connection goes through an SSM session on the same port.
     """
     return [
         *_auth_prefix(SSH_BINARY, pem_path, password),
         *_port_options("-p", port),
+        *_proxy_options(ssm, port),
         "--",
         f"{_checked_user(user)}@{ip_address}",
         remote_command,
@@ -203,9 +240,10 @@ def build_scp_command(
     user: str = SSH_USER,
     port: int | None = None,
     password: str | None = None,
+    ssm: SsmTarget | None = None,
 ) -> list[str]:
     """``scp -i <pem> <options> -- <files...> <user>@<ip>:<remote_dir>/`` as an argument list
-    (``sshpass -e scp ...`` with a ``password``).
+    (``sshpass -e scp ...`` with a ``password``, the same ProxyCommand as ssh with ``ssm``).
 
     Callers validate ``remote_dir`` and the file names (no shell metacharacters).
     """
@@ -215,6 +253,7 @@ def build_scp_command(
     return [
         *prefix[:split], "-q", *prefix[split:],
         *_port_options("-P", port),
+        *_proxy_options(ssm, port),
         "--", *local_files, f"{_checked_user(user)}@{host}:{remote_dir.rstrip('/')}/",
     ]  # fmt: skip
 
@@ -229,13 +268,14 @@ def run_scp(
     user: str = SSH_USER,
     port: int | None = None,
     password: str | None = None,
+    ssm: SsmTarget | None = None,
 ) -> RemoteResult:
     """Copy local files to ``<user>@<ip>:<remote_dir>/`` (no shell, same ssh options)."""
-    normalized_ip, error = _check_target(ip_address, pem_path, user, password)
+    normalized_ip, error = _check_target(ip_address, pem_path, user, password, ssm)
     if error:
         return RemoteResult(ok=False, error=error)
     command = build_scp_command(
-        normalized_ip, pem_path, local_files, remote_dir, user, port, password
+        normalized_ip, pem_path, local_files, remote_dir, user, port, password, ssm
     )
     try:
         proc = runner(
@@ -255,10 +295,10 @@ def run_scp(
     except OSError as exc:
         logger.exception("Could not start scp process")
         return RemoteResult(ok=False, error=f"Could not run scp: {exc.strerror or exc}")
-    stdout, stderr = proc.stdout or "", proc.stderr or ""
+    stdout, stderr = proc.stdout or "", _stderr(proc, ssm)
     if proc.returncode != 0:
-        message = _sshpass_error(proc.returncode, password) or describe_ssh_error(
-            stderr, password is not None
+        message = _sshpass_error(proc.returncode, password) or _connection_error(
+            stderr, password, ssm
         )
         return RemoteResult(False, stdout, stderr, proc.returncode, message)
     return RemoteResult(True, stdout, stderr, proc.returncode)
@@ -266,7 +306,10 @@ def run_scp(
 
 def parse_remote_info(stdout: str) -> dict[str, str]:
     info: dict[str, str] = {}
-    keys = {"EC2P_HOSTNAME": "hostname", "EC2P_OS": "os_release", "EC2P_ARCH": "architecture"}
+    keys = {
+        "EC2P_HOSTNAME": "hostname", "EC2P_OS": "os_release", "EC2P_ARCH": "architecture",
+        "EC2P_UNAME": "uname",
+    }  # fmt: skip
     for line in stdout.splitlines():
         key, sep, value = line.strip().partition("=")
         if sep and key in keys and value.strip():
@@ -315,16 +358,17 @@ def run_remote(
     user: str = SSH_USER,
     port: int | None = None,
     password: str | None = None,
+    ssm: SsmTarget | None = None,
 ) -> RemoteResult:
     """Run a command as ``<user>@<ip>`` with the same safe ssh options as the SSH test.
 
     The IP, PEM path (key login) and user are validated first. ssh itself exits 255 on
     connection/auth errors; sshpass exits 5 on a rejected password.
     """
-    normalized_ip, error = _check_target(ip_address, pem_path, user, password)
+    normalized_ip, error = _check_target(ip_address, pem_path, user, password, ssm)
     if error:
         return RemoteResult(ok=False, error=error)
-    command = build_ssh_command(normalized_ip, pem_path, remote_command, user, port, password)
+    command = build_ssh_command(normalized_ip, pem_path, remote_command, user, port, password, ssm)
     try:
         proc = runner(
             command,
@@ -343,9 +387,9 @@ def run_remote(
     except OSError as exc:
         logger.exception("Could not start ssh process")
         return RemoteResult(ok=False, error=f"Could not run ssh: {exc.strerror or exc}")
-    stdout, stderr = proc.stdout or "", proc.stderr or ""
+    stdout, stderr = proc.stdout or "", _stderr(proc, ssm)
     if proc.returncode == 255:
-        message = describe_ssh_error(stderr, password is not None)
+        message = _connection_error(stderr, password, ssm)
         return RemoteResult(False, stdout, stderr, 255, message)
     sshpass_error = _sshpass_error(proc.returncode, password)
     if sshpass_error and proc.returncode not in accept_returncodes:
@@ -367,21 +411,25 @@ def check_connection(
     user: str = SSH_USER,
     port: int | None = None,
     password: str | None = None,
+    ssm: SsmTarget | None = None,
 ) -> SSHTestResult:
-    """Attempt `ssh -i <pem> <user>@<ip>` (or password login through sshpass) and collect
-    hostname / OS / architecture."""
+    """Attempt `ssh -i <pem> <user>@<ip>` (or password login through sshpass, or either over
+    SSM) and collect hostname / OS / architecture / uname."""
     result = SSHTestResult(success=False, server_name=server_name, ip_address=ip_address)
 
-    normalized_ip, error = _check_target(ip_address, pem_path, user, password)
+    normalized_ip, error = _check_target(ip_address, pem_path, user, password, ssm)
     if error:
         result.error = error
         return result
 
     logger.info(
-        "SSH test attempted: server=%s ip=%s user=%s login=%s",
+        "SSH test attempted: server=%s ip=%s user=%s login=%s transport=%s",
         server_name, normalized_ip, user, "key" if password is None else "password",
+        ssm_service.transport_label(ssm),
     )  # fmt: skip
-    command = build_ssh_command(normalized_ip, pem_path, user=user, port=port, password=password)
+    command = build_ssh_command(
+        normalized_ip, pem_path, user=user, port=port, password=password, ssm=ssm
+    )
     try:
         proc = runner(
             command,
@@ -410,13 +458,15 @@ def check_connection(
             result.hostname = info.get("hostname", "unknown")
             result.os_release = info.get("os_release", "unknown")
             result.architecture = info.get("architecture", "unknown")
+            result.uname = info.get("uname", "unknown")
         else:
+            stderr = _stderr(proc, ssm)
             logger.warning(
                 "SSH test stderr for %s (exit %s): %s",
-                server_name, proc.returncode, (proc.stderr or "").strip()[:1000],
+                server_name, proc.returncode, stderr.strip()[:1000],
             )  # fmt: skip
-            result.error = _sshpass_error(proc.returncode, password) or describe_ssh_error(
-                proc.stderr or "", password is not None
+            result.error = _sshpass_error(proc.returncode, password) or _connection_error(
+                stderr, password, ssm
             )
 
     if result.success:

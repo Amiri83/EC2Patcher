@@ -58,6 +58,20 @@
     showAuthFields();
   }
 
+  // Server form: the SSM fields only matter for SSH over SSM. Without JavaScript they stay
+  // visible and are ignored for direct SSH.
+  var connectionSelect = document.querySelector("select[data-connection-type]");
+  if (connectionSelect) {
+    var showConnectionFields = function () {
+      var kind = connectionSelect.value || connectionSelect.getAttribute("data-default");
+      document.querySelectorAll("[data-connection-only]").forEach(function (el) {
+        el.hidden = el.getAttribute("data-connection-only") !== kind;
+      });
+    };
+    connectionSelect.addEventListener("change", showConnectionFields);
+    showConnectionFields();
+  }
+
   // Report upload: submit as soon as a file is picked or dropped (the <noscript>
   // button covers the no-JS case). The dropzone is locked while uploading so the
   // report cannot be submitted twice.
