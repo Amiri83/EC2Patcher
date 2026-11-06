@@ -217,6 +217,7 @@ class FakeUbuntu:
         self.sim_origin: dict[str, str] = {}  # package -> origin printed by apt
         self.install_mode = "ok"  # ok | fail | disconnect | disconnect-none | timeout
         self.post_fail = False
+        self.repair_ok = True  # dpkg --configure -a + audit of the Retry repair
         self.post_fail_after_install = False
         self.audit: list[str] = []
         self.busy = False
@@ -412,6 +413,20 @@ class FakeUbuntu:
         if self.post_fail_after_install:
             self.post_fail = True
         return _done(args, "\n".join(out) + "\n")
+
+    def _op_configure(self, args, command):
+        assert "sudo -n" in command and "dpkg --configure -a" in command
+        assert "apt-get" not in command and "--fix" not in command  # never apt -f
+        if self.repair_ok:
+            out = "@@EC2P configure-rc\n0\n@@EC2P audit\n@@EC2P audit-rc\n0\n"
+        else:
+            out = (
+                "dpkg: dependency problems prevent configuration of pkg-a:\n"
+                "@@EC2P configure-rc\n1\n@@EC2P audit\n"
+                "The following packages are only half configured:\n pkg-a  demo\n"
+                "@@EC2P audit-rc\n1\n"
+            )
+        return _done(args, "@@EC2P configure\n" + out + "@@EC2P end\n")
 
     def _op_post(self, args, command):
         if self.post_fail:

@@ -6,10 +6,24 @@
   <button type="button" class="btn btn-secondary rp-needs-js" data-rp-show>Show progress</button>
   <a href="/analysis/{{ execution.analysis_run_id }}/servers/{{ execution.server_analysis_id }}" class="btn btn-secondary">Approved Report</a>
   <a href="/history" class="btn btn-secondary">History</a>
+  {% if can_retry %}
+  <form method="post" action="/patch/{{ execution.id }}/retry" class="inline-form"
+        data-confirm="Retry patching {{ execution.server_name }}? EC2Patcher first runs 'sudo dpkg --configure -a' on the server to finish any half-installed packages (nothing is downloaded or removed), then starts a fresh analysis. You approve the new plan before anything is installed.">
+    <input type="hidden" name="confirm" value="yes">
+    <button type="submit" class="btn btn-primary">Retry</button>
+  </form>
+  {% endif %}
 </div>{% endblock %}
 {% block overlay %}{% with progress_ref=("queue-%d"|format(execution.queue_id) if execution.queue_id else "patch-%d"|format(execution.id)), progress_active=is_active %}{% include "_run_progress.html" %}{% endwith %}{% endblock %}
 {% block content %}
 {% set ex = execution %}
+{% if repair %}
+<div class="card result-fail">
+  <h2>dpkg repair</h2>
+  <p class="small">sudo dpkg --configure -a: {{ "OK" if repair.configure_ok else "FAILED" }} &middot; dpkg --audit: {{ "clean" if repair.audit_ok else "problems remain" }}</p>
+  {% if repair.output %}<pre>{{ repair.output | join("\n") }}</pre>{% endif %}
+</div>
+{% endif %}
 <div class="card {% if ex.state in ('SUCCESS', 'SUCCESS_WITH_CLEANUP_WARNING', 'ALREADY_PATCHED') %}result-ok{% elif ex.state in ('FAILED', 'UNKNOWN', 'INTERRUPTED') %}result-fail{% endif %}">
   <div class="card-header">
     <h2>{% if ex.error_title %}{{ ex.error_title }}{% else %}{{ patch_labels.get(ex.state, ex.state) }}{% endif %}</h2>

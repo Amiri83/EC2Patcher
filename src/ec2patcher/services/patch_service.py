@@ -360,6 +360,10 @@ class _Context:
 _SERVICES: "weakref.WeakSet[PatchService]" = weakref.WeakSet()
 
 
+# Terminal states a patch can be retried from (after a dpkg repair and a fresh analysis).
+RETRYABLE_STATES = frozenset({ps.FAILED, ps.UNKNOWN, ps.INTERRUPTED, ps.CANCELLED})
+
+
 class PatchService:
     def __init__(
         self,
@@ -498,6 +502,64 @@ class PatchService:
         result.allowed = not result.reasons
         return result
 
+    # --- retry ------------------------------------------------------------------------
+
+    def repair_for_retry(self, execution_id: int) -> patch_remote.RepairResult:
+        """Operator-requested step before retrying a failed patch: ``sudo -n dpkg --configure
+        -a`` then ``dpkg --audit`` on the server. Local only: nothing is downloaded, no APT
+        source is used and nothing is removed (``apt-get install -f`` stays a manual step).
+        Raises PatchNotAllowedError when a retry is not possible right now."""
+        self.reconcile()
+        execution = self.db.get_execution(execution_id)
+        if execution is None:
+            raise PatchNotAllowedError("This patch execution no longer exists.")
+        if execution.state not in RETRYABLE_STATES:
+            raise PatchNotAllowedError(
+                "Only a failed, interrupted, cancelled or unknown patch can be retried."
+            )
+        if self.analysis_running():
+            raise PatchNotAllowedError("An analysis is currently running. Wait for it to finish.")
+        if self._running or self.db.active_execution_id() is not None:
+            raise PatchNotAllowedError("Another patch execution is running.")
+        server = self.db.get_server(execution.server_id) if execution.server_id else None
+        if server is None:
+            raise PatchNotAllowedError("This server is no longer configured in EC2Patcher.")
+        if server.name != execution.server_name or server.ip_address != execution.ip_address:
+            raise PatchNotAllowedError(
+                "The server's name or IP address changed since this patch. Run a new analysis."
+            )
+        password, password_error = ssh_service.server_password(server, self.credentials)
+        if password_error:
+            raise PatchNotAllowedError(password_error)
+        self.transports.start_run()
+        transport = self.transports.for_server(server)
+        if transport.error:
+            raise PatchNotAllowedError(transport.error)
+
+        def remote(command: str, timeout: int) -> ssh_service.RemoteResult:
+            return ssh_service.run_remote(
+                server.ip_address, server.pem_path, command, runner=self.runner,
+                timeout=timeout, user=server.ssh_user, password=password, ssm=transport.target,
+            )  # fmt: skip
+
+        sudo = remote(patch_remote.SUDO_CHECK_COMMAND, SHORT_TIMEOUT_SECONDS)
+        if not sudo.ok or not patch_remote.parse_sudo(sudo.stdout):
+            raise PatchNotAllowedError(
+                f"Passwordless sudo (sudo -n) is not available for the {server.ssh_user} user, "
+                "so dpkg cannot be repaired from EC2Patcher."
+            )
+        result = remote(patch_remote.REPAIR_COMMAND, INSTALL_TIMEOUT_SECONDS)
+        repair = patch_remote.parse_repair(result.stdout or "")
+        logger.info(
+            "Retry of patch execution %s (%s): dpkg --configure -a %s, audit %s",
+            execution_id, server.name, "ok" if repair.configure_ok else "failed",
+            "clean" if repair.audit_ok else "not clean",
+        )  # fmt: skip
+        if not result.ok and not repair.complete:
+            raise PatchNotAllowedError(f"Could not run the dpkg repair: {result.error}")
+        return repair
+
+    # --- decisions -------------------------------------------------------------------
     # --- decisions -------------------------------------------------------------------
 
     def reject(self, analysis_id: int) -> int:

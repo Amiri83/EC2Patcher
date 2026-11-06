@@ -82,6 +82,46 @@ SUDO_CHECK_COMMAND = (
 )
 
 
+# Operator-requested repair before retrying a failed patch: finish configuring packages a
+# failed install left unpacked, then audit. Local only (no download, no APT sources, nothing
+# removed); never run automatically.
+REPAIR_COMMAND = (
+    f"echo '{MARK}configure'; sudo -n env DEBIAN_FRONTEND=noninteractive "
+    "dpkg --configure -a 2>&1 </dev/null; "
+    f"echo '{MARK}configure-rc'; echo $?; "
+    f"echo '{MARK}audit'; sudo -n dpkg --audit 2>&1 </dev/null; "
+    f"echo '{MARK}audit-rc'; echo $?; echo '{MARK}end'"
+)
+
+
+@dataclass
+class RepairResult:
+    complete: bool
+    configure_ok: bool
+    audit_ok: bool
+    output: list[str]
+
+    @property
+    def ok(self) -> bool:
+        return self.complete and self.configure_ok and self.audit_ok
+
+
+def parse_repair(stdout: str) -> RepairResult:
+    sections = split_sections(stdout)
+
+    def rc(name: str) -> str:
+        return next((ln.strip() for ln in sections.get(name, []) if ln.strip()), "")
+
+    configure = [ln for ln in sections.get("configure", []) if ln.strip()]
+    audit = [ln for ln in sections.get("audit", []) if ln.strip()]
+    return RepairResult(
+        complete="end" in sections,
+        configure_ok=rc("configure-rc") == "0",
+        audit_ok=rc("audit-rc") == "0" and not audit,
+        output=configure + audit,
+    )
+
+
 def parse_sudo(stdout: str) -> bool:
     sections = split_sections(stdout)
     return "end" in sections and [ln.strip() for ln in sections.get("sudo", [])][:1] == ["ok"]

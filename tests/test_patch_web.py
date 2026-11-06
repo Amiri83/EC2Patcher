@@ -495,3 +495,55 @@ def test_shared_fixture_consistency():
         assert plan_uri(package, target, pool).endswith(name)
         assert len(sha(deb_content(name))) == 64
     assert ps.SUCCESS in ps.TERMINAL
+
+
+# --- Retry of a failed patch ----------------------------------------------------------------
+
+
+def failed_patch(c, web, pem_file, tmp_path):
+    report_url = analyze(c, pem_file, tmp_path)
+    web.state["fake"].install_mode = "fail"
+    r = c.post(f"{report_url}/approve", data={"confirm": "yes"}, follow_redirects=False)
+    return r.headers["location"]
+
+
+def test_retry_repairs_dpkg_then_starts_a_fresh_analysis_of_that_server(web, pem_file, tmp_path):
+    with web() as c:
+        patch_url = failed_patch(c, web, pem_file, tmp_path)
+        page = c.get(patch_url).text
+        assert "PATCH FAILED" in page and f'action="{patch_url}/retry"' in page
+        assert c.post(f"{patch_url}/retry", follow_redirects=False).headers["location"] == (
+            patch_url
+        )  # no confirmation: nothing happens
+        assert "configure" not in [op for op, _ in web.state["fake"].calls]
+        installs = web.state["fake"].ops.count("install")
+
+        r = c.post(f"{patch_url}/retry", data={"confirm": "yes"}, follow_redirects=False)
+        assert r.status_code == 303 and re.fullmatch(r"/analysis/\d+", r.headers["location"])
+        assert "configure" in [op for op, _ in web.state["fake"].calls]
+        assert web.state["fake"].ops.count("install") == installs  # nothing installed by retry
+        run_page = c.get(r.headers["location"]).text
+        assert SERVER in run_page and run_page.count('href="/analysis/') >= 1
+        reports = re.findall(r'href="(/analysis/\d+/servers/\d+)"', run_page)
+        assert len(set(reports)) == 1  # only the retried server is re-analyzed
+        assert "Approve &amp; Patch" in c.get(reports[0]).text
+
+
+def test_retry_stops_when_dpkg_cannot_be_repaired(web, pem_file, tmp_path):
+    with web() as c:
+        patch_url = failed_patch(c, web, pem_file, tmp_path)
+        web.state["fake"].repair_ok = False
+        r = c.post(f"{patch_url}/retry", data={"confirm": "yes"}, follow_redirects=False)
+        assert r.status_code == 409
+        assert "apt-get install -f" in r.text and "dependency problems" in r.text
+        assert "half configured" in r.text
+
+
+def test_no_retry_button_after_success(web, pem_file, tmp_path):
+    with web() as c:
+        report_url = analyze(c, pem_file, tmp_path)
+        r = c.post(f"{report_url}/approve", data={"confirm": "yes"}, follow_redirects=False)
+        patch_url = r.headers["location"]
+        assert "/retry" not in c.get(patch_url).text
+        r = c.post(f"{patch_url}/retry", data={"confirm": "yes"}, follow_redirects=False)
+        assert r.status_code == 409 and "can be retried" in r.text
