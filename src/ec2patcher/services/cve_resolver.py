@@ -402,6 +402,40 @@ def kernel_meta_source(source: str) -> str:
     return f"linux-meta{flavour}"
 
 
+_ABI_RE = re.compile(r"^(\d+\.\d+\.\d+-\d+)")
+
+
+def kernel_abi(version_or_release: str) -> str | None:
+    """The kernel ABI: 7.0.0-1014.14~24.04.1 -> 7.0.0-1014, 7.0.0-1013-aws -> 7.0.0-1013."""
+    m = _ABI_RE.match(version_or_release or "")
+    return m.group(1) if m else None
+
+
+def kernel_abi_targets(facts: ServerFacts, finding: Finding) -> dict[str, str]:
+    """{new package: installed package} for a kernel line without any meta package: every
+    installed package of this kernel line (its source or its signed source) carrying the
+    running kernel's ABI, renamed to the ABI of the fixed version
+    (linux-image-7.0.0-1013-aws -> linux-image-7.0.0-1014-aws). Empty when the fix is not a
+    newer ABI of the running kernel."""
+    old, new = kernel_abi(facts.kernel or ""), kernel_abi(finding.fixed_version or "")
+    if not old or not new or old == new or not finding.source:
+        return {}
+    flavour = finding.source.removeprefix("linux").removeprefix("-signed")
+    sources = {finding.source, f"linux{flavour}", f"linux-signed{flavour}"}
+    targets = {}
+    for p in facts.packages:
+        if p.source in sources and old in p.base_name:
+            targets[p.base_name.replace(old, new)] = p.base_name
+    return dict(sorted(targets.items()))
+
+
+def kernel_upgrade_packages(facts: ServerFacts, finding: Finding) -> list[str]:
+    """What selects the fixed kernel: the meta packages of its line, else (no meta package
+    installed, e.g. removed by 'apt-get install -f') the fixed ABI's own packages."""
+    metas = kernel_meta_packages(facts, finding.source)
+    return metas or list(kernel_abi_targets(facts, finding))
+
+
 def kernel_meta_packages(facts: ServerFacts, source: str | None) -> list[str]:
     """Installed meta packages of *this* kernel source. A server often has several kernel
     lines (e.g. linux-aws 6.8 and linux-aws-7.0); another line's meta package can never
@@ -417,7 +451,7 @@ def candidate_query_packages(findings: list[Finding], facts: ServerFacts) -> lis
     for f in findings:
         if not needs_candidate_check(f):
             continue
-        names.update(kernel_meta_packages(facts, f.source) if f.is_kernel else f.binaries)
+        names.update(kernel_upgrade_packages(facts, f) if f.is_kernel else f.binaries)
     return sorted(names)
 
 
@@ -452,11 +486,12 @@ def apply_candidates(
     for f in findings:
         if not needs_candidate_check(f):
             continue
-        names = kernel_meta_packages(facts, f.source) if f.is_kernel else f.binaries
+        names = kernel_upgrade_packages(facts, f) if f.is_kernel else f.binaries
         if not names:
             f.status = FIX_NOT_IN_CONFIGURED_REPOS
             f.detail = (
-                "No kernel meta package (e.g. linux-aws) is installed to select the fixed kernel."
+                "No kernel meta package (e.g. linux-aws) is installed to select the fixed "
+                "kernel, and the fix is not a newer ABI of the running kernel."
             )
             continue
         ok: dict[str, str] = {}

@@ -938,7 +938,7 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
         highest = max(rows, key=lambda f: f.cvss_score if f.cvss_score is not None else -1)
         detail = next((f.detail for f in rows if f.status == status and f.detail), None)
         newer_release = cve_resolver.NEWER_RELEASEVER_REQUIRED in (detail or "")
-        if status == cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS and not newer_release:
+        if status == cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS and not newer_release and not detail:
             detail = "The configured repositories do not offer the fixed version."
         known_kev = [f.kev for f in rows if f.kev is not None]
         scores = [f.epss for f in rows if f.epss is not None]

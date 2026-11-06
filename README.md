@@ -362,9 +362,17 @@ executed, and each approved analysis only once. The pipeline stops at the first 
    reboot** is unchecked: `sudo -n reboot`, wait up to 10 minutes for a new boot id, record
    uptime and kernel. The reboot result is recorded separately from the patch result.
 
-A failed or interrupted install is never retried or rolled back; if the connection drops the
-server is inspected once more and the result is proven or recorded as *EXECUTION STATE
-UNKNOWN*. A new analysis is required before trying again.
+A failed or interrupted install is never retried or rolled back automatically; if the
+connection drops the server is inspected once more and the result is proven or recorded as
+*EXECUTION STATE UNKNOWN*. A new analysis is required before trying again.
+
+**Retry** (on a failed, unknown, interrupted or cancelled patch, after a confirmation): runs
+`sudo -n dpkg --configure -a` and `sudo -n dpkg --audit` on the server to finish packages the
+failed install left half-installed (local only: nothing is downloaded or removed), then starts
+a fresh analysis of that server alone with its CVEs from the original report. You approve the
+new plan as usual. If dpkg still reports problems (typically a missing dependency), the output
+is shown and `sudo apt-get install -f` stays a manual step on the server, because it may
+download or remove packages that were never approved.
 
 ### Patch All
 

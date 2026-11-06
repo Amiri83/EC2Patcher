@@ -305,6 +305,59 @@ def test_dash_scheme_meta_candidate_older_than_fix_stays_not_in_repos():
     assert kernel.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
 
 
+def _kernel_line_without_metas(running="7.0.0-1013-aws"):
+    """The linux-aws-7.0 kernel line after 'apt-get install -f' removed its meta packages."""
+    from ec2patcher.services.server_state import InstalledPackage
+
+    f = facts()
+    f.packages = [p for p in f.packages if not p.source.startswith("linux")]
+    v = "7.0.0-1013.13~24.04.1"
+    for name, source in (
+        ("linux-image-7.0.0-1013-aws", "linux-signed-aws-7.0"),
+        ("linux-modules-7.0.0-1013-aws", "linux-aws-7.0"),
+        ("linux-headers-7.0.0-1013-aws", "linux-aws-7.0"),
+        ("linux-aws-7.0-headers-7.0.0-1013", "linux-aws-7.0"),
+    ):
+        f.packages.append(InstalledPackage(name, v, source, v, "amd64"))
+    f.kernel = running
+    return f
+
+
+def test_kernel_without_meta_packages_upgrades_to_the_fixed_abi_packages():
+    f = _kernel_line_without_metas()
+    kernel = cr.Finding("CVE-1", "linux-aws-7.0", cr.FIX_NOT_IN_CONFIGURED_REPOS,
+                        fixed_version="7.0.0-1014.14~24.04.1", is_kernel=True)  # fmt: skip
+    wanted = [
+        "linux-aws-7.0-headers-7.0.0-1014", "linux-headers-7.0.0-1014-aws",
+        "linux-image-7.0.0-1014-aws", "linux-modules-7.0.0-1014-aws",
+    ]  # fmt: skip
+    assert cr.candidate_query_packages([kernel], f) == wanted
+    candidates = {n: apt_planner.Candidate(n, None, "7.0.0-1014.14~24.04.1") for n in wanted}
+    requests = cr.apply_candidates([kernel], candidates, f)
+    assert kernel.status == cr.PATCH_AVAILABLE, kernel.detail
+    assert requests == [(n, "7.0.0-1014.14~24.04.1") for n in wanted]
+
+
+def test_kernel_without_meta_packages_and_no_published_abi_stays_not_in_repos():
+    f = _kernel_line_without_metas()
+    kernel = cr.Finding("CVE-1", "linux-aws-7.0", cr.FIX_NOT_IN_CONFIGURED_REPOS,
+                        fixed_version="7.0.0-1014.14~24.04.1", is_kernel=True)  # fmt: skip
+    assert cr.apply_candidates([kernel], {}, f) == []
+    assert kernel.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
+    assert "linux-image-7.0.0-1014-aws: no installation candidate" in kernel.detail
+
+
+def test_abi_targets_only_for_a_newer_abi_of_the_running_line():
+    f = _kernel_line_without_metas()
+    same = cr.Finding("CVE-1", "linux-aws-7.0", cr.FIX_NOT_IN_CONFIGURED_REPOS,
+                      fixed_version="7.0.0-1013.14~24.04.1", is_kernel=True)  # fmt: skip
+    other = cr.Finding("CVE-2", "linux", cr.FIX_NOT_IN_CONFIGURED_REPOS,
+                       fixed_version="6.8.0-149.149", is_kernel=True)  # fmt: skip
+    assert cr.kernel_abi_targets(f, same) == {}
+    assert cr.kernel_abi_targets(f, other) == {}
+    assert cr.kernel_abi("7.0.0-1013-aws") == "7.0.0-1013"
+
+
 def test_kernel_source_without_own_meta_package_uses_all_meta_packages():
     f = _second_kernel_line(facts())
     assert cr.kernel_meta_packages(f, "linux") == [

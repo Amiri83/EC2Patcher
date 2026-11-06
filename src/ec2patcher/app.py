@@ -1062,17 +1062,65 @@ def create_app(
             return server_report_page(request, run_id, analysis_id, status_code=409, error=str(exc))
         return redirect(f"/analysis/{run_id}/servers/{analysis_id}", notice="rejected")
 
-    @app.get("/patch/{execution_id}", response_class=HTMLResponse)
-    def patch_execution(request: Request, execution_id: int):
+    def patch_execution_page(
+        request: Request, execution_id: int, status_code: int = 200, **ctx
+    ) -> HTMLResponse:
         patcher.reconcile()
         execution = db.get_execution(execution_id)
         if execution is None:
             raise StarletteHTTPException(404)
         return render(
-            request, "patch_execution.html", "history", execution=execution,
-            steps=patch_service.progress_steps(execution),
+            request, "patch_execution.html", "history", status_code=status_code,
+            execution=execution, steps=patch_service.progress_steps(execution),
             is_active=ps.in_progress(execution.state, execution.reboot_status),
+            can_retry=execution.state in patch_service.RETRYABLE_STATES, **ctx,
         )  # fmt: skip
+
+    @app.get("/patch/{execution_id}", response_class=HTMLResponse)
+    def patch_execution(request: Request, execution_id: int):
+        return patch_execution_page(request, execution_id)
+
+    @app.post("/patch/{execution_id}/retry", response_class=HTMLResponse)
+    def retry_patch(request: Request, execution_id: int, confirm: str = Form("")):
+        """Repair dpkg on the server (dpkg --configure -a), then start a fresh analysis of
+        that server; the operator approves the new plan as usual."""
+        execution = db.get_execution(execution_id)
+        if execution is None:
+            raise StarletteHTTPException(404)
+        if confirm != "yes":
+            return redirect(f"/patch/{execution_id}")
+        try:
+            repair = patcher.repair_for_retry(execution_id)
+        except patch_service.PatchNotAllowedError as exc:
+            return patch_execution_page(request, execution_id, status_code=409, error=str(exc))
+        if not repair.ok:
+            return patch_execution_page(
+                request, execution_id, status_code=409, repair=repair,
+                error="dpkg could not be repaired automatically. Run 'sudo apt-get install -f' "
+                "on the server (it may download packages), then retry again.",
+            )  # fmt: skip
+        analysis = db.get_server_analysis(execution.server_analysis_id)
+        run = db.get_analysis_run(analysis.run_id, details=False) if analysis else None
+        cves = run.report.get(execution.server_name) if run else None
+        if not run or cves is None:
+            return patch_execution_page(
+                request, execution_id, status_code=409, repair=repair,
+                error="dpkg is repaired, but the original report is gone. Upload the report "
+                "and run a new analysis.",
+            )  # fmt: skip
+        report = models.StoredReport(
+            id=run.report_id or 0, filename=run.report_filename,
+            servers={execution.server_name: cves}, uploaded_at=run.report_uploaded_at,
+            status="VALID",
+        )  # fmt: skip
+        run_id = analyzer.start(report)
+        if run_id is None:
+            return patch_execution_page(
+                request, execution_id, status_code=409, repair=repair,
+                error="dpkg is repaired, but another analysis is running. Re-analyze the "
+                "server when it finishes.",
+            )  # fmt: skip
+        return redirect(f"/analysis/{run_id}")
 
     # --- "Patch All": the eligible servers of one run, one at a time --------------------
 
