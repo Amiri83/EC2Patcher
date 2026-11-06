@@ -552,7 +552,7 @@ available). Stop with **Shutdown App** in the sidebar or Ctrl+C.
 
 Other environment variables: `NVD_API_KEY` (a key saved in Settings overrides it),
 `EC2PATCHER_CONFIG_DIR` (location of the secret key file), `EC2PATCHER_LOG_DIR` (default log directory),
-`EC2PATCHER_CANONICAL_TIMEOUT_SECONDS` (20),
+`EC2PATCHER_CANONICAL_TIMEOUT_SECONDS` (5),
 `EC2PATCHER_CANONICAL_CACHE_TTL_HOURS` (24), `EC2PATCHER_CANONICAL_BREAKER_THRESHOLD` (3).
 
 ## Data location (Linux defaults)
