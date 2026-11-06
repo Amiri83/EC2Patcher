@@ -56,6 +56,7 @@ from ec2patcher.services import (
     downloader,
     os_adapters,
     patch_remote,
+    patch_report,
     secret_store,
     server_state,
     ssh_service,
@@ -480,6 +481,7 @@ class PatchService:
                 failure_stage=ps.APPROVED, cleanup_status="NOT_NEEDED",
                 reboot_status=ps.REBOOT_SKIPPED if skip_reboot else ps.REBOOT_NOT_RUN,
             )  # fmt: skip
+            patch_report.safely(patch_report.record_execution, self.db, execution_id)
             raise
         return execution_id
 
@@ -564,6 +566,7 @@ class PatchService:
                     ps.ALREADY_PATCHED, finished_at=_now(), cleanup_status="NOT_NEEDED",
                     notes=ctx.notes, **fields,
                 )  # fmt: skip
+                patch_report.safely(patch_report.record_execution, self.db, execution_id)
                 return
             move(ps.DOWNLOADING)
             self._download(ctx)
@@ -581,6 +584,7 @@ class PatchService:
             self._verify_install(ctx, post)
             # Results are persisted; only now may the staging files go.
             move(ps.CLEANING_UP, notes=ctx.notes)
+            patch_report.safely(patch_report.record_execution, self.db, execution_id)
             warning = self._cleanup(ctx)
             final = ps.SUCCESS_WITH_CLEANUP_WARNING if warning else ps.SUCCESS
             move(
@@ -604,8 +608,10 @@ class PatchService:
                 ),
                 ctx,
             )
+        patch_report.safely(patch_report.record_execution, self.db, execution_id)
         if final in ps.SUCCESSFUL:  # installation verified (a cleanup error does not matter)
             self._reboot_safely(ctx)
+            patch_report.safely(patch_report.record_execution, self.db, execution_id)
 
     def _fail(self, execution_id: int, state: str, abort: PatchAbort, ctx) -> str:
         """Record the failure; returns the state the execution ended in."""

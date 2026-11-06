@@ -17,6 +17,7 @@
       </div>
     </noscript>
   </form>
+  <p class="muted small">Received the list as text instead? <a href="/reports/import">Paste it as it is</a> to turn it into this format.</p>
   <details class="format-help">
     <summary>Expected format</summary>
     <pre>{
@@ -74,6 +75,7 @@
       <dt>Servers in report</dt><dd>{{ report.server_count }}</dd>
       <dt>CVEs in report</dt><dd>{{ report.cve_count }}</dd>
     </dl>
+    <p class="small"><a href="/reports/latest/download">Download as JSON</a></p>
     {% if missing_servers %}
       <div class="alert alert-warning">Some servers in this report are no longer configured: {{ missing_servers|join(", ") }}</div>
     {% endif %}

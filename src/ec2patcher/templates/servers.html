@@ -52,6 +52,7 @@
             </form>
             {% endif %}
             <a href="/servers/{{ s.id }}/edit" class="btn btn-secondary btn-sm">Edit</a>
+            <a href="/servers/new?clone={{ s.id }}" class="btn btn-secondary btn-sm">Clone</a>
             <form method="post" action="/servers/{{ s.id }}/delete"
                   data-confirm="Delete server '{{ s.name }}'?">
               <button type="submit" class="btn btn-danger-outline btn-sm">Delete</button>

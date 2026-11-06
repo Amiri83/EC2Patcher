@@ -48,6 +48,7 @@ from ec2patcher.services import (
     local_apt,
     nvd,
     os_adapters,
+    patch_report,
     rpmversion,
     secret_store,
     server_state,
@@ -419,6 +420,7 @@ class AnalysisService:
             self.db.update_server_analysis(
                 analysis_id, status="failed", completed_at=_now(), error=error
             )
+            patch_report.safely(patch_report.record_analysis, self.db, analysis_id)
 
         status = previous_status
         if previous_status in ("completed", "completed_with_errors"):
@@ -465,6 +467,7 @@ class AnalysisService:
             self.db.update_server_analysis(
                 analysis.id, status="failed", completed_at=_now(), error=error
             )
+            patch_report.safely(patch_report.record_analysis, self.db, analysis.id)
             return False
         logger.info("Analysis of %s complete", analysis.server_name)
         return True
@@ -510,6 +513,7 @@ class AnalysisService:
         adapter = os_adapters.detect(os_release)
         if adapter is None:
             self._mark_unsupported(analysis, result.stdout, os_release)
+            patch_report.safely(patch_report.record_analysis, self.db, analysis.id)
             return None
         if adapter is not os_adapters.DEFAULT:  # the OS's own read-only facts command
             result = self._remote(server, adapter.facts_command, FACTS_TIMEOUT_SECONDS, ssm)
@@ -560,6 +564,7 @@ class AnalysisService:
             apt_arguments=assessment.apt_arguments,
             warnings=assessment.warnings,
         )
+        patch_report.safely(patch_report.record_analysis, self.db, analysis.id)
         return None
 
     def _mark_unsupported(self, analysis: ServerAnalysis, stdout: str, os_release: dict) -> None:

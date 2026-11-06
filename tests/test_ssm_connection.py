@@ -849,7 +849,7 @@ def test_no_credential_or_identity_is_kept_or_logged(db, caplog):
 def test_fresh_database_is_v16_with_the_connection_schema(db_path):
     db = Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 16
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 17
     conn.close()
     server_columns = columns(db_path, "servers")
     for name in ("connection_type", "instance_id_override", "aws_profile", "aws_region"):
@@ -886,7 +886,7 @@ def test_v15_database_upgrades_to_v16_keeping_data(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 16
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 17
     check.close()
     server = db.get_server_by_name("keep")
     assert (server.ip_address, server.pem_path, server.ssh_user) == (
@@ -905,7 +905,7 @@ def test_full_upgrade_path_from_v1_reaches_v16(db_path):
     _legacy_db(db_path, 1).close()
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 16
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 17
     check.close()
     server = db.get_server_by_name("keep")
     assert server.connection_type is None and server.ssh_user == "ubuntu"

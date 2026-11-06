@@ -241,6 +241,11 @@ input[type="radio"], input[type="checkbox"] { accent-color: var(--primary); widt
 .tag-row input[name="tag_key"] { flex: 2; }
 .tag-row input[name="tag_value"] { flex: 3; }
 select { width: auto; padding: 6px 8px; }
+.paste-area { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.filter-form { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-3); align-items: flex-end; margin-bottom: var(--space-2); }
+.filter-form label { display: flex; flex-direction: column; gap: var(--space-1); font-weight: 600; font-size: 13px; }
+.filter-form input[type="text"] { width: 170px; }
+.filter-form input[type="date"] { padding: 6px 8px; font: inherit; color: var(--text); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
 .card form > input[type="text"] { display: block; max-width: 320px; margin: var(--space-1) 0 var(--space-3); }
 
 /* Server list */

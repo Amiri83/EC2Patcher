@@ -75,6 +75,12 @@ files of a plan you approved.
   (`sudo -n`).
 - **Connection type** per server: **SSH (direct)** or **SSH over SSM**, see
   [Connection types](#connection-types).
+- **Clone** (button on each server) opens the Add form pre-filled with the source's SSH user, login
+  type, connection type, AWS profile, region and all tags. Name, IP and PEM file are empty and
+  required; so is the instance ID when the clone connects over SSM (PEM applies to key login only,
+  and direct SSH has no instance ID). A stored password stays usable by the clone without being
+  shown: leave the field empty to give the new server its own encrypted copy, or type another.
+  Saving creates a new server; the source is not changed.
 
 ### Connection types
 
@@ -210,6 +216,45 @@ only. The latest accepted report is kept; a failed upload does not replace it.
 
 Each key must be a configured server name (an unknown server rejects the whole report); each
 value is an array of `CVE-YYYY-NNNN…` strings (case-insensitive, normalized and de-duplicated).
+
+### Paste import of a security list
+
+**Reports → Paste it as it is** takes the list as raw text, exactly as received: a chat table
+(`|`, `·`, bullets, non-breaking spaces) or plain lines, wrapped anywhere. Each record is
+comma-separated CVE IDs, then a host (`ip-10-0-0-1` or `ip-10-0-0-1.us-east-1.compute.internal`),
+then a title like `Ubuntu Security Notification for example-package Vulnerabilities (USN-0000-1)`.
+A new record starts at each run of CVE IDs; other columns and text are ignored, and a missing USN or
+title is fine. Records are de-duplicated on host, CVE and USN.
+
+**Preview** lists each record with its host, the saved server it matches (by name, else private
+IP), the CVE count and USNs. A host with no saved server, or a private IP several servers share, is
+flagged *unknown*; CVEs with no host in the text are dropped and listed. Nothing is stored yet.
+
+**Confirm and Load** generates the report JSON above from the matched records, makes it the latest
+report (**Download JSON** gives the same file, which can be uploaded again) and adds the rows to the
+patch report. Unknown hosts are left out: add the server and paste the list again.
+
+### Patch report
+
+**Patch Report** (`/patch-report`) has one row per server and CVE: hostname, server and tags, CVE,
+USN, package, title, Ubuntu priority (only if an analysis supplied one), status, package version
+before and after, imported at, patched at, run ID and error. Status is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Listed or found still open. |
+| `patched` | Verified by a patch (with *Patched at*), or found already fixed by an analysis (without). |
+| `failed` | The patch did not finish or was not verified; see Error. Stays until a patch succeeds or an analysis finds the CVE fixed. |
+| `not-affected` | Canonical says not affected, or the package is not installed. |
+| `reboot-required` | Patched, but the server still needs a reboot. |
+
+Rows come from the paste import and are kept up to date by every analysis and patch execution; an
+analysis of an uploaded report adds rows too (without USN or imported date). They outlive a deleted
+server and follow a renamed one. Filters (server, status, USN, CVE, exact date or date range, on the
+imported or patched day) are URL parameters and apply to the per-server summary and the export.
+
+**Export .xlsx** downloads the filtered rows: a `Details` sheet with the same columns and a `Summary`
+sheet with the counts per server, both with an autofilter and a frozen header.
 
 ### Analysis (read-only)
 

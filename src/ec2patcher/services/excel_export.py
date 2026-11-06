@@ -16,7 +16,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from ec2patcher.formatting import format_size, format_timestamp
-from ec2patcher.models import AnalysisRun, ServerAnalysis
+from ec2patcher.models import REPORT_STATUSES, AnalysisRun, PatchReportRow, ServerAnalysis
 from ec2patcher.services import analysis_service, cve_resolver, nvd
 from ec2patcher.services.severity import SEVERITIES, UNKNOWN
 
@@ -63,6 +63,25 @@ PLAN_COLUMNS = [
     ("Reboot Impact", 30),
     ("Plan Status", 12),
     ("Note", 50),
+]
+
+
+PATCH_REPORT_COLUMNS = [
+    ("Hostname", 40),
+    ("Server", 26),
+    ("Tags", 30),
+    ("CVE", 18),
+    ("USN", 16),
+    ("Package", 24),
+    ("Title", 60),
+    ("Ubuntu Priority", 15),
+    ("Status", 16),
+    ("Version Before", 26),
+    ("Version After", 26),
+    ("Imported At", 20),
+    ("Patched At", 20),
+    ("Run ID", 8),
+    ("Error", 60),
 ]
 
 
@@ -294,6 +313,43 @@ def _plan_rows(analysis: ServerAnalysis) -> list[list]:
         ]
         for p in analysis.plan
     ]
+
+
+def _when(value: str | None) -> str:
+    return format_timestamp(value) if value else ""
+
+
+def patch_report_filename() -> str:
+    return f"ec2patcher_patch_report_{datetime.now().strftime('%Y-%m-%d')}.xlsx"
+
+
+def build_patch_report_workbook(rows: list[PatchReportRow], summaries: list) -> bytes:
+    """The .xlsx bytes of the patch report: the rows given (``Details``) and their per-server
+    counts (``Summary``, from ``patch_report.summarize``)."""
+    wb = Workbook()
+    details = wb.active
+    details.title = "Details"
+    _table_sheet(
+        details,
+        PATCH_REPORT_COLUMNS,
+        [
+            [
+                r.hostname or "", r.server_name, ", ".join(r.tags), r.cve, r.usn or "",
+                r.package or "", r.title or "", r.priority or "", r.status, r.version_before or "",
+                r.version_after or "", _when(r.imported_at), _when(r.patched_at), r.run_id,
+                r.error or "",
+            ]
+            for r in rows
+        ],
+    )  # fmt: skip
+    _table_sheet(
+        wb.create_sheet("Summary"),
+        [("Server", 30), ("Total", 8), *((status.capitalize(), 16) for status in REPORT_STATUSES)],
+        [[s.server, s.total, *(s.counts[st] for st in REPORT_STATUSES)] for s in summaries],
+    )
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
 
 
 def _table_sheet(ws: Worksheet, columns: list[tuple[str, int]], rows: list[list]) -> None:

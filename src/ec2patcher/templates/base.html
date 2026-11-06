@@ -16,7 +16,8 @@
     </div>
     <nav class="nav">
       {% set items = [('dashboard', '/', 'Dashboard'), ('servers', '/servers', 'Servers'),
-                      ('reports', '/reports', 'Reports'), ('history', '/history', 'History'),
+                      ('reports', '/reports', 'Reports'), ('patch-report', '/patch-report', 'Patch Report'),
+                      ('history', '/history', 'History'),
                       ('settings', '/settings', 'Settings')] %}
       {% for key, href, label in items %}
         <a href="{{ href }}" class="nav-link{% if active == key %} active{% endif %}"
