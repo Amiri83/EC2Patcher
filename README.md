@@ -238,7 +238,8 @@ patch report. Unknown hosts are left out: add the server and paste the list agai
 
 **Patch Report** (`/patch-report`) has one row per server and CVE: hostname, server and tags, CVE,
 USN, package, title, Ubuntu priority (only if an analysis supplied one), status, package version
-before and after, imported at, patched at, run ID and error. Status is one of:
+before and after, imported at, patched at, run ID, error, and the source, KEV, EPSS and failure reason
+of the [CVE resolver](#cve-resolver). Status is one of:
 
 | Status | Meaning |
 | --- | --- |
@@ -278,9 +279,9 @@ Servers are analyzed one after another; one failure never affects the others.
   `Dir::State`, `Dir::Cache` and `Dir::Etc`, so the workstation's own APT is never used or
   changed. `apt-get -s` and `--print-uris` give exact versions, URIs, sizes and SHA256 without
   downloading anything.
-- **Canonical** (`https://ubuntu.com/security/cves/<CVE>.json`) decides applicability, fixed
-  version and status, per source package and Ubuntu release, with Debian version comparison.
-  Kernel CVEs are checked against the *running* kernel.
+- **Canonical's data** decides applicability, fixed version and status, per source package and
+  Ubuntu release, with Debian version comparison. It comes from the first source of the
+  [resolver](#cve-resolver) that answers. Kernel CVEs are checked against the *running* kernel.
 - **Amazon Linux 2023**: the repository `updateinfo.xml` (ALAS advisories) of the server's
   releasever and of the latest release is fetched on the workstation (via
   `cdn.amazonlinux.com` mirror lists) and compared with the installed rpm versions (EVR
@@ -298,6 +299,36 @@ Servers are analyzed one after another; one failure never affects the others.
 - Every run is stored as a snapshot (report, server facts, findings, plan); older runs stay
   viewable. **Export to Excel** builds an `.xlsx` (Summary, CVE Findings, Package Plan) from
   that snapshot only, without any network or SSH access.
+
+#### CVE resolver
+
+Needs no configuration. Each Ubuntu CVE is resolved by the first source that answers, in this order:
+
+| # | Source (as shown in reports) | What it is |
+| --- | --- | --- |
+| 1 | `oval` | Canonical's OVAL feed (`security-metadata.canonical.com/oval/com.ubuntu.<codename>.cve.oval.xml.bz2`), one file per release found on the run's servers, stored in SQLite, refreshed after 24 h. A corrupt or truncated download is discarded and the previous copy stays in use. CVEs are then answered locally, without a request per CVE. |
+| 2 | `notices` | USNs from `ubuntu.com/security/notices.json`: paged, stored, refreshed after 24 h. The first download may span several runs (each gives it up to 2 minutes). Also supplies the USN and title of the report: a CVE in several USNs keeps them all, and the report shows the one for the server's release, then the latest, then the highest number. |
+| 3 | `changelog` | `changelog.Debian.gz` of the package's candidate `.deb` on `security.ubuntu.com` (`ports.ubuntu.com` for arm64). The oldest entry mentioning the CVE is the fix version. Bounded per run, one read per package, and only for packages already linked to the CVE (pasted list, other releases, USNs). |
+| 4 | `cve-json` | The per-CVE `ubuntu.com/security/cves/<CVE>.json`, as a last resort, with a 5 s timeout. |
+
+When a run starts, every source (and NVD, KEV, EPSS) is probed in parallel with one small request.
+The progress panel shows one line per source; a blocked one is skipped for that run, with its reason
+recorded, while data already stored from it is still used. Circuit breakers are per source and
+endpoint, half-open with a doubling backoff and held in memory: a blocked `ubuntu.com` never disables
+`security.ubuntu.com`, NVD, KEV or EPSS.
+
+**Unresolved CVEs** are summed up as `Unresolved: N (reason: count, ...)`, each reason naming the
+source that failed. They do not block the resolved plan: patching one server or Patch All asks for an
+explicit confirmation of how many CVEs stay unresolved. An analysis error (a required package mapping
+failed) still blocks.
+
+**Priority only, never the status**: CISA's KEV catalogue (one file, cached 24 h) and FIRST's EPSS
+scores (batches of 50 CVEs, cached 24 h) join the NVD CVSS severity. They are best-effort and get at
+most 20 s per server; a failure only leaves the value empty.
+
+**Columns**: `Source`, `KEV` (yes/no) and `EPSS` (the score) are on the findings of the server report
+and the patch report; those two and the `.xlsx` sheets (`CVE Findings`, `Details`) also give the
+`Failure Reason` of unresolved CVEs.
 
 **Re-analyze and Retry**
 
@@ -395,8 +426,8 @@ failed server.
 - **Caches** (top of the page): one badge per cache (*NVD cache: <N> CVEs, oldest <age>, TTL
   <ttl>*, same for Canonical and Amazon updateinfo; blue when the latest analysis answered
   lookups from it, gray when unused or empty), the **Cache TTL** of each cache and **Clear
-  Security Cache**, which empties all three caches (`nvd_cache`, `cve_metadata_cache`,
-  `amazon_updateinfo_cache`) and the in-memory lookup state. TTLs are entered as hours (`24h`)
+  Security Cache**, which empties the caches (`nvd_cache`, `cve_metadata_cache`,
+  `amazon_updateinfo_cache`), the stored OVAL, USN, KEV and EPSS data and the in-memory lookup state. TTLs are entered as hours (`24h`)
   or days (`30d`), between 1 hour and 365 days, and stored in the database. Changing a TTL
   deletes nothing; expired entries are refreshed on their next lookup. The same badges appear
   next to the NVD API key badge on the Pre-Patch Analysis pages and link to this section.
@@ -423,6 +454,9 @@ it).
 - **Canonical** (`cve_metadata_cache`): reused for 24 h (1 h while a release is under
   investigation); older entries are refreshed and used as a marked fallback when ubuntu.com is
   unreachable.
+- **OVAL, USN notices, KEV, EPSS** (`oval_cve_packages`, `usn_notices`, `kev_cves`, `epss_scores`,
+  state in `source_feeds`): reused for 24 h, a fixed TTL; **Clear Security Cache** empties them too.
+  See [CVE resolver](#cve-resolver).
 - **Amazon updateinfo** (`amazon_updateinfo_cache`): per repository, reused for 24 h.
 - **NVD** (`nvd_cache`): raw CVSS metrics per CVE, reused for **30 days**; older entries are
   refreshed and used as a *stale cache* fallback when NVD is unreachable. Without any data the
@@ -473,9 +507,10 @@ them to another machine.
 - AWS CLI v2 and `session-manager-plugin` only for servers using
   [SSH over SSM](#connection-types)
 - Internet access to the Ubuntu archive (`archive.ubuntu.com` / `security.ubuntu.com`, or
-  `ports.ubuntu.com` for arm64), `ubuntu.com`, `cdn.amazonlinux.com` (Amazon Linux servers)
-  and `services.nvd.nist.gov` (optional: without it severities are Unknown).
-  `HTTPS_PROXY` / `NO_PROXY` are honoured.
+  `ports.ubuntu.com` for arm64), `security-metadata.canonical.com`, `ubuntu.com`,
+  `cdn.amazonlinux.com` (Amazon Linux servers), and optionally `services.nvd.nist.gov`, `www.cisa.gov`
+  and `api.first.org` (without them severity, KEV and EPSS stay empty). A blocked source is skipped,
+  see [CVE resolver](#cve-resolver). `HTTPS_PROXY` / `NO_PROXY` are honoured.
 
 ## Install
 

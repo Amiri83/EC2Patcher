@@ -27,7 +27,7 @@ from ec2patcher.models import (
     PatchReportRow,
     ServerAnalysis,
 )
-from ec2patcher.services import cve_resolver
+from ec2patcher.services import cve_resolver, usn_notices
 from ec2patcher.services import patch_state as ps
 from ec2patcher.services.security_list import MatchedRecord
 
@@ -110,13 +110,18 @@ def record_analysis(db: Database, analysis_id: int) -> None:
     analysis = db.get_server_analysis(analysis_id)
     if analysis is None:
         return
+    findings: dict[str, list] = {}
+    for finding in analysis.findings:
+        findings.setdefault(finding.cve, []).append(finding)
+    cves = list(dict.fromkeys([*analysis.reported_cves, *findings]))
+    # Read before the report's transaction starts. Only Ubuntu has USNs.
+    usns = {}
+    if analysis.os_id in (None, "ubuntu") and analysis.status == "complete":
+        usns = {cve: usn_notices.best_usn(db, cve, analysis.os_codename) for cve in cves}
 
     def merge(current: dict[str, PatchReportRow]) -> list[PatchReportRow]:
-        findings: dict[str, list] = {}
-        for finding in analysis.findings:
-            findings.setdefault(finding.cve, []).append(finding)
         rows = []
-        for cve in dict.fromkeys([*analysis.reported_cves, *findings]):
+        for cve in cves:
             row = current.get(cve) or PatchReportRow(analysis.server_name, cve)
             if row.run_id and row.run_id > analysis.run_id:
                 continue  # a follow-up on an older run does not overrule a newer one
@@ -124,6 +129,10 @@ def record_analysis(db: Database, analysis_id: int) -> None:
             row.hostname = row.hostname or analysis.remote_hostname
             row.run_id = analysis.run_id
             if analysis.status == "complete":
+                usn = usns.get(cve)
+                if usn is not None:  # what a pasted list says about the row stays
+                    row.usn = row.usn or usn.id
+                    row.title = row.title or usn.title
                 _apply_findings(row, findings.get(cve, []), analysis)
             else:  # the server could not be analyzed: what is known of the CVE has not changed
                 row.error = _short(analysis.error)
@@ -138,6 +147,11 @@ def _apply_findings(row: PatchReportRow, findings: list, analysis: ServerAnalysi
     installed = _join(f.installed_version for f in findings)
     row.priority = _join(f.priority for f in findings) or row.priority
     row.package = row.package or _join(f.source_package for f in findings)
+    row.source = _join(f.resolution_source for f in findings)
+    row.failure_reason = _short(_join(f.failure_reason for f in findings))
+    known_kev = [f.kev for f in findings if f.kev is not None]
+    row.kev = any(known_kev) if known_kev else row.kev
+    row.epss = max((f.epss for f in findings if f.epss is not None), default=row.epss)
     row.error = None
     if statuses and statuses <= NO_LONGER_AFFECTED:
         row.status, row.version_after = REPORT_NOT_AFFECTED, None

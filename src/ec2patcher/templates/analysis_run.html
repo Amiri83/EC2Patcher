@@ -25,6 +25,10 @@
         </form>
         <div class="muted small">Queries ubuntu.com again for the failed CVEs only and re-analyzes the servers that reported them.</div>
       {% endif %}</dd>
+    {% if run.source_probes %}
+    <dt>Security data sources</dt>
+    <dd class="source-probes">{% for p in run.source_probes %}<span class="badge {{ 'badge-success' if p.reachable else 'badge-warning' }}"{% if p.reason %} title="{{ p.reason }}"{% endif %}>{{ p.source }}{% if not p.reachable %}: blocked{% endif %}</span> {% endfor %}</dd>
+    {% endif %}
     <dt>Cache lookups</dt>
     <dd>{% set r = run %}{% include "_cache_stats.html" %}</dd>
   </dl>

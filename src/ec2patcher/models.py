@@ -95,6 +95,11 @@ class CveFindingRow:
     nvd_last_modified: str | None = None
     nvd_status: str | None = None
     nvd_note: str | None = None
+    # Which source resolved it, or why none did; KEV / EPSS rank it. All None before v19.
+    resolution_source: str | None = None
+    failure_reason: str | None = None
+    kev: bool | None = None
+    epss: float | None = None
 
     @property
     def severity(self) -> str:
@@ -312,6 +317,10 @@ class PatchReportRow:
     error: str | None = None
     updated_at: str | None = None
     tags: list[str] = field(default_factory=list)  # "key=value" of the server, when still saved
+    source: str | None = None  # the source that resolved the CVE (oval, notices, ...)
+    failure_reason: str | None = None  # why it is unresolved, with the source that failed
+    kev: bool | None = None  # in CISA's KEV catalogue; None: not known
+    epss: float | None = None
 
 
 @dataclass
@@ -337,6 +346,8 @@ class AnalysisRun:
     metadata_lookups: dict[str, str] = field(default_factory=dict)
     # Per cache (nvd / canonical / amazon): {"cache": n, "live": n, "failed": n} lookups.
     cache_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    # One per source probed at the start: {source, endpoint, reachable, reason, duration_ms}.
+    source_probes: list[dict] = field(default_factory=list)
 
     @property
     def is_running(self) -> bool:

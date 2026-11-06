@@ -96,6 +96,7 @@ class UbuntuAdapter(OsAdapter):
                     if cve_resolver.needs_candidate_check(f):
                         f.status = cve_resolver.ANALYSIS_ERROR
                         f.detail = f"APT candidate check failed: {exc}"
+                        f.failure_reason = "apt: candidate check failed"
             else:
                 requests = cve_resolver.apply_candidates(findings, candidates, facts)
 

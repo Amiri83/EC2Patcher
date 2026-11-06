@@ -46,6 +46,10 @@ CVE_COLUMNS = [
     ("Related Binary Package(s)", 40),
     ("NVD Lookup", 30),
     ("Detail", 60),
+    ("Source", 12),
+    ("KEV", 6),
+    ("EPSS", 8),
+    ("Failure Reason", 50),
 ]
 PLAN_COLUMNS = [
     ("Binary Package", 30),
@@ -82,6 +86,10 @@ PATCH_REPORT_COLUMNS = [
     ("Patched At", 20),
     ("Run ID", 8),
     ("Error", 60),
+    ("Source", 12),
+    ("KEV", 6),
+    ("EPSS", 8),
+    ("Failure Reason", 50),
 ]
 
 
@@ -121,6 +129,10 @@ def _set(ws: Worksheet, row: int, column: int, value):
     if cell.data_type == "f":  # never let stored text become a formula
         cell.data_type = "s"
     return cell
+
+
+def _kev(value: bool | None) -> str:
+    return "" if value is None else ("yes" if value else "no")
 
 
 def _yes_no_unknown(value: bool | None, yes: str, no: str) -> str:
@@ -262,7 +274,8 @@ def _cve_rows(analysis: ServerAnalysis) -> list[list]:
     for cve in dict.fromkeys(order):
         findings = by_cve.get(cve)
         if not findings:
-            rows.append([cve, UNKNOWN, *[""] * 11, NOT_ANALYZED_LABEL, "", "", ""])
+            not_analyzed = [cve, UNKNOWN, *[""] * 11, NOT_ANALYZED_LABEL, "", "", ""]
+            rows.append([*not_analyzed, "", "", None, "not analyzed"])
             continue
         for f in findings:
             lookup = nvd.STATUS_LABELS.get(f.nvd_status, f.nvd_status) if f.nvd_status else ""
@@ -287,6 +300,10 @@ def _cve_rows(analysis: ServerAnalysis) -> list[list]:
                     ", ".join(f.binary_packages),
                     lookup or "Not captured (analysis predates NVD severity)",
                     f.detail or "",
+                    f.resolution_source or "",
+                    _kev(f.kev),
+                    f.epss,
+                    f.failure_reason or "",
                 ]
             )
     return rows
@@ -337,7 +354,7 @@ def build_patch_report_workbook(rows: list[PatchReportRow], summaries: list) -> 
                 r.hostname or "", r.server_name, ", ".join(r.tags), r.cve, r.usn or "",
                 r.package or "", r.title or "", r.priority or "", r.status, r.version_before or "",
                 r.version_after or "", _when(r.imported_at), _when(r.patched_at), r.run_id,
-                r.error or "",
+                r.error or "", r.source or "", _kev(r.kev), r.epss, r.failure_reason or "",
             ]
             for r in rows
         ],

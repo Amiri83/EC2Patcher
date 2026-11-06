@@ -44,7 +44,12 @@ def userland_only():
     }
 
 
-def metadata_unavailable():
+def analysis_error():
+    finding = cr.Finding("CVE-2026-7", "zlib", cr.ANALYSIS_ERROR, "mapping failed")
+    return {"finding_list": [*findings(), finding]}
+
+
+def unresolved_cve():
     finding = cr.Finding("CVE-2026-7", None, cr.METADATA_UNAVAILABLE, "Canonical unreachable")
     return {"finding_list": [*findings(), finding]}
 
@@ -117,12 +122,12 @@ def test_queue_order_is_run_order_one_server_at_a_time(q):
 
 
 def test_ineligible_servers_are_skipped_not_patched(q):
-    run = q.run({"srv-a": metadata_unavailable(), "srv-c": unresolved_plan()})
+    run = q.run({"srv-a": analysis_error(), "srv-c": unresolved_plan()})
     queue = q.start(run)
     items = q.items(queue)
     assert queue.state == ps.QUEUE_COMPLETED
     assert items["srv-a"].status == ps.ITEM_SKIPPED and items["srv-a"].execution_id is None
-    assert "Canonical metadata unavailable" in items["srv-a"].detail
+    assert "package mapping failed" in items["srv-a"].detail
     assert items["srv-c"].status == ps.ITEM_SKIPPED
     assert "package download plan is unresolved" in items["srv-c"].detail
     assert items["srv-b"].status == ps.ITEM_SUCCESS
@@ -131,10 +136,20 @@ def test_ineligible_servers_are_skipped_not_patched(q):
 
 
 def test_queue_refused_when_nothing_is_eligible(q):
-    run = q.run({n: metadata_unavailable() for n in NAMES})
+    run = q.run({n: analysis_error() for n in NAMES})
     with pytest.raises(PatchNotAllowedError, match="No eligible servers"):
         q.start(run)
     assert q.fleet.log == [] and not q.service.is_running
+
+
+def test_queue_with_unresolved_cves_needs_their_number_confirmed(q):
+    run = q.run({"srv-a": unresolved_cve(), "srv-b": unresolved_cve()})
+    ids = [a.id for a in run.servers]
+    with pytest.raises(PatchNotAllowedError, match="leaves 2 CVEs unresolved"):
+        q.service.start_queue(run.id, ids, False)
+    assert q.fleet.log == [] and not q.service.is_running and q.db.latest_queue_id(run.id) is None
+    queue_id = q.service.start_queue(run.id, ids, False, acknowledged_unresolved=2)
+    assert q.db.get_patch_queue(queue_id).state == ps.QUEUE_COMPLETED
 
 
 def test_other_patch_blocked_while_queue_runs(q):
@@ -360,7 +375,7 @@ def web(q, db_path):
 
 def test_web_patch_all_flow(q, web):
     q.fake("srv-b").install_mode = "fail"
-    run = q.run({"srv-a": metadata_unavailable()})  # srv-a: SKIPPED
+    run = q.run({"srv-a": analysis_error()})  # srv-a: SKIPPED
     page = web.get(f"/analysis/{run.id}").text
     assert "Patch All" in page and f'action="/analysis/{run.id}/patch-all"' in page
     assert '<input type="checkbox" name="skip_reboot" value="1"> Skip reboot' in page  # unchecked
@@ -369,7 +384,7 @@ def test_web_patch_all_flow(q, web):
     eligible = confirm.split("patch-all-eligible")[1].split("</table>")[0]
     skipped = confirm.split("patch-all-skipped")[1].split("</table>")[0]
     assert "srv-b" in eligible and "srv-c" in eligible and "srv-a" not in eligible
-    assert "srv-a" in skipped and "SKIPPED" in skipped and "metadata unavailable" in skipped
+    assert "srv-a" in skipped and "SKIPPED" in skipped and "package mapping failed" in skipped
     assert "Patch 2 Servers" in confirm and "The queue stops at the first failure" in confirm
     assert q.fleet.log == []  # the confirmation page does nothing
 
@@ -444,7 +459,7 @@ def test_web_patch_all_refused_while_patch_running(q, web):
 
 
 def test_web_patch_all_button_hidden_when_nothing_eligible(q, web):
-    run = q.run({n: metadata_unavailable() for n in NAMES})
+    run = q.run({n: analysis_error() for n in NAMES})
     page = web.get(f"/analysis/{run.id}").text
     assert 'id="patch-all"' in page and "Nothing to patch" in page
     assert f'action="/analysis/{run.id}/patch-all"' not in page
@@ -454,7 +469,7 @@ def test_web_patch_all_button_hidden_when_nothing_eligible(q, web):
 
 
 def test_web_patch_all_button_shown_when_one_eligible(q, web):
-    run = q.run({"srv-a": metadata_unavailable(), "srv-c": unresolved_plan()})  # srv-b only
+    run = q.run({"srv-a": analysis_error(), "srv-c": unresolved_plan()})  # srv-b only
     page = web.get(f"/analysis/{run.id}").text
     assert f'action="/analysis/{run.id}/patch-all"' in page and ">Patch All</button>" in page
     assert '<input type="checkbox" name="skip_reboot" value="1"> Skip reboot' in page

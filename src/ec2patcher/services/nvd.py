@@ -493,6 +493,10 @@ class NvdClient:
         self._unreachable: str | None = None
         self._sources: dict[str, str] = {}  # CVE -> cache / live / failed, this run
 
+    def skip_for_run(self, reason: str) -> None:
+        """This run's probe found NVD blocked: use the cache only until the next start_run."""
+        self._unreachable = f"NVD unreachable: {reason}"
+
     def run_cache_stats(self) -> CacheStats:
         """Lookups since :meth:`start_run`: from cache (fresh or stale) / live / failed."""
         return CacheStats.from_sources(self._sources)

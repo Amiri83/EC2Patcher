@@ -115,6 +115,12 @@ class Finding:
     is_kernel: bool = False
     # NVD CVSS enrichment (analysis_service); never affects the status above.
     cvss: CvssResult | None = None
+    # The source that resolved it (oval, notices, changelog, cve-json, updateinfo), or why none did.
+    resolution_source: str | None = None
+    failure_reason: str | None = None
+    # KEV / EPSS enrichment (analysis_service): priority only, never affects the status either.
+    kev: bool | None = None
+    epss: float | None = None
 
     @property
     def status_label(self) -> str:
@@ -608,6 +614,19 @@ def expected_reboot(plan: list[PlanEntry]) -> tuple[bool, str]:
     return False, "No planned package is known to require a reboot."
 
 
+def mark_origin(findings: list[Finding], origin: str) -> None:
+    """Record the source behind each finding, or what that source could not say."""
+    for finding in findings:
+        if finding.status == UNKNOWN:
+            finding.failure_reason = f"{origin}: no usable statement for this release"
+        elif finding.status == METADATA_UNAVAILABLE:
+            finding.failure_reason = f"{origin}: data unavailable"
+        elif finding.status == ANALYSIS_ERROR:
+            finding.failure_reason = f"{origin}: analysis error"
+        else:
+            finding.resolution_source = origin
+
+
 def resolve_all(
     cves: list[str], lookup: Callable[[str], CveRecord | None], facts: ServerFacts
 ) -> list[Finding]:
@@ -622,6 +641,7 @@ def resolve_all(
                     source=None,
                     status=METADATA_UNAVAILABLE,
                     detail=f"Canonical metadata lookup failed: {exc}",
+                    failure_reason=getattr(exc, "failure_reason", None) or f"cve-json: {exc}",
                 )
             )
             continue
@@ -630,10 +650,20 @@ def resolve_all(
         except Exception as exc:  # noqa: BLE001 - one bad CVE must not break the server report
             findings.append(
                 Finding(
-                    cve=cve, source=None, status=ANALYSIS_ERROR, detail=f"Analysis error: {exc}"
+                    cve=cve,
+                    source=None,
+                    status=ANALYSIS_ERROR,
+                    detail=f"Analysis error: {exc}",
+                    failure_reason="analysis error",
                 )
             )
             continue
+        if record is None:
+            mark_origin(resolved, "cve-json")
+            for finding in resolved:
+                finding.failure_reason = "no source knows this CVE"
+        else:
+            mark_origin(resolved, record.origin)
         note = record.cache_note if record is not None else None
         if note:  # ubuntu.com was unreachable: say which verdicts rest on older data
             for finding in resolved:

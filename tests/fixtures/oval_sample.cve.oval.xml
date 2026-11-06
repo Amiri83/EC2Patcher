@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<oval_definitions xmlns="http://oval.mitre.org/XMLSchema/oval-definitions-5" xmlns:linux="http://oval.mitre.org/XMLSchema/oval-definitions-5#linux">
+  <definitions>
+    <definition class="inventory" id="oval:com.ubuntu.noble:def:100" version="1">
+      <metadata><title>Check that Ubuntu 24.04 LTS (noble) is installed.</title></metadata>
+      <criteria><criterion test_ref="oval:com.ubuntu.noble:tst:100" comment="The host is part of the unix family."/></criteria>
+    </definition>
+    <definition class="vulnerability" id="oval:com.ubuntu.noble:def:1" version="1">
+      <metadata>
+        <title>CVE-2000-0001 on Ubuntu 24.04 LTS (noble) - medium</title>
+        <reference source="CVE" ref_id="CVE-2000-0001" ref_url="https://ubuntu.com/security/CVE-2000-0001"/>
+        <advisory><severity>Medium</severity></advisory>
+      </metadata>
+      <criteria>
+        <extend_definition definition_ref="oval:com.ubuntu.noble:def:100" comment="Ubuntu 24.04 LTS (noble) is installed." applicability_check="true"/>
+        <criteria operator="OR">
+          <criterion test_ref="oval:com.ubuntu.noble:tst:1" comment="openssl package in noble was vulnerable but has been fixed (note: '3.0.13-0ubuntu3.6')."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:2" comment="curl package in noble, while related to the CVE in some way, is not affected (note: 'code not present')."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:3" comment="vim package in noble is affected and needs fixing."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:4" comment="sudo package in noble is affected and may need fixing."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:5" comment="bash package in noble is affected, but a decision has been made to defer addressing it (note: '2000-01-01')."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:6" comment="zlib package does not exist in noble."/>
+        </criteria>
+      </criteria>
+    </definition>
+    <definition class="vulnerability" id="oval:com.ubuntu.noble:def:2" version="1">
+      <metadata>
+        <title>CVE-2000-0002 on Ubuntu 24.04 LTS (noble) - high</title>
+        <reference source="CVE" ref_id="CVE-2000-0002"/>
+      </metadata>
+      <criteria>
+        <criterion test_ref="oval:com.ubuntu.noble:tst:7" comment="example-package package in noble was vulnerable but has been fixed."/>
+        <criterion test_ref="oval:com.ubuntu.noble:tst:8" comment="libxml2 package in noble was vulnerable and has been fixed, but no release version available for it."/>
+      </criteria>
+    </definition>
+  </definitions>
+  <tests>
+    <linux:dpkginfo_test id="oval:com.ubuntu.noble:tst:7" check="at least one" comment="example-package">
+      <linux:object object_ref="oval:com.ubuntu.noble:obj:7"/>
+      <linux:state state_ref="oval:com.ubuntu.noble:ste:7"/>
+    </linux:dpkginfo_test>
+  </tests>
+  <objects>
+    <linux:dpkginfo_object id="oval:com.ubuntu.noble:obj:7"><linux:name>example-package</linux:name></linux:dpkginfo_object>
+  </objects>
+  <states>
+    <linux:dpkginfo_state id="oval:com.ubuntu.noble:ste:7">
+      <linux:evr datatype="debian_evr" operation="less than">0:1.2.3-1ubuntu1</linux:evr>
+    </linux:dpkginfo_state>
+  </states>
+</oval_definitions>

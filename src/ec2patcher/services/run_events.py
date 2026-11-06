@@ -39,6 +39,8 @@ KIND_ANALYSIS, KIND_PATCH, KIND_QUEUE = "analysis", "patch", "queue"
 INFO, WARNING, ERROR = "info", "warning", "error"
 LEVELS = (INFO, WARNING, ERROR)
 
+# Of the run itself, before any server: one event per security data source probed.
+PROBE_SOURCES = "probe_sources"
 # Analysis steps, in order.
 RESOLVE_INSTANCE = "resolve_instance"
 SSM_CHECK = "ssm_check"
@@ -73,9 +75,10 @@ PATCH_PHASES = (
     SIMULATE, INSTALL, VERIFY_INSTALL, CLEANUP, REBOOT,
 )  # fmt: skip
 TERMINAL_PHASES = (DONE, FAILED, CANCELLED)
-PHASES = frozenset({*ANALYSIS_PHASES, *PATCH_PHASES, *TERMINAL_PHASES})
+PHASES = frozenset({PROBE_SOURCES, *ANALYSIS_PHASES, *PATCH_PHASES, *TERMINAL_PHASES})
 
 PHASE_LABELS = {
+    PROBE_SOURCES: "Probe sources",
     RESOLVE_INSTANCE: "Resolve instance ID",
     SSM_CHECK: "SSM check",
     OPEN_SSH: "Open SSH/SCP",

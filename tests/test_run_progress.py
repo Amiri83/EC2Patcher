@@ -991,7 +991,7 @@ def test_only_local_files_and_safe_rendering():
 
 def test_fresh_database_has_the_tables(db_path):
     db = Database(db_path)
-    assert version_of(db_path) == SCHEMA_VERSION == 18
+    assert version_of(db_path) == SCHEMA_VERSION == 19
     event_id = db.add_run_event("analysis", 1, "ip-10-0-0-1", "done", "text", "info", 5)
     row = db.list_run_events("analysis", 1)[0]
     assert (row["id"], row["server"], row["phase"]) == (event_id, "ip-10-0-0-1", "done")

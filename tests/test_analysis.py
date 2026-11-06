@@ -553,7 +553,7 @@ def test_analyze_button_only_after_valid_report(web, pem_file):
         page = c.get("/reports").text
         assert "Pre-Patch Analysis" in page and "Upload a valid report to enable analysis." in page
         assert 'action="/reports/analyze"' not in page
-        assert "Canonical security data is queried online per CVE" in page
+        assert "Each CVE is resolved by the first source that answers" in page
         assert "Upload &amp; Validate" not in page and ">Validate</button>" not in page
         # The upload auto-submits via app.js; the button is only a no-JS fallback.
         noscript = re.search(r"<noscript>(.*?)</noscript>", page, re.S)

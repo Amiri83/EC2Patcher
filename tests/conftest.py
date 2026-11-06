@@ -8,7 +8,14 @@ from phase2_fixtures import FakeApt
 from ec2patcher import config
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
-from ec2patcher.services import amazon_updateinfo, local_apt, nvd, security_metadata, ssm_plugin
+from ec2patcher.services import (
+    amazon_updateinfo,
+    local_apt,
+    nvd,
+    security_metadata,
+    source_http,
+    ssm_plugin,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +68,24 @@ def no_live_amazon_updateinfo(monkeypatch):
         raise OSError("network access to cdn.amazonlinux.com is disabled in tests")
 
     monkeypatch.setattr(amazon_updateinfo, "http_get", offline)
+
+
+@pytest.fixture(autouse=True)
+def no_live_sources(monkeypatch):
+    """Tests never reach the security data sources. Only the per-CVE JSON and NVD probe as
+    reachable: their own fake clients decide per test. To test a source, pass it a fake fetcher
+    (test_cve_sources.py)."""
+
+    def probe(url, timeout):
+        reachable = "/security/cves/" in url or "services.nvd.nist.gov" in url
+        return None if reachable else "network access is disabled in tests"
+
+    def offline(*args, **kwargs):
+        raise OSError("network access to the security data sources is disabled in tests")
+
+    monkeypatch.setattr(source_http, "probe", probe)
+    monkeypatch.setattr(source_http, "fetch_json", offline)
+    monkeypatch.setattr(source_http, "fetch_to_file", offline)
 
 
 @pytest.fixture(autouse=True)

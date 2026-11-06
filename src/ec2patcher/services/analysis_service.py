@@ -11,9 +11,11 @@ candidates and the upgrade plan (apt-get -s / --print-uris) are resolved on the 
 against a private APT state for the server's release and architecture (local_apt). Nothing
 is downloaded, copied, installed or restarted.
 
-Canonical's metadata alone decides applicability, fixed versions and statuses. NVD is only
-queried afterwards for the CVSS severity of the server's CVEs (each unique CVE once per run,
-shared by all servers); an NVD failure leaves the severity Unknown and nothing else changes.
+Canonical's data alone decides applicability, fixed versions and statuses; it comes from the
+first source that answers (cve_sources: OVAL, USN notices, changelog, per-CVE JSON), each probed
+once when the run starts. NVD is only queried afterwards for the CVSS severity of the server's
+CVEs (each unique CVE once per run, shared by all servers), KEV and EPSS for their priority; a
+failure of those leaves the value empty and nothing else changes.
 
 Each run records how many lookups of the NVD, Canonical and Amazon updateinfo caches were
 answered from the cache, live or failed (``cache_stats``; follow-ups add theirs).
@@ -29,7 +31,7 @@ import threading
 import weakref
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ec2patcher import config
@@ -46,6 +48,7 @@ from ec2patcher.services import (
     amazon_updateinfo,
     cache_settings,
     cve_resolver,
+    cve_sources,
     debversion,
     local_apt,
     nvd,
@@ -65,6 +68,7 @@ from ec2patcher.services.severity import SEVERITIES, UNKNOWN, normalize_severity
 logger = logging.getLogger(__name__)
 
 FACTS_TIMEOUT_SECONDS = 90
+ENRICHMENT_BUDGET_SECONDS = 20  # KEV and EPSS never hold a server up for longer than this
 DISPLAY_NAME_TAG = "display_name"
 UNSUPPORTED = os_adapters.UNSUPPORTED_STATUS  # OS without an adapter (not a failure)
 
@@ -106,11 +110,13 @@ class AnalysisService:
         advisories: amazon_updateinfo.UpdateInfoSource | None = None,
         credentials: secret_store.SecretStore | None = None,
         step_timeout: float | None = None,
+        sources: cve_sources.SourceResolver | None = None,
     ):
         self.db = db
         self.credentials = credentials or secret_store.SecretStore(db)  # encrypted passwords
         self.step_timeout = step_timeout  # None: the value saved in Settings
         self.metadata = metadata
+        self.sources = sources or cve_sources.SourceResolver(db, metadata)
         self.nvd = nvd_client or nvd.NvdClient(db)
         self.apt = apt or local_apt.LocalApt(
             config.get_apt_state_dir(config.get_data_dir()), config.get_apt_max_age()
@@ -244,6 +250,8 @@ class AnalysisService:
         self.apt.start_run()
         self.advisories.start_run()
         self.transports.start_run()
+        progress("Probing the security data sources")
+        self._probe_sources(run_id)
         failures = 0
         for index, analysis in enumerate(run.servers, start=1):
             if run_events.cancel_requested(self.db, _ref(run_id)):
@@ -276,6 +284,19 @@ class AnalysisService:
             progress_message=None,
         )
         logger.info("Analysis run %s finished (%d server failure(s))", run_id, failures)
+
+    def _probe_sources(self, run_id: int) -> None:
+        """Probe every source once (the clients' start_run came first): one event per source, and
+        a blocked one is skipped for this run."""
+        steps = self._steps(run_id)
+        results = self.sources.start_run()
+        for result in results:
+            level = run_events.INFO if result.reachable else run_events.WARNING
+            steps.record(run_events.PROBE_SOURCES, result.message, level, result.duration_ms)
+        blocked = self.sources.blocked(cve_sources.NVD)
+        if blocked:
+            self.nvd.skip_for_run(blocked)
+        self.db.update_analysis_run(run_id, source_probes=[r.as_dict() for r in results])
 
     def _finish_cancelled(self, run_id: int, servers: list, overall: run_events.Steps) -> None:
         """Finished servers keep their results; the ones not reached are marked as such."""
@@ -385,6 +406,7 @@ class AnalysisService:
         self.apt.start_run()
         self.advisories.start_run()
         self.transports.start_run()
+        self._probe_sources(run_id)
 
         def lookup(cve: str):
             if cve.strip().upper() in failed:
@@ -460,6 +482,7 @@ class AnalysisService:
         self.apt.start_run()
         self.advisories.start_run(force_refresh=True)
         self.transports.start_run()
+        self._probe_sources(run_id)
         label = analysis.server_name
 
         def progress(message: str) -> None:
@@ -688,6 +711,7 @@ class AnalysisService:
 
         def lookups_done(findings: list) -> None:
             self._enrich_severity(findings, progress, steps, lookups)
+            self._enrich_priority(findings, lookups)
             lookups.finish(self._lookup_summary())
             current.append(steps.begin(run_events.COMPUTE_FIXES, "Computing the fix versions"))
 
@@ -696,15 +720,18 @@ class AnalysisService:
             packages=steps.guarded(self.apt, run_events.COMPUTE_FIXES),
             progress=report,
             record=lambda **fields: self.db.update_server_analysis(analysis.id, **fields),
-            lookup=self._reported_lookup(analysis, steps, lookups, progress, lookup),
+            lookup=self._reported_lookup(analysis, facts, steps, lookups, progress, lookup),
             advisories=steps.guarded(self.advisories, run_events.LOOKUPS),
             lookups_done=lookups_done,
         )
         try:
+            if adapter.os_id == os_adapters.DEFAULT.os_id:
+                self.sources.prepare(facts.codename, lookups.note, steps.check_cancelled)
             assessment = adapter.assess(facts, analysis.reported_cves, context)
             if len(current) == 1:  # this adapter had nothing to look up
                 lookups_done(assessment.findings)
             self._enrich_severity(assessment.findings, progress, steps, current[-1])
+            self._enrich_priority(assessment.findings, current[-1])
         except run_events.RunCancelled:
             current[-1].finish()
             raise
@@ -716,10 +743,12 @@ class AnalysisService:
         )
         return assessment
 
-    def _reported_lookup(self, analysis, steps, step, progress, lookup):
-        """The Canonical lookup with its step event ("CVE-2000-0001 (3 of 12): cache hit"), the
-        step timeout and the cancel check between two CVEs."""
+    def _reported_lookup(self, analysis, facts, steps, step, progress, lookup):
+        """The resolver's lookup with its step event ("CVE-2000-0001 (3 of 12): resolved by
+        oval"), the step timeout and the cancel check between two CVEs. ``lookup`` replaces the
+        per-CVE lookup at the end of the chain (a retry forces only the failed CVEs)."""
         base = lookup or self.metadata.lookup
+        hints = self._package_hints(analysis)
         total = len(analysis.reported_cves)
         count = 0
 
@@ -730,15 +759,30 @@ class AnalysisService:
             steps.check_cancelled()
             progress(f"Canonical lookup of {label}")
             before = self.metadata.run_cache_stats()
+            packages = hints.get(cve, ())
             try:
-                record = steps.guard(lambda: base(cve), run_events.LOOKUPS)
+                record = steps.guard(
+                    lambda: self.sources.lookup(cve, facts, base, packages), run_events.LOOKUPS
+                )
             except Exception as exc:
                 step.note(f"{label}: lookup failed: {exc}", run_events.WARNING)
                 raise
-            step.note(f"{label}: {_lookup_source(before, self.metadata.run_cache_stats())}")
+            if record is not None and record.origin != cve_sources.CVE_JSON:
+                step.note(f"{label}: resolved by {record.origin}")
+            else:
+                step.note(f"{label}: {_lookup_source(before, self.metadata.run_cache_stats())}")
             return record
 
         return reported
+
+    def _package_hints(self, analysis) -> dict[str, tuple[str, ...]]:
+        """CVE -> the packages a pasted security list names for it, for the changelog search."""
+        try:
+            rows = self.db.list_patch_report(server=analysis.server_name)
+        except Exception as exc:  # noqa: BLE001 - only a hint
+            logger.warning("Cannot read the package hints of %s: %s", analysis.server_name, exc)
+            return {}
+        return {r.cve: tuple(r.package.replace(",", " ").split()) for r in rows if r.package}
 
     def _lookup_summary(self) -> str:
         """Cache hits, misses and API calls of this run so far, from the run's own tallies."""
@@ -792,6 +836,26 @@ class AnalysisService:
                 if f.cve == cve:
                     f.cvss = result
 
+    def _enrich_priority(self, findings: list, step: run_events.Step) -> None:
+        """Attach KEV and EPSS to the findings, as far as they can be had in a bounded time and
+        from what is cached. Statuses and plans are never touched, and nothing here can fail."""
+        cves = list(dict.fromkeys(f.cve for f in findings))
+        if not cves:
+            return
+        try:
+            run_events.run_with_timeout(
+                lambda: self.sources.refresh_enrichment(cves),
+                ENRICHMENT_BUDGET_SECONDS,
+                "KEV/EPSS enrichment",
+            )
+        except (Exception, run_events.StepTimeoutError) as exc:
+            logger.warning("KEV/EPSS enrichment incomplete: %s", exc)
+            step.note(f"KEV/EPSS enrichment incomplete: {exc}", run_events.WARNING)
+        try:
+            self.sources.annotate(findings)
+        except Exception as exc:  # noqa: BLE001 - enrichment must never break analysis
+            logger.warning("Could not attach KEV/EPSS: %s", exc)
+
 
 def _lookup_source(before: CacheStats, after: CacheStats) -> str:
     """Where one lookup's answer came from, by what it added to the run's tallies. Without an
@@ -824,6 +888,14 @@ class RemediationGroup:
     pockets: list[str]
     rows: list
     highest_row: object
+    resolution_sources: list[str] = field(default_factory=list)
+    failure_reasons: list[str] = field(default_factory=list)
+    kev: bool | None = None  # any CVE of the group is listed; None: not known
+    epss: float | None = None  # the highest score of the group
+
+    @property
+    def kev_label(self) -> str:
+        return "" if self.kev is None else ("yes" if self.kev else "no")
 
 
 def _oldest(versions: list[str]) -> str:
@@ -868,6 +940,8 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
         newer_release = cve_resolver.NEWER_RELEASEVER_REQUIRED in (detail or "")
         if status == cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS and not newer_release:
             detail = "The configured repositories do not offer the fixed version."
+        known_kev = [f.kev for f in rows if f.kev is not None]
+        scores = [f.epss for f in rows if f.epss is not None]
         result.append(
             RemediationGroup(
                 source=first.source_package,
@@ -888,6 +962,10 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
                 pockets=sorted({f.pocket for f in rows if f.pocket}),
                 rows=rows,
                 highest_row=highest,
+                resolution_sources=sorted({f.resolution_source or "" for f in rows} - {""}),
+                failure_reasons=sorted({f.failure_reason or "" for f in rows} - {""}),
+                kev=any(known_kev) if known_kev else None,
+                epss=max(scores) if scores else None,
             )
         )
     return result
