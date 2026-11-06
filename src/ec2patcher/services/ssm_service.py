@@ -14,13 +14,13 @@ Credentials stay in the aws CLI's own configuration: nothing here reads, stores 
 import ipaddress
 import json
 import logging
-import os
 import re
 import subprocess  # noqa: S404 - runs the aws CLI as an argument list
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ec2patcher.models import CONNECTION_SSH, CONNECTION_SSM, CONNECTION_TYPES
+from ec2patcher.services import ssm_plugin
 from ec2patcher.validation import check_aws_profile, check_aws_region, check_instance_id
 
 logger = logging.getLogger(__name__)
@@ -28,10 +28,11 @@ logger = logging.getLogger(__name__)
 Runner = Callable[..., subprocess.CompletedProcess]
 
 AWS_BINARY = "aws"
-PLUGIN_BINARY = "session-manager-plugin"
+PLUGIN_BINARY = ssm_plugin.PLUGIN_BINARY
 SSM_DOCUMENT = "AWS-StartSSHSession"
 DEFAULT_SSH_PORT = 22  # what ssh connects to when no port is configured
 AWS_TIMEOUT_SECONDS = 30
+CREDENTIALS_CHECK = "The AWS credentials check"
 
 DEFAULT_CONNECTION_SETTING = "default_connection_type"
 DEFAULT_PROFILE_SETTING = "default_aws_profile"
@@ -41,8 +42,8 @@ AWS_MISSING = (
     "The 'aws' command was not found. Install AWS CLI v2 on this machine to use SSH over SSM."
 )
 PLUGIN_MISSING = (
-    "The 'session-manager-plugin' command was not found. Install the Session Manager plugin "
-    "for the AWS CLI on this machine to use SSH over SSM."
+    "The 'session-manager-plugin' command was not found. Use Install SSM plugin in Settings "
+    "(no sudo needed) to use SSH over SSM."
 )
 
 _HOST_IP_RE = re.compile(r"ip-(\d{1,3})-(\d{1,3})-(\d{1,3})-(\d{1,3})(\..*)?", re.IGNORECASE)
@@ -143,8 +144,13 @@ def describe_aws_error(stderr: str, profile: str) -> str | None:
         return PLUGIN_MISSING
     if re.search(r"\baws: (command )?not found", lower):
         return AWS_MISSING
+    if "provided region_name" in lower or "invalid endpoint" in lower:
+        return "The AWS region is not valid. Check the region in Settings or on this server."
     if "could not connect to the endpoint url" in lower or "connect timeout on endpoint" in lower:
-        return "AWS could not be reached from this machine. Check the network and HTTPS_PROXY."
+        return (
+            "AWS could not be reached from this machine. Check the network, HTTPS_PROXY and the "
+            "AWS region."
+        )
     return None
 
 
@@ -176,7 +182,7 @@ def _run(command: list[str], runner: Runner, missing: str, action: str):
             timeout=AWS_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             check=False,
-            env={**os.environ, "AWS_PAGER": ""},
+            env=ssm_plugin.aws_env(),  # finds the app-managed plugin too
         )
     except FileNotFoundError:
         raise SsmError(missing) from None
@@ -193,12 +199,16 @@ def preflight(profile: str, region: str, runner: Runner = subprocess.run) -> Non
         proc = _run([binary, "--version"], runner, missing, f"'{binary} --version'")
         if proc.returncode != 0:
             raise SsmError(f"'{binary} --version' failed (exit {proc.returncode}).")
-    proc = _run(
-        [AWS_BINARY, "sts", "get-caller-identity", "--profile", profile, "--region", region],
-        runner, AWS_MISSING, "The AWS credentials check",
-    )  # fmt: skip
+    proc = _caller_identity(profile, region, runner)
     if proc.returncode != 0:
-        raise SsmError(_failure(proc.stderr or "", profile, "The AWS credentials check"))
+        raise SsmError(_failure(proc.stderr or "", profile, CREDENTIALS_CHECK))
+
+
+def _caller_identity(profile: str, region: str, runner: Runner):
+    return _run(
+        [AWS_BINARY, "sts", "get-caller-identity", "--profile", profile, "--region", region],
+        runner, AWS_MISSING, CREDENTIALS_CHECK,
+    )  # fmt: skip
 
 
 def private_ip_for(name: str, ip_address: str) -> str | None:
@@ -351,6 +361,87 @@ def connection_view(db, server) -> dict:
         if cached:
             view["instance_id"], view["instance_source"] = cached, "resolved"
     return view
+
+
+# --- status shown in Settings -------------------------------------------------------------
+
+
+PROFILE_OK = "ok"
+PROFILE_SSO_EXPIRED = "sso_expired"
+PROFILE_FAILED = "failed"
+PROFILE_NOT_CHECKED = "not_checked"
+
+
+@dataclass(frozen=True)
+class ToolStatus:
+    found: bool
+    version: str | None = None
+    path: str | None = None
+    managed: bool = False  # the plugin in the app-managed directory
+
+
+@dataclass(frozen=True)
+class ProfileStatus:
+    state: str
+    message: str
+    profile: str | None = None
+    region: str | None = None
+    hint: str | None = None  # the command that repairs it
+
+
+@dataclass(frozen=True)
+class SsmStatus:
+    plugin: ToolStatus
+    aws: ToolStatus
+    profile: ProfileStatus
+
+
+def _plugin_status(runner: Runner) -> ToolStatus:
+    location = ssm_plugin.find_plugin()
+    if location is None:
+        return ToolStatus(False)
+    version = ssm_plugin.version_of(location.path, runner)
+    return ToolStatus(version is not None, version, str(location.path), location.managed)
+
+
+def _aws_status(runner: Runner) -> ToolStatus:
+    try:
+        proc = _run([AWS_BINARY, "--version"], runner, AWS_MISSING, "'aws --version'")
+    except SsmError:
+        return ToolStatus(False)
+    if proc.returncode != 0:
+        return ToolStatus(False)
+    # aws-cli/2.x.y Python/... : only the first word is the CLI's version.
+    words = f"{proc.stdout or ''} {proc.stderr or ''}".split()
+    return ToolStatus(True, words[0][:64] if words else None)
+
+
+def _profile_status(defaults: ConnectionDefaults, aws_found: bool, runner: Runner) -> ProfileStatus:
+    profile, region = defaults.profile, defaults.region
+    if not profile or not region:
+        message = "Set the default AWS profile and region above to check them."
+        return ProfileStatus(PROFILE_NOT_CHECKED, message, profile, region)
+    if not aws_found:
+        return ProfileStatus(PROFILE_NOT_CHECKED, "Needs the AWS CLI.", profile, region)
+    try:
+        proc = _caller_identity(profile, region, runner)
+    except SsmError as exc:
+        return ProfileStatus(PROFILE_FAILED, str(exc), profile, region)
+    if proc.returncode == 0:  # the identity it answers with is neither kept nor shown
+        return ProfileStatus(PROFILE_OK, "Profile OK", profile, region)
+    stderr = proc.stderr or ""
+    if is_sso_expired(stderr):
+        login = f"aws sso login --profile {profile}"
+        return ProfileStatus(PROFILE_SSO_EXPIRED, "SSO expired", profile, region, login)
+    message = _failure(stderr, profile, CREDENTIALS_CHECK)
+    return ProfileStatus(PROFILE_FAILED, message, profile, region)
+
+
+def check_status(db, runner: Runner = subprocess.run) -> SsmStatus:
+    """The plugin, the aws CLI and the default profile. This runs them, so pages load it apart."""
+    aws = _aws_status(runner)
+    profile = _profile_status(load_defaults(db), aws.found, runner)
+    return SsmStatus(_plugin_status(runner), aws, profile)
 
 
 # --- one server's transport ------------------------------------------------------------

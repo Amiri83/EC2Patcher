@@ -72,6 +72,16 @@
     showConnectionFields();
   }
 
+  // Settings: the SSM status runs the aws CLI, so it loads after the page. The Check now link
+  // does the same without JavaScript.
+  var ssmStatus = document.querySelector("[data-ssm-status-url]");
+  if (ssmStatus) {
+    fetch(ssmStatus.getAttribute("data-ssm-status-url"))
+      .then(function (response) { return response.ok ? response.text() : Promise.reject(); })
+      .then(function (html) { ssmStatus.innerHTML = html; })
+      .catch(function () { ssmStatus.textContent = "The status could not be loaded. Use Check now."; });
+  }
+
   // Report upload: submit as soon as a file is picked or dropped (the <noscript>
   // button covers the no-JS case). The dropzone is locked while uploading so the
   // report cannot be submitted twice.

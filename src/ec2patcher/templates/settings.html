@@ -58,7 +58,7 @@
 </div>
 <div class="card form-card" id="connection">
   <h2>Connection</h2>
-  <p class="muted">How servers without their own connection type are reached. SSH over SSM runs the same ssh and scp through <code>aws ssm start-session</code> as ProxyCommand; it needs the AWS CLI and the Session Manager plugin on this machine. AWS credentials stay in the AWS CLI configuration; only the profile name is stored here.</p>
+  <p class="muted">How servers without their own connection type are reached. SSH over SSM runs the same ssh and scp through <code>aws ssm start-session</code> as ProxyCommand; it needs the AWS CLI on this machine and the Session Manager plugin, which can be installed from here without sudo. AWS credentials stay in the AWS CLI configuration; only the profile name is stored here.</p>
   <form method="post" action="/settings/connection">
     <div class="field{% if connection_errors.connection_type %} has-error{% endif %}">
       <label for="default_connection_type">Default connection type</label>
@@ -81,10 +81,23 @@
     </div>
     <div class="form-actions">
       <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
-      <button type="submit" name="action" value="apply_all" class="btn btn-secondary" title="Also clears the connection type set on individual servers">Save and switch all servers</button>
+      <button type="submit" name="action" value="apply_all" class="btn btn-secondary" title="Also clears the connection type, AWS profile and region set on individual servers">Apply to all servers</button>
     </div>
-    <div class="hint">Save changes the servers that follow the default. Save and switch all servers also clears the connection type set on individual servers.</div>
+    <div class="hint">Save changes the servers that follow the default. Apply to all servers also clears the connection type, AWS profile and region set on individual servers; manual instance IDs are kept.</div>
   </form>
+  <h3>SSH over SSM status</h3>
+  <div id="ssm-status"{% if not ssm_status %} data-ssm-status-url="/settings/ssm-status"{% endif %}>
+    {% include "_ssm_status.html" %}
+  </div>
+  <div class="form-actions">
+    <a href="/settings?ssm_check=1#connection" class="btn btn-secondary">Check now</a>
+    {% if not ssm_plugin_location or ssm_plugin_location.managed %}
+    <form method="post" action="/settings/ssm-plugin/install" class="inline">
+      <button type="submit" class="btn {{ 'btn-secondary' if ssm_plugin_location else 'btn-primary' }}">{{ "Update SSM plugin" if ssm_plugin_location else "Install SSM plugin" }}</button>
+    </form>
+    {% endif %}
+  </div>
+  <div class="hint">Install SSM plugin downloads the official Ubuntu package from AWS, verifies it and keeps its program in <code>{{ ssm_plugin_dir }}</code>. No sudo; nothing else on this machine changes.</div>
 </div>
 <div class="card form-card" id="nvd-key">
   <h2>NVD API Key</h2>

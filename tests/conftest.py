@@ -8,7 +8,7 @@ from phase2_fixtures import FakeApt
 from ec2patcher import config
 from ec2patcher.app import create_app
 from ec2patcher.database import Database
-from ec2patcher.services import amazon_updateinfo, local_apt, nvd, security_metadata
+from ec2patcher.services import amazon_updateinfo, local_apt, nvd, security_metadata, ssm_plugin
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +59,16 @@ def no_live_amazon_updateinfo(monkeypatch):
         raise OSError("network access to cdn.amazonlinux.com is disabled in tests")
 
     monkeypatch.setattr(amazon_updateinfo, "http_get", offline)
+
+
+@pytest.fixture(autouse=True)
+def no_live_plugin_download(monkeypatch):
+    """Tests never download the Session Manager plugin; pass a fake fetcher to test installing."""
+
+    def offline(url, out, max_bytes, timeout):
+        raise OSError("network access to the plugin download is disabled in tests")
+
+    monkeypatch.setattr(ssm_plugin, "default_fetcher", offline)
 
 
 @pytest.fixture

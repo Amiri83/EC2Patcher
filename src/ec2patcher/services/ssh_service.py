@@ -10,6 +10,9 @@ child process - never from the command line, a plain-text file or a log.
 
 Over SSM (services.ssm_service) the invocation is the same plus one ProxyCommand option; the
 login method and everything built on these functions do not change.
+
+This module is the only place that builds an ssh or scp command line (a test enforces it), and
+``_proxy_options`` the only place that decides between the direct and the SSM transport.
 """
 
 import logging
@@ -20,7 +23,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ec2patcher.models import AUTH_PASSWORD, DEFAULT_SSH_USER
-from ec2patcher.services import ssm_service
+from ec2patcher.services import ssm_plugin, ssm_service
 from ec2patcher.services.secret_store import SecretError
 from ec2patcher.services.ssm_service import SsmTarget
 from ec2patcher.validation import (
@@ -159,11 +162,13 @@ def _auth_prefix(binary: str, pem_path: str, password: str | None) -> list[str]:
     return [SSHPASS_BINARY, "-e", binary, *PASSWORD_SSH_OPTIONS]
 
 
-def _run_kwargs(password: str | None) -> dict:
-    """Extra subprocess arguments: the SSHPASS environment for password login."""
-    if password is None:
-        return {}
-    return {"env": {**os.environ, SSHPASS_ENV: password}}
+def _run_kwargs(password: str | None, ssm: SsmTarget | None) -> dict:
+    """Extra subprocess arguments: the SSHPASS environment for password login, and over SSM the
+    PATH with which the ProxyCommand finds aws and the app-managed plugin."""
+    env: dict[str, str] = ssm_plugin.aws_env() if ssm is not None else {}
+    if password is not None:
+        env = {**(env or os.environ), SSHPASS_ENV: password}
+    return {"env": env} if env else {}
 
 
 def _connection_error(stderr: str, password: str | None, ssm: SsmTarget | None) -> str:
@@ -285,7 +290,7 @@ def run_scp(
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             check=False,
-            **_run_kwargs(password),
+            **_run_kwargs(password, ssm),
         )
     except subprocess.TimeoutExpired:
         return RemoteResult(ok=False, error=f"The file transfer did not finish within {timeout}s.")
@@ -377,7 +382,7 @@ def run_remote(
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             check=False,
-            **_run_kwargs(password),
+            **_run_kwargs(password, ssm),
         )
     except subprocess.TimeoutExpired:
         return RemoteResult(ok=False, error=f"The remote command did not finish within {timeout}s.")
@@ -438,7 +443,7 @@ def check_connection(
             timeout=PROCESS_TIMEOUT_SECONDS,
             stdin=subprocess.DEVNULL,
             check=False,
-            **_run_kwargs(password),
+            **_run_kwargs(password, ssm),
         )
     except subprocess.TimeoutExpired:
         result.error = "Connection timed out. The server did not respond in time."
