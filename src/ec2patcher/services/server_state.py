@@ -237,7 +237,15 @@ def dpkg_blocker(facts: ServerFacts) -> str | None:
         return None
     names = audit_packages(facts.dpkg_audit)
     detail = ", ".join(names) if names else "; ".join(facts.dpkg_audit)[:500]
-    return f"{DPKG_BLOCKER} on the server, then re-analyze it. dpkg --audit reports: {detail}."
+    message = f"{DPKG_BLOCKER} on the server, then re-analyze it. dpkg --audit reports: {detail}."
+    if any("permission denied" in line.lower() for line in facts.dpkg_audit):
+        # dpkg needs its lock to replay an interrupted transaction, which a non-root
+        # analysis cannot take: the audit itself is the symptom of an unfinished install.
+        message += (
+            " dpkg could not even be checked without root: a package installation was "
+            "interrupted (for example a failed patch) and has not been finished yet."
+        )
+    return message
 
 
 def check_supported(facts: ServerFacts) -> str | None:

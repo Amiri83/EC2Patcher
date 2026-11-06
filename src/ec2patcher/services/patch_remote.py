@@ -268,11 +268,16 @@ def check_simulation(result: AptResult, expected: dict[tuple[str, str], tuple]) 
 
 
 def post_install_command(packages: list[str]) -> str:
-    """Read-only: package versions, dpkg health, reboot-required, package manager still busy."""
+    """Read-only: package versions, dpkg health, reboot-required, package manager still busy.
+
+    ``dpkg --audit`` runs as root (``sudo -n``, already required for patching): after an
+    interrupted install a non-root audit fails with "Permission denied" on dpkg's lock
+    instead of listing the unconfigured packages."""
     names = " ".join(_q(n) for n in _package_names(sorted(set(packages))))
     return (
         f"echo '{MARK}dpkg'; dpkg-query -W -f='{QUERY_FORMAT}' -- {names} 2>/dev/null; "
-        f"echo '{MARK}audit'; dpkg --audit 2>&1; echo '{MARK}audit-rc'; echo $?; "
+        f"echo '{MARK}audit'; sudo -n dpkg --audit 2>&1 </dev/null; "
+        f"echo '{MARK}audit-rc'; echo $?; "
         f"echo '{MARK}reboot'; if [ -e /run/reboot-required ]; then echo yes; "
         "cat /run/reboot-required.pkgs 2>/dev/null; else echo no; fi; "
         f"echo '{MARK}busy'; if pgrep -x dpkg >/dev/null || pgrep -x apt-get >/dev/null; "

@@ -146,3 +146,19 @@ def test_build_plan_skips_same_version_debs():
     assert [e.package for e in plan] == ["openssl"]
     assert cr.already_at_target(download) == ["curl 0:8.5.0-2ubuntu10.6"]
     assert cr.same_version("1.0", "0:1.0") and not cr.same_version(None, "1.0")
+
+
+def test_dpkg_audit_permission_denied_explains_an_interrupted_install():
+    denied = [
+        "dpkg: error: unable to check lock file for dpkg database directory /var/lib/dpkg: "
+        "Permission denied"
+    ]
+    message = server_state.dpkg_blocker(server_state.parse_facts(facts_output(audit=denied)))
+    assert message.startswith(server_state.DPKG_BLOCKER)
+    assert "Permission denied" in message and "installation was interrupted" in message
+
+
+def test_post_install_audit_runs_as_root_and_analysis_stays_without_sudo():
+    from ec2patcher.services import patch_remote
+
+    assert "sudo -n dpkg --audit" in patch_remote.post_install_command(["openssl"])
