@@ -728,7 +728,7 @@ def version_of(db_path):
 
 def test_fresh_database_has_the_table(db_path):
     db = Database(db_path)
-    assert version_of(db_path) == SCHEMA_VERSION == 17
+    assert version_of(db_path) == SCHEMA_VERSION == 18
     db.create_server("keep", "10.0.0.1", "/k.pem")
     seed(db, "keep", C1)
     assert [r.cve for r in db.list_patch_report()] == [C1]

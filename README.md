@@ -343,8 +343,55 @@ analyzed again after this run is patched from its latest analysis. Servers are p
 at a time** with the pipeline above; the queue **stops at the first failure** and the rest are
 shown as **NOT RUN**. Only one patch execution or queue runs at a time.
 
+### Live progress, cancel and the step timeout
+
+Analysis runs and patch runs write each step to the `run_events` table as they go. **Show
+progress** on the run page opens a drawer (it also opens by itself when a run starts) with:
+
+- the step list per server (spinner, check or cross, elapsed time, the current step in bold), and
+  a progress bar per server and overall (servers and CVEs done / total);
+- for a failed step, the real error text and a hint by cause (SSM, expired AWS SSO session with
+  its `aws sso login --profile <profile>`, SSH login); never a traceback or a secret;
+- a log tail that follows the run, with **Pause**;
+- **Hide**, or Escape: the run keeps going and a small badge with the done / total count reopens
+  the drawer. The open and paused state survives a page refresh while the run is going;
+- **Cancel**, after a confirmation.
+
+Analysis steps: resolve instance ID, SSM check, open SSH/SCP, detect OS/release, list installed
+packages, map CVEs to packages, Canonical/NVD/Amazon lookups (each CVE as `CVE-2000-0001 (3 of
+12)`, then the cache hits, misses and API calls), compute fix versions, then done or failed. Patch
+runs share the first two and then follow the pipeline above. Without JavaScript the pages keep
+their automatic refresh and show no drawer.
+
+**Events endpoint**: `GET /runs/<run>/events?after=<last id>` answers JSON: `events` (`id`, `ts`,
+`server`, `phase`, `phase_label`, `message`, `level`, `duration_ms`, `hint`), `next` (pass it as
+`after`), `more`, `status`, `done`, `cancelled`, `cancel_requested`, `started_at`, `finished_at`,
+`servers`, `servers_done`, `servers_total`, `cves_done`, `cves_total` and `phases`. `<run>` is an
+analysis run (`12`), a single patch execution (`patch-12`) or a Patch All queue (`queue-3`); a
+patch execution of a queue reports to its queue. An unknown run answers 404 with a JSON error and
+a bad `after` (not a whole number, or negative) answers 422.
+
+**Cancel**: `POST /runs/<run>/cancel` records the request in the database, so it survives a
+restart; the run stops after its current step and ends as `cancelled`, not failed. Finished servers
+keep their results and the others are marked cancelled. Cancelling a finished run, or twice, is a
+no-op that says so. Patching is stricter, as it is never left half done: a cancel is honoured only
+before the install starts, and after that the install is finished and verified, then the server is
+**not rebooted** and no further server of a queue is patched. A cancelled execution keeps its
+staging files and needs a new analysis, like a failed one.
+
+**Step timeout**: Settings > Run progress, in seconds, 10 to 3600, default 300. In an analysis a
+blocking call that takes longer (the SSM checks, opening SSH and listing packages, one CVE lookup,
+one APT resolution) shows an error naming the step and the timeout, fails that server, and the run
+moves to the next server. Each CVE lookup has its own limit, so a long CVE list is not cut off
+while it makes progress. Commands keep any shorter limit of their own (the 90 s of the facts
+command). When patching the timeout only shortens the commands before the install; scp, the install,
+its verification and the reboot keep their own limits, and Patch All still stops at the first
+failed server.
+
 ### Settings
 
+- **Run progress**: the per-step timeout (see
+  [Live progress, cancel and the step timeout](#live-progress-cancel-and-the-step-timeout)).
 - **Caches** (top of the page): one badge per cache (*NVD cache: <N> CVEs, oldest <age>, TTL
   <ttl>*, same for Canonical and Amazon updateinfo; blue when the latest analysis answered
   lookups from it, gray when unused or empty), the **Cache TTL** of each cache and **Clear

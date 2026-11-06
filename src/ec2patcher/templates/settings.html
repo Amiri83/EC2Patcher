@@ -29,6 +29,21 @@
     <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
   </form>
 </div>
+<div class="card form-card" id="run-progress-settings">
+  <h2>Run progress</h2>
+  <form method="post" action="/settings/step-timeout">
+    <div class="field{% if step_timeout_error %} has-error{% endif %}">
+      <label for="step_timeout">Per-step timeout (seconds)</label>
+      <input type="text" id="step_timeout" name="step_timeout" value="{{ step_timeout_value }}" autocomplete="off" spellcheck="false" size="8" inputmode="numeric">
+      {% if step_timeout_error %}<div class="field-error">{{ step_timeout_error }}</div>{% endif %}
+      <div class="hint">Between {{ step_timeout_min }} and {{ step_timeout_max }} seconds; default {{ step_timeout_default }}. In an analysis, a blocking call that takes longer (opening SSH, listing packages, one CVE lookup) fails that server and the run moves to the next one. When patching it only shortens the commands before the install; scp, the install and the reboot keep their own limits. Commands with a shorter limit of their own keep it.</div>
+    </div>
+    <div class="form-actions">
+      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
+      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+    </div>
+  </form>
+</div>
 <div class="card form-card">
   <h2>Patch &amp; Download Settings</h2>
   <form method="post" action="/settings/staging">

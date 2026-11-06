@@ -31,6 +31,12 @@ uptime and kernel are recorded.
 "Patch All" runs the same pipeline (plus reboot) for the eligible servers of one analysis
 run, one server at a time, and stops the queue at the first failed server. A server that was
 analyzed again after that run is patched from its latest analysis.
+
+Every step writes progress events (run_events). A cancel request is honoured between the steps
+before the install, and between the servers of a queue. Once the install has started it no longer
+stops anything: the install is finished and verified, only the reboot and later servers are off.
+The per-step timeout only ever shortens the commands before the install; scp, the install, its
+verification and the reboot keep their own timeouts.
 """
 
 import logging
@@ -52,11 +58,13 @@ from ec2patcher.models import (
     ServerAnalysis,
 )
 from ec2patcher.services import (
+    cache_settings,
     cve_resolver,
     downloader,
     os_adapters,
     patch_remote,
     patch_report,
+    run_events,
     secret_store,
     server_state,
     ssh_service,
@@ -84,6 +92,8 @@ SERVER_CHANGED = "PATCH ABORTED — SERVER STATE CHANGED"
 PATCH_FAILED = "PATCH FAILED"
 PARTIAL_STATE = "PATCH FAILED — PARTIAL STATE POSSIBLE"
 STATE_UNKNOWN = "EXECUTION STATE UNKNOWN"
+PATCH_CANCELLED = "PATCH CANCELLED"
+CANCELLED_MESSAGE = "Cancelled by the operator before the install. Nothing was installed."
 NEWER_ANALYSIS = "A newer analysis exists. Use the latest analysis before patching."
 DRIFT_MESSAGE = (
     "Package state changed since this report was analyzed. Run a new analysis before patching."
@@ -300,6 +310,7 @@ class _Context:
     reboot_required: bool = False  # /run/reboot-required seen by the post-install check
     dropped: list[PatchPackageResult] = field(default_factory=list)  # already at target
     transfer_attempts: list[dict] = field(default_factory=list)
+    steps: run_events.Steps | None = None
 
     @property
     def filenames(self) -> list[str]:
@@ -321,9 +332,11 @@ class PatchService:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         credentials: secret_store.SecretStore | None = None,
+        step_timeout: float | None = None,
     ):
         self.db = db
         self.credentials = credentials or secret_store.SecretStore(db)  # encrypted passwords
+        self.step_timeout = step_timeout  # None: the value saved in Settings
         self.runner = runner
         self.transports = ssm_service.TransportResolver(db, runner)
         self.starter = starter
@@ -349,6 +362,12 @@ class PatchService:
         worker = self.starter(job)
         if isinstance(worker, threading.Thread) and self._running:
             self._worker = worker
+
+    def _steps(self, ref: run_events.RunRef, server: str | None = None) -> run_events.Steps:
+        timeout = self.step_timeout
+        if timeout is None:
+            timeout = cache_settings.step_timeout(self.db)
+        return run_events.Steps(self.db, ref, server, timeout)
 
     def _clear_stale(self) -> None:
         """Caller holds ``self._lock``. With no live worker (in any service of this process
@@ -535,6 +554,7 @@ class PatchService:
             # records the execution as INTERRUPTED/UNKNOWN.
             logger.exception("Patch execution %s could not record its result", execution_id)
         finally:
+            run_events.clear_cancel(self.db, run_events.RunRef(run_events.KIND_PATCH, execution_id))
             self._running = False
 
     # --- execution ---------------------------------------------------------------------
@@ -550,12 +570,26 @@ class PatchService:
             logger.info("Patch execution %s (%s): %s -> %s", execution_id, name, state, target)
             state = target
 
+        steps = self._steps(run_events.execution_ref(execution), name)
+        current: run_events.Step | None = None
+
+        def begin(phase: str, message: str, before_install: bool = True) -> None:
+            """The next step. A cancel request stops the run here, up to the install."""
+            nonlocal current
+            if current is not None:
+                current.finish()
+                current = None
+            current = steps.begin(phase, message, cancellable=before_install)
+
         ctx = None
         try:
+            steps.check_cancelled()
             move(ps.REVALIDATING, started_at=_now())
-            ctx = self._context(execution)
+            ctx = self._context(execution, steps)
+            begin(run_events.REVALIDATE, "Comparing the server with the approved analysis")
             self._revalidate(ctx)
             if not ctx.packages:  # every approved package is already at its target version
+                current.finish("Every approved package is already at its target version")
                 fields = {}
                 if ctx.execution.reboot_status == ps.REBOOT_PENDING:
                     fields = {
@@ -567,22 +601,32 @@ class PatchService:
                     notes=ctx.notes, **fields,
                 )  # fmt: skip
                 patch_report.safely(patch_report.record_execution, self.db, execution_id)
+                steps.end(run_events.DONE, "Already patched; nothing to install.")
                 return
+            begin(run_events.DOWNLOAD, f"Downloading {len(ctx.debs)} package file(s)")
             move(ps.DOWNLOADING)
             self._download(ctx)
+            begin(run_events.VERIFY_DOWNLOADS, "Checking the size and SHA256 of the downloads")
             move(ps.VERIFYING_DOWNLOADS)
             self._verify_downloads(ctx)
+            begin(run_events.TRANSFER, f"Copying {len(ctx.debs)} package file(s) to the server")
             move(ps.TRANSFERRING)
             self._transfer(ctx)
+            begin(run_events.VERIFY_TRANSFER, "Checking the size and SHA256 on the server")
             move(ps.VERIFYING_TRANSFER)
             self._verify_transfer(ctx)
+            begin(run_events.SIMULATE, "Simulating the install")
             move(ps.SIMULATING_INSTALL)
             self._simulate(ctx)
+            # The last point a cancel request can stop this execution.
+            begin(run_events.INSTALL, "Installing the approved packages")
             move(ps.INSTALLING, install_started_at=_now())
             post = self._install(ctx)
+            begin(run_events.VERIFY_INSTALL, "Verifying the installation", before_install=False)
             move(ps.VERIFYING_INSTALL)
             self._verify_install(ctx, post)
             # Results are persisted; only now may the staging files go.
+            begin(run_events.CLEANUP, "Removing the staging files", before_install=False)
             move(ps.CLEANING_UP, notes=ctx.notes)
             patch_report.safely(patch_report.record_execution, self.db, execution_id)
             warning = self._cleanup(ctx)
@@ -591,11 +635,26 @@ class PatchService:
                 final, finished_at=_now(), cleanup_status="WARNING" if warning else "DELETED",
                 cleanup_detail=warning,
             )  # fmt: skip
+            current.finish(warning or "Staging files removed")
             logger.info("Patch execution %s (%s) finished: %s", execution_id, name, final)
+        except run_events.RunCancelled:
+            if current is not None:
+                current.finish()
+            final = self._fail(
+                execution_id, state,
+                PatchAbort(CANCELLED_MESSAGE, title=PATCH_CANCELLED, state=ps.CANCELLED), ctx,
+            )  # fmt: skip
+            logger.info("Patch execution %s (%s) cancelled", execution_id, name)
+        except run_events.StepTimeoutError as exc:
+            final = self._fail(execution_id, state, PatchAbort(str(exc)), ctx)
         except PatchAbort as abort:
+            if current is not None:
+                current.fail(str(abort))
             final = self._fail(execution_id, state, abort, ctx)
         except Exception as exc:
             logger.exception("Patch execution %s (%s) crashed in %s", execution_id, name, state)
+            if current is not None:
+                current.fail(f"Unexpected error: {exc}")
             post_install = state in ps.POST_INSTALL
             final = self._fail(
                 execution_id,
@@ -610,8 +669,38 @@ class PatchService:
             )
         patch_report.safely(patch_report.record_execution, self.db, execution_id)
         if final in ps.SUCCESSFUL:  # installation verified (a cleanup error does not matter)
-            self._reboot_safely(ctx)
+            self._reboot_step(ctx, steps)
             patch_report.safely(patch_report.record_execution, self.db, execution_id)
+        self._report_end(execution_id, final, steps)
+
+    def _reboot_step(self, ctx: _Context, steps: run_events.Steps) -> None:
+        step = steps.begin(run_events.REBOOT, "Checking the reboot", cancellable=False)
+        self._reboot_safely(ctx)
+        done = self.db.get_execution(ctx.execution.id)
+        label = ps.REBOOT_LABELS.get(done.reboot_status, done.reboot_status)
+        message = f"{label}: {done.reboot_detail}" if done.reboot_detail else label
+        if done.reboot_status == ps.REBOOT_FAILED:
+            step.fail(message)
+        else:
+            step.finish(message)
+
+    def _report_end(self, execution_id: int, final: str, steps: run_events.Steps) -> None:
+        execution = self.db.get_execution(execution_id)
+        if final == ps.CANCELLED:
+            steps.end(run_events.CANCELLED, CANCELLED_MESSAGE, run_events.WARNING)
+        elif final not in ps.DONE:
+            title = execution.error_title or ps.LABELS.get(final, final)
+            steps.end(
+                run_events.FAILED, f"{title}: {execution.error_summary or 'no details'}",
+                run_events.ERROR,
+            )  # fmt: skip
+        elif execution.reboot_status == ps.REBOOT_FAILED:
+            steps.end(
+                run_events.FAILED, f"REBOOT FAILED: {execution.reboot_detail or 'no details'}",
+                run_events.ERROR,
+            )  # fmt: skip
+        else:
+            steps.end(run_events.DONE, ps.LABELS.get(final, final))
 
     def _fail(self, execution_id: int, state: str, abort: PatchAbort, ctx) -> str:
         """Record the failure; returns the state the execution ended in."""
@@ -668,7 +757,7 @@ class PatchService:
         )  # fmt: skip
         return target
 
-    def _context(self, execution: PatchExecution) -> _Context:
+    def _context(self, execution: PatchExecution, steps: run_events.Steps) -> _Context:
         analysis = self.db.get_server_analysis(execution.server_analysis_id)
         if analysis is None:
             raise PatchAbort("The approved analysis no longer exists.")
@@ -687,7 +776,7 @@ class PatchService:
         if password_error:
             raise PatchAbort(password_error)
         self.transports.start_run()  # sessions can expire between the servers of a Patch All
-        transport = self.transports.for_server(server)
+        transport = run_events.resolve_transport(steps, lambda: self.transports.for_server(server))
         self.db.update_execution(execution.id, transport=transport.label)
         logger.info("Patch execution %s: transport: %s", execution.id, transport.label)
         if transport.error:
@@ -712,7 +801,17 @@ class PatchService:
             password=password,
             adapter=_adapter(analysis),
             ssm=transport.target,
+            steps=steps,
         )
+
+    def _step_remote(self, ctx: _Context, command: str, timeout: int) -> ssh_service.RemoteResult:
+        """A command before the install, bounded by the step timeout. Only the command itself is
+        guarded, so an abandoned one cannot touch the execution afterwards."""
+        limit = ctx.steps.command_timeout(timeout)
+        try:
+            return ctx.steps.guard(lambda: self._remote(ctx, command, limit))
+        except run_events.StepTimeoutError as exc:
+            return ssh_service.RemoteResult(ok=False, error=str(exc))
 
     def _remote(self, ctx: _Context, command: str, timeout: int) -> ssh_service.RemoteResult:
         result = ssh_service.run_remote(
@@ -733,7 +832,7 @@ class PatchService:
     # --- steps ------------------------------------------------------------------------
 
     def _check_sudo(self, ctx: _Context) -> None:
-        result = self._remote(ctx, patch_remote.SUDO_CHECK_COMMAND, SHORT_TIMEOUT_SECONDS)
+        result = self._step_remote(ctx, patch_remote.SUDO_CHECK_COMMAND, SHORT_TIMEOUT_SECONDS)
         if not result.ok:
             raise PatchAbort(f"Sudo preflight failed: {result.error}")
         if not patch_remote.parse_sudo(result.stdout):
@@ -745,7 +844,7 @@ class PatchService:
 
     def _revalidate(self, ctx: _Context) -> None:
         adapter = ctx.adapter
-        result = self._remote(ctx, adapter.facts_command, REVALIDATE_TIMEOUT_SECONDS)
+        result = self._step_remote(ctx, adapter.facts_command, REVALIDATE_TIMEOUT_SECONDS)
         if not result.ok:
             raise PatchAbort(f"Pre-patch revalidation failed: {result.error}")
         try:
@@ -855,7 +954,7 @@ class PatchService:
 
     def _transfer(self, ctx: _Context) -> None:
         command = patch_remote.stage_command(ctx.remote_dir)
-        result = self._remote(ctx, command, SHORT_TIMEOUT_SECONDS)
+        result = self._step_remote(ctx, command, SHORT_TIMEOUT_SECONDS)
         if not result.ok:
             raise PatchAbort(f"Could not prepare the remote staging directory: {result.error}")
         stage = patch_remote.parse_stage(result.stdout)
@@ -886,7 +985,9 @@ class PatchService:
                 f"{messages.get(stage.status, 'could not be inspected')}."
             )
         self.db.update_execution(ctx.execution.id, remote_staging_created=True)
-        result = self._remote(ctx, patch_remote.mark_command(ctx.remote_dir), SHORT_TIMEOUT_SECONDS)
+        result = self._step_remote(
+            ctx, patch_remote.mark_command(ctx.remote_dir), SHORT_TIMEOUT_SECONDS
+        )
         if not result.ok or "ok" not in result.stdout.split():
             raise PatchAbort(f"Could not write to {ctx.remote_dir}: {result.error or 'no output'}")
         for filename in ctx.filenames:
@@ -936,7 +1037,7 @@ class PatchService:
 
     def _verify_transfer(self, ctx: _Context) -> None:
         command = patch_remote.verify_transfer_command(ctx.remote_dir, ctx.filenames)
-        result = self._remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
+        result = self._step_remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
         if not result.ok:
             raise PatchAbort(f"Remote verification failed: {result.error}")
         files = patch_remote.parse_verify_transfer(result.stdout, ctx.remote_dir)
@@ -968,7 +1069,7 @@ class PatchService:
     def _simulate(self, ctx: _Context) -> None:
         self._check_sudo(ctx)
         command = ctx.adapter.simulate_command(ctx.remote_dir, ctx.filenames)
-        result = self._remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
+        result = self._step_remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)
         if not result.ok:
             raise PatchAbort(f"Install simulation failed: {result.error}")
         output, check = ctx.adapter.check_simulation(result.stdout, self._expected(ctx))
@@ -1191,6 +1292,14 @@ class PatchService:
             return
         if ctx.execution.reboot_status != ps.REBOOT_PENDING:
             return
+        if run_events.cancel_requested(self.db, ctx.steps.ref):
+            self.db.update_execution(
+                execution_id, reboot_status=ps.REBOOT_NOT_RUN, reboot_finished_at=_now(),
+                reboot_detail="The run was cancelled after the install started; the server was "
+                "not rebooted. Schedule a reboot yourself if one is required.",
+            )  # fmt: skip
+            logger.info("Patch execution %s: reboot not run (cancelled)", execution_id)
+            return
 
         def finish(status: str, detail: str, **fields) -> None:
             self.db.update_execution(
@@ -1351,14 +1460,19 @@ class PatchService:
             except Exception:
                 logger.exception("Patch All queue %s could not record its result", queue_id)
         finally:
+            run_events.clear_cancel(self.db, run_events.RunRef(run_events.KIND_QUEUE, queue_id))
             self._running = False
 
     def _run_queue(self, queue_id: int) -> None:
         """Patch the PENDING servers in order; stop at the first failure."""
         queue = self.db.get_patch_queue(queue_id)
+        ref = run_events.RunRef(run_events.KIND_QUEUE, queue_id)
         for item in queue.items:
             if item.status != ps.ITEM_PENDING:
                 continue
+            if run_events.cancel_requested(self.db, ref):
+                self._cancel_queue(queue_id)
+                return
             analysis = self.db.get_server_analysis(item.server_analysis_id)
             try:
                 if analysis is None:
@@ -1375,6 +1489,12 @@ class PatchService:
                 continue
             self.db.update_queue_item(item.id, status=ps.ITEM_RUNNING, execution_id=execution_id)
             self.execute(execution_id)
+            if self.db.get_execution(execution_id).state == ps.CANCELLED:
+                self.db.update_queue_item(
+                    item.id, status=ps.ITEM_CANCELLED, detail=CANCELLED_MESSAGE
+                )
+                self._cancel_queue(queue_id)
+                return
             failure = queue_failure(self.db.get_execution(execution_id))
             if failure:
                 self.db.update_queue_item(item.id, status=ps.ITEM_FAILED, detail=failure)
@@ -1385,8 +1505,26 @@ class PatchService:
                 note = "Already patched: every package was already at its target version."
                 done["detail"] = f"{item.detail} {note}" if item.detail else note
             self.db.update_queue_item(item.id, **done)
+        self._steps(ref).end(run_events.DONE, "Patch All finished.")
         self.db.update_patch_queue(queue_id, state=ps.QUEUE_COMPLETED, finished_at=_now())
         logger.info("Patch All queue %s completed", queue_id)
+
+    def _cancel_queue(self, queue_id: int) -> None:
+        """Servers already patched keep their results; the others are not touched."""
+        ref = run_events.RunRef(run_events.KIND_QUEUE, queue_id)
+        for item in self.db.get_patch_queue(queue_id).items:
+            if item.status == ps.ITEM_PENDING:
+                detail = "Not run: the queue was cancelled."
+                self.db.update_queue_item(item.id, status=ps.ITEM_CANCELLED, detail=detail)
+                self._steps(ref, item.server_name).record(
+                    run_events.CANCELLED, detail, run_events.WARNING
+                )
+        self._steps(ref).end(run_events.CANCELLED, "Patch All cancelled.", run_events.WARNING)
+        self.db.update_patch_queue(
+            queue_id, state=ps.QUEUE_CANCELLED, finished_at=_now(),
+            stop_reason="Cancelled by the operator.",
+        )  # fmt: skip
+        logger.info("Patch All queue %s cancelled", queue_id)
 
     def _stop_queue(self, queue_id: int, failed_server: str | None, reason: str) -> None:
         queue = self.db.get_patch_queue(queue_id)
@@ -1402,6 +1540,9 @@ class PatchService:
                     detail="The queue stopped while this server was being patched; "
                     "check its execution.",
                 )  # fmt: skip
+        self._steps(run_events.RunRef(run_events.KIND_QUEUE, queue_id)).end(
+            run_events.FAILED, f"Patch All stopped{after}: {reason}", run_events.ERROR
+        )
         self.db.update_patch_queue(
             queue_id, state=ps.QUEUE_STOPPED, finished_at=_now(),
             stop_reason=f"{failed_server}: {reason}" if failed_server else reason,
@@ -1461,9 +1602,10 @@ def progress_steps(execution: PatchExecution) -> list[ProgressStep]:
         current, current_status = len(ps.PIPELINE), "done"
     elif execution.state in ps.ACTIVE:
         current, current_status = order(execution.state), "running"
-    else:  # FAILED / UNKNOWN
+    else:  # FAILED / UNKNOWN / CANCELLED
         stage = execution.failure_stage if execution.failure_stage in ps.PIPELINE else ps.APPROVED
-        current, current_status = order(stage), "failed"
+        current = order(stage)
+        current_status = "pending" if execution.state == ps.CANCELLED else "failed"
     result = []
     for label, stage in steps:
         index = order(stage)

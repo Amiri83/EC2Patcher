@@ -28,6 +28,8 @@ class AnalysisContext:
     record: Callable[..., None]  # update fields of the server's analysis row
     lookup: Callable[[str], object] | None = None  # replaces the metadata lookup (retries)
     advisories: object = None  # Amazon Linux advisories (amazon_updateinfo.UpdateInfoSource)
+    # Told the findings once the lookups are done and before the fix versions are computed.
+    lookups_done: Callable[[list], None] = lambda findings: None
 
 
 @dataclass

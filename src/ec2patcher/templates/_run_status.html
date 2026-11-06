@@ -2,4 +2,5 @@
 {%- elif r.status == "completed" %}<span class="badge badge-success">COMPLETED</span>
 {%- elif r.status == "completed_with_errors" %}<span class="badge badge-warning">COMPLETED WITH ERRORS</span>
 {%- elif r.status == "interrupted" %}<span class="badge badge-danger">INTERRUPTED</span>
+{%- elif r.status == "cancelled" %}<span class="badge badge-neutral">CANCELLED</span>
 {%- else %}<span class="badge badge-danger">FAILED</span>{% endif %}

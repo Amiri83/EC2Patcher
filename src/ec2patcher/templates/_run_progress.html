@@ -1,0 +1,30 @@
+{# Live progress of a run: progress_ref names the run (12, patch-12, queue-3), progress_active says
+   it is still going. Rendered by app.js from the events endpoint, so nothing shows without
+   JavaScript: those pages keep their automatic refresh instead. #}
+<aside id="run-progress" class="rp-drawer" role="dialog" aria-modal="false" aria-labelledby="rp-title" hidden
+       data-run-progress="{{ progress_ref }}" data-active="{{ 'true' if progress_active else 'false' }}"
+       data-events-url="/runs/{{ progress_ref }}/events" data-cancel-url="/runs/{{ progress_ref }}/cancel">
+  <header class="rp-header">
+    <h2 id="rp-title">Run progress</h2>
+    <span class="badge badge-neutral" data-rp-status></span>
+    <span class="muted small" data-rp-elapsed></span>
+    <button type="button" class="btn btn-secondary btn-sm rp-hide" data-rp-hide>Hide</button>
+  </header>
+  <div class="rp-overall">
+    <label class="rp-bar"><span>Servers <span data-rp-servers-count>0/0</span></span>
+      <progress data-rp-servers-bar value="0" max="1"></progress></label>
+    <label class="rp-bar"><span>CVEs <span data-rp-cves-count>0/0</span></span>
+      <progress data-rp-cves-bar value="0" max="1"></progress></label>
+  </div>
+  <div class="rp-servers" data-rp-servers></div>
+  <div class="rp-log-header">
+    <h3>Log</h3>
+    <button type="button" class="btn btn-secondary btn-sm" data-rp-pause aria-pressed="false">Pause</button>
+  </div>
+  <div class="rp-log" data-rp-log role="log" aria-live="polite" aria-label="Run log" tabindex="0"></div>
+  <footer class="rp-footer">
+    <span class="muted small" data-rp-note role="status"></span>
+    <button type="button" class="btn btn-danger btn-sm" data-rp-cancel hidden>Cancel</button>
+  </footer>
+</aside>
+<button type="button" class="rp-badge" data-rp-badge data-rp-show hidden>Progress <span data-rp-badge-count></span></button>

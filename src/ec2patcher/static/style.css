@@ -377,6 +377,67 @@ details.bucket, h3.bucket { border-left: 3px solid var(--border); padding-left: 
 .steps { margin: 0 0 var(--space-3); padding-left: 20px; }
 .log-file { font-weight: 500; }
 
+/* Live progress of a run: a drawer over the page's right side and the badge that reopens it */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden;
+  clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.rp-needs-js { display: none; }
+.js .rp-needs-js { display: inline-flex; }
+.progress-cancelled .progress-icon { color: var(--muted); }
+.rp-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 20; width: min(560px, 100vw);
+  display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-4);
+  background: var(--surface); border-left: 1px solid var(--border);
+  box-shadow: -4px 0 16px rgba(16, 24, 32, 0.15); overflow: hidden;
+}
+.rp-header { display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
+.rp-header h2 { margin: 0; font-size: 17px; }
+.rp-hide { margin-left: auto; }
+.rp-overall { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
+.rp-bar { display: block; font-size: 13px; color: var(--muted); }
+.rp-bar progress, .rp-server progress { display: block; width: 100%; height: 8px; }
+.rp-servers { flex: 1 1 55%; min-height: 0; overflow-y: auto; }
+.rp-server { padding: var(--space-2) 0; border-top: 1px solid var(--border-soft); }
+.rp-server:first-child { border-top: 0; }
+.rp-server-title { display: flex; align-items: baseline; gap: var(--space-2); overflow-wrap: anywhere; }
+.rp-server-state { margin-left: auto; font-size: 13px; color: var(--muted); white-space: nowrap; }
+.rp-steps { list-style: none; margin: var(--space-1) 0 0; padding: 0; font-size: 13px; }
+.rp-step { display: flex; gap: var(--space-2); align-items: baseline; padding: 1px 0; color: var(--muted); }
+.rp-step-running, .rp-step-done, .rp-step-failed { color: var(--text); }
+.rp-step-running .rp-step-label { font-weight: 700; }
+.rp-step-mark { flex: none; width: 16px; text-align: center; }
+.rp-step-done .rp-step-mark { color: var(--success); }
+.rp-step-failed .rp-step-mark { color: var(--danger); }
+.rp-step-body { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.rp-step-detail { color: var(--muted); }
+.rp-step-time { flex: none; color: var(--muted); font-variant-numeric: tabular-nums; }
+.rp-error { color: var(--danger); overflow-wrap: anywhere; }
+.rp-hint { color: var(--text); font-style: italic; overflow-wrap: anywhere; }
+.rp-spinner {
+  display: inline-block; width: 11px; height: 11px; border: 2px solid var(--border);
+  border-top-color: var(--primary); border-radius: 50%; animation: rp-spin 0.9s linear infinite;
+}
+@keyframes rp-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .rp-spinner { animation: none; } }
+.rp-log-header { display: flex; align-items: center; justify-content: space-between; }
+.rp-log-header h3 { margin: 0; font-size: 14px; }
+.rp-log {
+  flex: 1 1 30%; min-height: 80px; overflow-y: auto; padding: var(--space-2);
+  background: var(--surface-2); border: 1px solid var(--border-soft); border-radius: var(--radius);
+  font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere;
+}
+.rp-log-warning { color: var(--warning); }
+.rp-log-error { color: var(--danger); }
+.rp-footer { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 30px; }
+.rp-badge {
+  position: fixed; right: var(--space-4); bottom: var(--space-4); z-index: 19;
+  padding: var(--space-2) var(--space-3); border: 0; border-radius: var(--radius-lg);
+  background: var(--primary); color: var(--on-accent); font: inherit; cursor: pointer;
+  box-shadow: var(--shadow);
+}
+.rp-badge:hover { background: var(--primary-hover); }
+
 /* Responsive: sidebar becomes a top bar on narrow screens */
 @media (max-width: 800px) {
   .layout { flex-direction: column; }
@@ -395,7 +456,7 @@ details.bucket, h3.bucket { border-left: 3px solid var(--border); padding-left: 
 }
 
 @media print {
-  .sidebar, .header-actions, .form-actions, .btn { display: none !important; }
+  .sidebar, .header-actions, .form-actions, .btn, .rp-drawer, .rp-badge { display: none !important; }
   .content { padding: 0; max-width: none; }
   .card { box-shadow: none; break-inside: avoid; }
 }

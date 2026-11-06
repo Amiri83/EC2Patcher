@@ -1,11 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Patch #{{ execution.id }} - {{ execution.server_name }}{% endblock %}
-{% block head %}{% if is_active %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block head %}{% if is_active %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}
 {% block heading %}Patch Execution #{{ execution.id }}: {{ execution.server_name }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
+  <button type="button" class="btn btn-secondary rp-needs-js" data-rp-show>Show progress</button>
   <a href="/analysis/{{ execution.analysis_run_id }}/servers/{{ execution.server_analysis_id }}" class="btn btn-secondary">Approved Report</a>
   <a href="/history" class="btn btn-secondary">History</a>
 </div>{% endblock %}
+{% block overlay %}{% with progress_ref=("queue-%d"|format(execution.queue_id) if execution.queue_id else "patch-%d"|format(execution.id)), progress_active=is_active %}{% include "_run_progress.html" %}{% endwith %}{% endblock %}
 {% block content %}
 {% set ex = execution %}
 <div class="card {% if ex.state in ('SUCCESS', 'SUCCESS_WITH_CLEANUP_WARNING', 'ALREADY_PATCHED') %}result-ok{% elif ex.state in ('FAILED', 'UNKNOWN', 'INTERRUPTED') %}result-fail{% endif %}">
