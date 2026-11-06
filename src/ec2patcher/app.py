@@ -875,6 +875,12 @@ def create_app(
             return reports_page(request, status_code=409, error="An analysis is already running.")
         return redirect(f"/analysis/{run_id}")
 
+    @app.get("/analysis/latest")
+    def latest_analysis():
+        """Menu entry: the newest analysis run, or the reports page when there is none."""
+        run = db.get_latest_analysis_run()
+        return RedirectResponse(f"/analysis/{run.id}" if run else "/reports", status_code=303)
+
     @app.get("/analysis/{run_id}", response_class=HTMLResponse)
     def analysis_run(request: Request, run_id: int):
         analyzer.reconcile()
@@ -887,7 +893,7 @@ def create_app(
         if not run.is_running:  # same read-only preview as the Patch All confirmation page
             eligible_count = sum(c.allowed for _, c in patcher.queue_preview(run))
         return render(
-            request, "analysis_run.html", "reports", run=run, summaries=summaries,
+            request, "analysis_run.html", "analysis", run=run, summaries=summaries,
             notice=notice_from_query(request), patch_running=patcher.is_running,
             latest_queue_id=db.latest_queue_id(run_id), eligible_count=eligible_count,
         )  # fmt: skip
@@ -949,7 +955,7 @@ def create_app(
         if adapter is not None and not adapter.supports_patching:
             unsupported = adapter.patching_unsupported
         return render(
-            request, "server_report.html", "reports", status_code=status_code, run=run,
+            request, "server_report.html", "analysis", status_code=status_code, run=run,
             analysis=analysis, summary=analysis_service.summarize(analysis),
             finding_groups=analysis_service.group_findings(analysis),
             remediation_groups=groups,
@@ -1015,7 +1021,7 @@ def create_app(
                 error="Patching is not available for this report: " + " ".join(check.reasons),
             )  # fmt: skip
         return render(
-            request, "patch_confirm.html", "reports", run=run, analysis=analysis, patch=check
+            request, "patch_confirm.html", "analysis", run=run, analysis=analysis, patch=check
         )
 
     @app.post("/analysis/{run_id}/servers/{analysis_id}/approve", response_class=HTMLResponse)
@@ -1080,7 +1086,7 @@ def create_app(
         run = patch_all_run(run_id)
         preview = patcher.queue_preview(run)
         return render(
-            request, "patch_all_confirm.html", "reports", status_code=status_code, run=run,
+            request, "patch_all_confirm.html", "analysis", status_code=status_code, run=run,
             eligible=[(a, c) for a, c in preview if c.allowed],
             skipped=[(a, c) for a, c in preview if not c.allowed],
             skip_reboot=skip_reboot, **ctx,

@@ -249,8 +249,8 @@ def _second_kernel_line(f):
 
     for name in ("linux-aws-7.0", "linux-image-aws-7.0"):
         f.packages.append(
-            InstalledPackage(name, "7.0.0.1013.13~24.04.1", "linux-meta-aws-7.0",
-                             "7.0.0.1013.13~24.04.1", "amd64")
+            InstalledPackage(name, "7.0.0-1013.13~24.04.1", "linux-meta-aws-7.0",
+                             "7.0.0-1013.13~24.04.1", "amd64")
         )  # fmt: skip
     return f
 
@@ -269,7 +269,7 @@ def test_kernel_fix_only_checks_the_meta_packages_of_its_own_kernel_line():
     kernel = cr.Finding("CVE-1", "linux-aws-7.0", cr.FIX_NOT_IN_CONFIGURED_REPOS,
                         fixed_version="7.0.0-1014.14~24.04.1", is_kernel=True)  # fmt: skip
     candidates = {
-        name: apt_planner.Candidate(name, "7.0.0.1013.13~24.04.1", "7.0.0.1014.14~24.04.1")
+        name: apt_planner.Candidate(name, "7.0.0-1013.13~24.04.1", "7.0.0-1014.14~24.04.1")
         for name in ("linux-aws-7.0", "linux-image-aws-7.0")
     } | {
         name: apt_planner.Candidate(name, "6.8.0.1021.23", "6.8.0.1024.26")
@@ -279,9 +279,30 @@ def test_kernel_fix_only_checks_the_meta_packages_of_its_own_kernel_line():
     requests = cr.apply_candidates([kernel], candidates, f)
     assert kernel.status == cr.PATCH_AVAILABLE, kernel.detail
     assert requests == [
-        ("linux-aws-7.0", "7.0.0.1014.14~24.04.1"),
-        ("linux-image-aws-7.0", "7.0.0.1014.14~24.04.1"),
+        ("linux-aws-7.0", "7.0.0-1014.14~24.04.1"),
+        ("linux-image-aws-7.0", "7.0.0-1014.14~24.04.1"),
     ]
+
+
+def test_kernel_meta_target_follows_the_candidate_version_scheme():
+    # dotted meta scheme (older kernels)
+    assert cr.kernel_meta_target("6.8.0-1024.26", "6.8.0.1021.23") == "6.8.0.1024.26"
+    # newer metas carry the kernel version unchanged (e.g. noble linux-aws 7.0)
+    assert cr.kernel_meta_target("7.0.0-1014.14~24.04.1", "7.0.0-1014.14~24.04.1") == (
+        "7.0.0-1014.14~24.04.1"
+    )
+
+
+def test_dash_scheme_meta_candidate_older_than_fix_stays_not_in_repos():
+    f = _second_kernel_line(facts())
+    kernel = cr.Finding("CVE-1", "linux-aws-7.0", cr.FIX_NOT_IN_CONFIGURED_REPOS,
+                        fixed_version="7.0.0-1017.18~24.04.1", is_kernel=True)  # fmt: skip
+    candidates = {
+        name: apt_planner.Candidate(name, "7.0.0-1013.13~24.04.1", "7.0.0-1014.14~24.04.1")
+        for name in ("linux-aws-7.0", "linux-image-aws-7.0")
+    }
+    assert cr.apply_candidates([kernel], candidates, f) == []
+    assert kernel.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
 
 
 def test_kernel_source_without_own_meta_package_uses_all_meta_packages():
