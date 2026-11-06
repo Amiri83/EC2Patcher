@@ -165,6 +165,8 @@ def record_execution(db: Database, execution_id: int) -> None:
     execution = db.get_execution(execution_id)
     if execution is None or execution.decision != ps.APPROVED:
         return
+    if execution.state == ps.CANCELLED:
+        return  # stopped before the install: the rows stay as they were
     verified = execution.state in ps.DONE or execution.state == ps.CLEANING_UP
     if execution.state in ps.ACTIVE and not verified:
         return

@@ -21,6 +21,7 @@ via argument-list subprocesses. Lint/format: ruff (line length 100).
   `aws_config` (read-only AWS CLI config: profiles, their regions; region list, form choices),
   `security_list` (parser of pasted security lists, matching to servers), `patch_report` (server x
   CVE report rows fed by the import, analysis and patch flows; filters, summary),
+  `run_events` (progress events of analysis and patch runs, step timeout, cancel requests),
   `secret_store` (encrypted secrets, Fernet key file in the config dir)
 - `src/ec2patcher/templates/`, `static/` – UI
 - `tests/` – pytest; fixtures in `conftest.py`, `*_fixtures.py`, `tests/fixtures/`

@@ -19,7 +19,8 @@ Each run records how many lookups of the NVD, Canonical and Amazon updateinfo ca
 answered from the cache, live or failed (``cache_stats``; follow-ups add theirs).
 
 Servers are analyzed sequentially in one background thread; one failing server (or CVE)
-never aborts the others.
+never aborts the others. Each step writes progress events and honours a cancel request and the
+per-step timeout (run_events): a step that overruns fails its server, and the run moves on.
 """
 
 import logging
@@ -43,6 +44,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import (
     amazon_updateinfo,
+    cache_settings,
     cve_resolver,
     debversion,
     local_apt,
@@ -50,6 +52,7 @@ from ec2patcher.services import (
     os_adapters,
     patch_report,
     rpmversion,
+    run_events,
     secret_store,
     server_state,
     ssh_service,
@@ -83,6 +86,10 @@ def _now() -> str:
     return _utcnow().isoformat()
 
 
+def _ref(run_id: int) -> run_events.RunRef:
+    return run_events.RunRef(run_events.KIND_ANALYSIS, run_id)
+
+
 # Every AnalysisService of this process: a worker of one counts as live for all on that database.
 _SERVICES: "weakref.WeakSet[AnalysisService]" = weakref.WeakSet()
 
@@ -98,9 +105,11 @@ class AnalysisService:
         apt: local_apt.LocalApt | None = None,
         advisories: amazon_updateinfo.UpdateInfoSource | None = None,
         credentials: secret_store.SecretStore | None = None,
+        step_timeout: float | None = None,
     ):
         self.db = db
         self.credentials = credentials or secret_store.SecretStore(db)  # encrypted passwords
+        self.step_timeout = step_timeout  # None: the value saved in Settings
         self.metadata = metadata
         self.nvd = nvd_client or nvd.NvdClient(db)
         self.apt = apt or local_apt.LocalApt(
@@ -128,6 +137,12 @@ class AnalysisService:
         worker = self.starter(job)
         if isinstance(worker, threading.Thread) and self._running:
             self._worker = worker
+
+    def _steps(self, run_id: int, server: str | None = None) -> run_events.Steps:
+        timeout = self.step_timeout
+        if timeout is None:
+            timeout = cache_settings.step_timeout(self.db)
+        return run_events.Steps(self.db, _ref(run_id), server, timeout)
 
     def _clear_stale(self) -> int:
         """Caller holds ``self._lock``. Mark runs the database still shows as running while no
@@ -190,11 +205,13 @@ class AnalysisService:
             self.run(run_id)
         except Exception as exc:
             logger.exception("Analysis run %s crashed", run_id)
+            self._steps(run_id).end(run_events.FAILED, f"Unexpected error: {exc}", run_events.ERROR)
             self.db.update_analysis_run(
                 run_id, status="failed", completed_at=_now(), progress_message=None,
                 error=f"Unexpected error: {exc}",
             )  # fmt: skip
         finally:
+            run_events.clear_cancel(self.db, _ref(run_id))
             self._running = False
 
     def run(self, run_id: int) -> None:
@@ -203,9 +220,14 @@ class AnalysisService:
         def progress(message: str) -> None:
             self.db.update_analysis_run(run_id, progress_message=message)
 
+        overall = self._steps(run_id)
         progress("Checking Canonical security metadata")
         self.metadata.start_run()
+        check = overall.begin(
+            run_events.LOOKUPS, "Checking Canonical security metadata", cancellable=False
+        )
         meta = self.metadata.ensure_fresh(progress)
+        check.finish(meta.source if meta.available else f"Unavailable: {meta.error}")
         metadata_warning = meta.warning
         if not meta.available:
             metadata_warning = f"Canonical security metadata is unavailable: {meta.error}"
@@ -224,6 +246,8 @@ class AnalysisService:
         self.transports.start_run()
         failures = 0
         for index, analysis in enumerate(run.servers, start=1):
+            if run_events.cancel_requested(self.db, _ref(run_id)):
+                break
             label = f"{analysis.server_name} ({index} of {len(run.servers)})"
             progress(f"Analyzing {label}")
             if not self.analyze_server(analysis, lambda m, label=label: progress(f"{label}: {m}")):
@@ -233,6 +257,18 @@ class AnalysisService:
                 run_id, metadata_lookups=self.metadata.run_outcomes(),
                 cache_stats=self._cache_stats(),
             )  # fmt: skip
+        servers = self.db.get_analysis_run(run_id, details=False).servers
+        if any(s.status in ("waiting", "cancelled") for s in servers):
+            self._finish_cancelled(run_id, servers, overall)
+            return
+        total = len(servers)
+        if failures:
+            overall.end(
+                run_events.DONE, f"Run finished: {failures} of {total} server(s) failed.",
+                run_events.WARNING,
+            )  # fmt: skip
+        else:
+            overall.end(run_events.DONE, f"Run finished: {total} server(s) analyzed.")
         self.db.update_analysis_run(
             run_id,
             status="completed_with_errors" if failures else "completed",
@@ -240,6 +276,29 @@ class AnalysisService:
             progress_message=None,
         )
         logger.info("Analysis run %s finished (%d server failure(s))", run_id, failures)
+
+    def _finish_cancelled(self, run_id: int, servers: list, overall: run_events.Steps) -> None:
+        """Finished servers keep their results; the ones not reached are marked as such."""
+        skipped = [s for s in servers if s.status == "waiting"]
+        for analysis in skipped:
+            self.db.update_server_analysis(
+                analysis.id, status="cancelled", completed_at=_now(),
+                error=run_events.SERVER_SKIPPED,
+            )  # fmt: skip
+            self._steps(run_id, analysis.server_name).record(
+                run_events.CANCELLED, run_events.SERVER_SKIPPED, run_events.WARNING
+            )
+        finished = sum(s.status in ("complete", "failed", "unsupported") for s in servers)
+        overall.end(
+            run_events.CANCELLED,
+            f"Run cancelled: {finished} finished server(s) keep their results, "
+            f"{len(servers) - finished} did not finish.",
+            run_events.WARNING,
+        )
+        self.db.update_analysis_run(
+            run_id, status="cancelled", completed_at=_now(), progress_message=None
+        )
+        logger.info("Analysis run %s cancelled", run_id)
 
     # --- follow-up actions on a finished run -----------------------------------------
     # Retry failed lookups (whole run), Retry these CVEs (Investigate bucket of one server)
@@ -257,6 +316,7 @@ class AnalysisService:
                 return False
             self._running, self._worker = True, None
         try:
+            run_events.clear_cancel(self.db, _ref(run_id))
             self.db.update_analysis_run(run_id, status="running", progress_message=message)
             self._launch(lambda: self._followup_safely(run_id, run.status, job))
         except Exception:
@@ -272,6 +332,7 @@ class AnalysisService:
             logger.exception("Follow-up action on run %s crashed", run_id)
             self.db.update_analysis_run(run_id, status=previous_status, progress_message=None)
         finally:
+            run_events.clear_cancel(self.db, _ref(run_id))
             self._running = False
 
     def retry_failed_lookups(self, run_id: int) -> int | None:
@@ -340,6 +401,9 @@ class AnalysisService:
         ]  # fmt: skip
         still_failed: set[str] = set()
         for index, analysis in enumerate(affected, start=1):
+            if run_events.cancel_requested(self.db, _ref(run_id)):
+                still_failed |= failed.intersection(s for a in affected for s in a.reported_cves)
+                break
             label = f"{analysis.server_name} ({index} of {len(affected)})"
             self.db.update_analysis_run(run_id, progress_message=f"Retrying lookups for {label}")
             try:
@@ -354,6 +418,7 @@ class AnalysisService:
         lookups = dict(run.metadata_lookups)
         lookups.update(self.metadata.run_outcomes())
         lookups.update(dict.fromkeys(still_failed, FAILED_LOOKUP))
+        self._steps(run_id).end(run_events.DONE, "Retry of the lookups finished.")
         self.db.update_analysis_run(
             run_id,
             status=previous_status,
@@ -405,7 +470,9 @@ class AnalysisService:
         except Exception as exc:
             logger.exception("Re-analysis of %s failed unexpectedly", label)
             error = f"Unexpected error: {exc}"
-        if not error:
+        if error == run_events.SERVER_CANCELLED:
+            logger.info("Re-analysis of %s cancelled", label)  # earlier results stay as they were
+        elif not error:
             if self.db.get_server_analysis(analysis_id).status != UNSUPPORTED:
                 self.db.update_server_analysis(analysis_id, error=None)
         elif analysis.status == "complete" and not os_adapters.is_blocker(error):
@@ -428,6 +495,7 @@ class AnalysisService:
             failed = any(s.status == "failed" for s in servers)
             status = "completed_with_errors" if failed else "completed"
         lookups = {**run.metadata_lookups, **self.metadata.run_outcomes()}
+        self._steps(run_id).end(run_events.DONE, f"Re-analysis of {label} finished.")
         self.db.update_analysis_run(
             run_id,
             status=status,
@@ -462,6 +530,11 @@ class AnalysisService:
         except Exception as exc:
             logger.exception("Analysis of %s failed unexpectedly", analysis.server_name)
             error = f"Unexpected error: {exc}"
+        if error == run_events.SERVER_CANCELLED:
+            self.db.update_server_analysis(
+                analysis.id, status="cancelled", completed_at=_now(), error=error
+            )
+            return True  # not a failure: the run stops because it was asked to
         if error:
             logger.warning("Analysis of %s failed: %s", analysis.server_name, error)
             self.db.update_server_analysis(
@@ -492,66 +565,102 @@ class AnalysisService:
         progress: Callable[[str], None],
         lookup: Callable[[str], object] | None = None,
     ) -> str | None:
-        """Analyze one server; return an error message if the whole server failed.
+        """Analyze one server; return an error message if the whole server failed
+        (``run_events.SERVER_CANCELLED`` if a cancel request stopped it).
 
         ``lookup`` replaces the Canonical lookup (used to retry only the failed CVEs).
         A server whose OS has no adapter is marked unsupported (and None is returned)."""
+        steps = self._steps(analysis.run_id, analysis.server_name)
+        try:
+            error = self._analyze_steps(analysis, steps, progress, lookup)
+        except run_events.StepTimeoutError as exc:
+            error = str(exc)  # the next server is not held up
+        except run_events.RunCancelled:
+            steps.end(run_events.CANCELLED, run_events.SERVER_CANCELLED, run_events.WARNING)
+            return run_events.SERVER_CANCELLED
+        except Exception as exc:
+            steps.end(run_events.FAILED, f"Unexpected error: {exc}", run_events.ERROR)
+            raise
+        if error:
+            steps.end(run_events.FAILED, error, run_events.ERROR)
+        else:
+            steps.end(run_events.DONE, "Analysis finished.")
+        return error
+
+    def _analyze_steps(
+        self,
+        analysis: ServerAnalysis,
+        steps: run_events.Steps,
+        progress: Callable[[str], None],
+        lookup: Callable[[str], object] | None,
+    ) -> str | None:
         server = self.db.get_server(analysis.server_id) if analysis.server_id else None
         if server is None:
             return "This server is no longer configured in EC2Patcher."
 
-        transport = self.transports.for_server(server)
+        transport = run_events.resolve_transport(steps, lambda: self.transports.for_server(server))
         self.db.update_server_analysis(analysis.id, transport=transport.label)
         logger.info("Analysis of %s: transport: %s", analysis.server_name, transport.label)
         if transport.error:
             return transport.error
         ssm = transport.target
-        result = self._remote(server, os_adapters.DEFAULT.facts_command, FACTS_TIMEOUT_SECONDS, ssm)
-        if not result.ok:
-            return result.error
-        os_release = os_adapters.os_release_from_output(result.stdout)
-        adapter = os_adapters.detect(os_release)
-        if adapter is None:
-            self._mark_unsupported(analysis, result.stdout, os_release)
-            patch_report.safely(patch_report.record_analysis, self.db, analysis.id)
-            return None
-        if adapter is not os_adapters.DEFAULT:  # the OS's own read-only facts command
-            result = self._remote(server, adapter.facts_command, FACTS_TIMEOUT_SECONDS, ssm)
-            if not result.ok:
-                return result.error
-        try:
-            facts = adapter.parse_facts(result.stdout)
-        except server_state.RemoteOutputError as exc:
-            return f"Malformed remote output: {exc}"
-        self.db.update_server_analysis(
-            analysis.id,
-            remote_hostname=facts.hostname,
-            os_pretty_name=facts.pretty_name,
-            os_version_id=facts.version_id,
-            os_codename=facts.codename,
-            architecture=facts.architecture,
-            running_kernel=facts.kernel,
-            current_reboot_required=facts.reboot_required,
-            reboot_required_packages=facts.reboot_required_pkgs,
-            os_id=adapter.os_id,
-        )
-        unsupported = adapter.check_supported(facts)
-        if unsupported:
-            return unsupported
-        blocker = adapter.blocker(facts)
-        if blocker:  # no plan: the package manager cannot upgrade anything until repaired
-            return blocker
 
-        context = os_adapters.AnalysisContext(
-            metadata=self.metadata,
-            packages=self.apt,
-            progress=progress,
-            record=lambda **fields: self.db.update_server_analysis(analysis.id, **fields),
-            lookup=lookup,
-            advisories=self.advisories,
-        )
-        assessment = adapter.assess(facts, analysis.reported_cves, context)
-        self._enrich_severity(assessment.findings, progress)
+        def remote(command: str, phase: str) -> ssh_service.RemoteResult:
+            timeout = steps.command_timeout(FACTS_TIMEOUT_SECONDS)
+            return steps.guard(lambda: self._remote(server, command, timeout, ssm), phase)
+
+        with steps.step(run_events.OPEN_SSH, "Connecting and collecting the facts") as step:
+            result = remote(os_adapters.DEFAULT.facts_command, run_events.OPEN_SSH)
+            if not result.ok:
+                step.fail(result.error)
+                return result.error
+            step.finish("Connected; facts collected")
+        with steps.step(run_events.DETECT_OS, "Reading /etc/os-release") as step:
+            os_release = os_adapters.os_release_from_output(result.stdout)
+            adapter = os_adapters.detect(os_release)
+            if adapter is None:
+                self._mark_unsupported(analysis, result.stdout, os_release)
+                patch_report.safely(patch_report.record_analysis, self.db, analysis.id)
+                step.finish(os_adapters.unsupported_message(os_release))
+                return None
+            step.finish(os_release.get("PRETTY_NAME") or os_adapters.describe(os_release))
+        with steps.step(run_events.LIST_PACKAGES, "Listing the installed packages") as step:
+            if adapter is not os_adapters.DEFAULT:  # the OS's own read-only facts command
+                result = remote(adapter.facts_command, run_events.LIST_PACKAGES)
+                if not result.ok:
+                    step.fail(result.error)
+                    return result.error
+            try:
+                facts = adapter.parse_facts(result.stdout)
+            except server_state.RemoteOutputError as exc:
+                step.fail(f"Malformed remote output: {exc}")
+                return f"Malformed remote output: {exc}"
+            self.db.update_server_analysis(
+                analysis.id,
+                remote_hostname=facts.hostname,
+                os_pretty_name=facts.pretty_name,
+                os_version_id=facts.version_id,
+                os_codename=facts.codename,
+                architecture=facts.architecture,
+                running_kernel=facts.kernel,
+                current_reboot_required=facts.reboot_required,
+                reboot_required_packages=facts.reboot_required_pkgs,
+                os_id=adapter.os_id,
+            )
+            unsupported = adapter.check_supported(facts)
+            if unsupported:
+                step.fail(unsupported)
+                return unsupported
+            blocker = adapter.blocker(facts)
+            if blocker:  # no plan: the package manager cannot upgrade anything until repaired
+                step.fail(blocker)
+                return blocker
+            step.finish(f"{len(facts.packages)} packages installed")
+        with steps.step(run_events.MAP_CVES, "Matching the reported CVEs") as step:
+            cves = len(analysis.reported_cves)
+            step.finish(f"{cves} reported CVEs against {len(facts.packages)} installed packages")
+
+        assessment = self._assess(analysis, adapter, facts, steps, progress, lookup)
         reboot, reason = adapter.expected_reboot(assessment.plan)
         self.db.save_server_results(
             analysis.id,
@@ -566,6 +675,83 @@ class AnalysisService:
         )
         patch_report.safely(patch_report.record_analysis, self.db, analysis.id)
         return None
+
+    def _assess(self, analysis, adapter, facts, steps, progress, lookup):
+        """The lookups and the fix versions. One adapter call does both, so it says when the
+        lookups are over (``lookups_done``); the NVD severities are fetched at that point."""
+        lookups = steps.begin(run_events.LOOKUPS, "Looking up the reported CVEs")
+        current = [lookups]
+
+        def report(message: str) -> None:
+            progress(message)
+            current[-1].note(message)
+
+        def lookups_done(findings: list) -> None:
+            self._enrich_severity(findings, progress, steps, lookups)
+            lookups.finish(self._lookup_summary())
+            current.append(steps.begin(run_events.COMPUTE_FIXES, "Computing the fix versions"))
+
+        context = os_adapters.AnalysisContext(
+            metadata=self.metadata,
+            packages=steps.guarded(self.apt, run_events.COMPUTE_FIXES),
+            progress=report,
+            record=lambda **fields: self.db.update_server_analysis(analysis.id, **fields),
+            lookup=self._reported_lookup(analysis, steps, lookups, progress, lookup),
+            advisories=steps.guarded(self.advisories, run_events.LOOKUPS),
+            lookups_done=lookups_done,
+        )
+        try:
+            assessment = adapter.assess(facts, analysis.reported_cves, context)
+            if len(current) == 1:  # this adapter had nothing to look up
+                lookups_done(assessment.findings)
+            self._enrich_severity(assessment.findings, progress, steps, current[-1])
+        except run_events.RunCancelled:
+            current[-1].finish()
+            raise
+        except (run_events.StepTimeoutError, Exception) as exc:
+            current[-1].fail(str(exc))
+            raise
+        current[-1].finish(
+            f"{len(assessment.findings)} findings, {len(assessment.plan)} packages planned"
+        )
+        return assessment
+
+    def _reported_lookup(self, analysis, steps, step, progress, lookup):
+        """The Canonical lookup with its step event ("CVE-2000-0001 (3 of 12): cache hit"), the
+        step timeout and the cancel check between two CVEs."""
+        base = lookup or self.metadata.lookup
+        total = len(analysis.reported_cves)
+        count = 0
+
+        def reported(cve: str):
+            nonlocal count
+            count += 1
+            label = f"{cve} ({count} of {total})"
+            steps.check_cancelled()
+            progress(f"Canonical lookup of {label}")
+            before = self.metadata.run_cache_stats()
+            try:
+                record = steps.guard(lambda: base(cve), run_events.LOOKUPS)
+            except Exception as exc:
+                step.note(f"{label}: lookup failed: {exc}", run_events.WARNING)
+                raise
+            step.note(f"{label}: {_lookup_source(before, self.metadata.run_cache_stats())}")
+            return record
+
+        return reported
+
+    def _lookup_summary(self) -> str:
+        """Cache hits, misses and API calls of this run so far, from the run's own tallies."""
+        parts = []
+        for name, label in ((CACHE_CANONICAL, "Canonical"), (CACHE_NVD, "NVD"),
+                            (CACHE_AMAZON, "Amazon")):  # fmt: skip
+            stats = CacheStats.from_dict(self._cache_stats().get(name))
+            if stats.total:
+                parts.append(
+                    f"{label}: {stats.cache} cache hits, {stats.live + stats.failed} misses, "
+                    f"{stats.live} API calls, {stats.failed} failed"
+                )
+        return "; ".join(parts) or "Nothing to look up"
 
     def _mark_unsupported(self, analysis: ServerAnalysis, stdout: str, os_release: dict) -> None:
         """Record what was learned about a server whose OS has no adapter (not a failure)."""
@@ -585,15 +771,36 @@ class AnalysisService:
             os_id=os_release.get("ID") or None,
         )
 
-    def _enrich_severity(self, findings: list, progress: Callable[[str], None]) -> None:
+    def _enrich_severity(
+        self,
+        findings: list,
+        progress: Callable[[str], None],
+        steps: run_events.Steps,
+        step: run_events.Step,
+    ) -> None:
         """Attach NVD CVSS data to the findings. Statuses and plans are never touched."""
-        cves = list(dict.fromkeys(f.cve for f in findings))
+        cves = list(dict.fromkeys(f.cve for f in findings if f.cvss is None))
         for index, cve in enumerate(cves, start=1):
+            steps.check_cancelled()
             progress(f"Fetching NVD severity data ({index} of {len(cves)})")
-            result = self.nvd.lookup(cve)  # never raises; cached / memoized per run
+            before = self.nvd.run_cache_stats()
+            # never raises; cached / memoized per run
+            result = steps.guard(lambda cve=cve: self.nvd.lookup(cve), run_events.LOOKUPS)
+            source = _lookup_source(before, self.nvd.run_cache_stats())
+            step.note(f"NVD {cve} ({index} of {len(cves)}): {source}")
             for f in findings:
                 if f.cve == cve:
                     f.cvss = result
+
+
+def _lookup_source(before: CacheStats, after: CacheStats) -> str:
+    """Where one lookup's answer came from, by what it added to the run's tallies. Without an
+    addition the answer was already known this run."""
+    if after.live > before.live:
+        return "API call"
+    if after.failed > before.failed:
+        return "lookup failed"
+    return "cache hit"
 
 
 # --- presentation helpers -------------------------------------------------------------

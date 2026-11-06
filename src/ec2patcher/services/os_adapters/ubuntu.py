@@ -74,6 +74,7 @@ class UbuntuAdapter(OsAdapter):
             warnings.append("Some Canonical metadata lookups failed; those CVEs remain unresolved.")
         elif any(f.status == cve_resolver.UNKNOWN for f in findings):
             warnings.append("Some CVEs have no usable Canonical statement for this Ubuntu release.")
+        ctx.lookups_done(findings)
         candidates: dict[str, apt_planner.Candidate] = {}
         requests: list[tuple[str, str]] = []
         state: local_apt.AptState | None = None

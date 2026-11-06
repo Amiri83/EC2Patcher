@@ -298,6 +298,7 @@ class AmazonLinuxAdapter(OsAdapter):
                         detail=f"Analysis error: {exc}",
                     )
                 )  # fmt: skip
+        ctx.lookups_done(findings)
         if facts.system_release and facts.system_release != releasever:
             warnings.append(
                 f"dnf uses releasever {releasever} ({facts.releasever_source}); the installed "

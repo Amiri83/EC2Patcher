@@ -2,12 +2,13 @@
 
 import logging
 import os
+import re
 import signal
 import subprocess  # noqa: S404 - default runner handed to the ssh service
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
@@ -38,6 +39,7 @@ from ec2patcher.services import (
     patch_report,
     patch_service,
     report_service,
+    run_events,
     secret_store,
     security_list,
     ssh_service,
@@ -107,6 +109,8 @@ NOTICES = {
         "lookup."
     ),
     "cache_ttl_reset": "Cache TTLs reset to default. No entries were deleted.",
+    "step_timeout_saved": "Step timeout saved. It applies from the next step of a run.",
+    "step_timeout_reset": "Step timeout reset to default.",
     "connection_saved": (
         "Connection defaults saved. Servers with their own connection type keep it."
     ),
@@ -952,6 +956,47 @@ def create_app(
     def server_report(request: Request, run_id: int, analysis_id: int):
         return server_report_page(request, run_id, analysis_id)
 
+    # --- live progress of a run --------------------------------------------------------
+
+    def reconcile_run(ref: run_events.RunRef) -> None:
+        """A run whose worker died must read as finished, and cannot be cancelled any more."""
+        (analyzer if ref.kind == run_events.KIND_ANALYSIS else patcher).reconcile()
+
+    unknown_run = {"error": "Unknown run."}
+
+    @app.get("/runs/{run_ref}/events")
+    def run_progress_events(request: Request, run_ref: str):
+        """The step events after the id ``after``, and the state of the run. Server names say
+        something about the user, so other sites must not read them."""
+        if rejected := rejected_cross_site(request):
+            return rejected
+        ref = run_events.parse_ref(run_ref)
+        if ref is None:
+            return JSONResponse(unknown_run, status_code=404)
+        after = request.query_params.get("after", "0")
+        if not re.fullmatch(r"\d{1,18}", after):
+            error = {"error": "after must be a non-negative whole number."}
+            return JSONResponse(error, status_code=422)
+        reconcile_run(ref)
+        payload = run_events.events_payload(db, ref, int(after))
+        if payload is None:
+            return JSONResponse(unknown_run, status_code=404)
+        return JSONResponse(
+            {**payload, "now": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
+        )
+
+    @app.post("/runs/{run_ref}/cancel")
+    def cancel_run(run_ref: str):
+        """Stop a run after its current step. A finished run, or a second request, is a no-op."""
+        ref = run_events.parse_ref(run_ref)
+        if ref is None:
+            return JSONResponse({**unknown_run, "accepted": False}, status_code=404)
+        reconcile_run(ref)
+        answer = run_events.request_cancel(db, ref)
+        if answer is None:
+            return JSONResponse({**unknown_run, "accepted": False}, status_code=404)
+        return JSONResponse(answer)
+
     # --- patch execution (Phase 3) ---------------------------------------------------
 
     @app.get("/analysis/{run_id}/servers/{analysis_id}/approve", response_class=HTMLResponse)
@@ -1130,6 +1175,12 @@ def create_app(
             connection_errors=ctx.pop("connection_errors", {}),
             ssm_plugin_location=ssm_plugin.find_plugin(),
             ssm_plugin_dir=config.get_plugin_bin_dir(), ssm_status=ctx.pop("ssm_status", None),
+            step_timeout_value=ctx.pop("step_timeout_value", None)
+            or cache_settings.step_timeout(db),
+            step_timeout_error=ctx.pop("step_timeout_error", None),
+            step_timeout_default=cache_settings.DEFAULT_STEP_TIMEOUT_SECONDS,
+            step_timeout_min=cache_settings.MIN_STEP_TIMEOUT_SECONDS,
+            step_timeout_max=cache_settings.MAX_STEP_TIMEOUT_SECONDS,
             **ctx,
         )  # fmt: skip
 
@@ -1267,6 +1318,24 @@ def create_app(
             )
         ttls.save(hours)  # entries are kept; expired ones refresh on their next lookup
         return redirect("/settings", notice="cache_ttl_saved")
+
+    @app.post("/settings/step-timeout", response_class=HTMLResponse)
+    def save_step_timeout(
+        request: Request, action: str = Form("save"), step_timeout: str = Form("")
+    ):
+        if action == "reset":
+            db.delete_setting(cache_settings.STEP_TIMEOUT_SETTING)
+            logger.info("Step timeout reset to default")
+            return redirect("/settings", notice="step_timeout_reset")
+        seconds, error = cache_settings.parse_step_timeout(step_timeout)
+        if error:
+            return settings_page(
+                request, status_code=422, step_timeout_value=step_timeout[:32],
+                step_timeout_error=error,
+            )  # fmt: skip
+        db.set_setting(cache_settings.STEP_TIMEOUT_SETTING, str(seconds))
+        logger.info("Step timeout set to %d s", seconds)
+        return redirect("/settings", notice="step_timeout_saved")
 
     @app.post("/settings/clear-cache")
     def clear_security_cache():

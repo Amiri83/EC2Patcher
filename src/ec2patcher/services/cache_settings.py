@@ -8,6 +8,8 @@ between 1 hour and 365 days.
 
 A TTL only decides when an entry is refreshed: changing it never deletes cache entries;
 entries older than the new TTL are refreshed on their next lookup.
+
+The per-step timeout of analysis and patch runs (Settings -> Run progress) is saved the same way.
 """
 
 import json
@@ -145,6 +147,43 @@ def validate_form(form: dict[str, str]) -> tuple[dict[str, int], dict[str, str]]
     if not errors and hours[CANONICAL_UNSETTLED] > hours[CANONICAL]:
         errors[CANONICAL_UNSETTLED] = "Must not be longer than the TTL of settled CVEs."
     return hours, errors
+
+
+# --- per-step timeout of analysis and patch runs -------------------------------------------------
+
+STEP_TIMEOUT_SETTING = "step_timeout_seconds"
+DEFAULT_STEP_TIMEOUT_SECONDS = 300
+MIN_STEP_TIMEOUT_SECONDS = 10
+MAX_STEP_TIMEOUT_SECONDS = 3600
+
+
+def parse_step_timeout(text: str) -> tuple[int | None, str | None]:
+    """(seconds, None) for a whole number within the bounds; (None, error) otherwise."""
+    value = (text or "").strip()
+    bounds = f"between {MIN_STEP_TIMEOUT_SECONDS} and {MAX_STEP_TIMEOUT_SECONDS} seconds"
+    if not re.fullmatch(r"\d{1,7}", value):
+        return None, f"Enter a whole number of seconds, {bounds}."
+    seconds = int(value)
+    if not MIN_STEP_TIMEOUT_SECONDS <= seconds <= MAX_STEP_TIMEOUT_SECONDS:
+        return None, f"The step timeout must be {bounds}."
+    return seconds, None
+
+
+def step_timeout(db: Database) -> int:
+    """The saved per-step timeout in seconds; the default when unset, no longer valid or
+    unreadable. Never raises: it is read while a run is going."""
+    try:
+        stored = db.get_setting(STEP_TIMEOUT_SETTING)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Cannot read the step timeout: %s", exc)
+        return DEFAULT_STEP_TIMEOUT_SECONDS
+    if stored is None:
+        return DEFAULT_STEP_TIMEOUT_SECONDS
+    seconds, error = parse_step_timeout(stored)
+    if error:
+        logger.warning("Ignoring the invalid saved step timeout %r", stored)
+        return DEFAULT_STEP_TIMEOUT_SECONDS
+    return seconds
 
 
 # --- cache badges ------------------------------------------------------------------------------

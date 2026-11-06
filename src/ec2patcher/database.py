@@ -30,7 +30,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -393,6 +393,29 @@ _MIGRATIONS = {
             error           TEXT,
             updated_at      TEXT NOT NULL,
             UNIQUE (server_name, cve)
+        );
+    """,
+    # Live progress: the step events of a run, written while it runs (run_kind + run_id name the
+    # run: analysis run, patch execution or Patch All queue, each with its own ids), and the
+    # cancel requests the workers check between steps. In the database so they outlive a restart.
+    18: """
+        CREATE TABLE run_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_kind     TEXT NOT NULL DEFAULT 'analysis',
+            run_id       INTEGER NOT NULL,
+            ts           TEXT NOT NULL,
+            server       TEXT,
+            phase        TEXT NOT NULL,
+            message      TEXT NOT NULL,
+            level        TEXT NOT NULL DEFAULT 'info',
+            duration_ms  INTEGER
+        );
+        CREATE INDEX idx_run_events_run ON run_events(run_id, id);
+        CREATE TABLE run_cancel_requests (
+            run_kind      TEXT NOT NULL,
+            run_id        INTEGER NOT NULL,
+            requested_at  TEXT NOT NULL,
+            PRIMARY KEY (run_kind, run_id)
         );
     """,
 }
@@ -1184,9 +1207,31 @@ class Database:
             )
 
     def mark_interrupted_runs(self) -> int:
-        """Runs still 'running' at startup were cut short by a restart; say so explicitly."""
+        """Runs still 'running' at startup were cut short by a restart; say so explicitly. A run
+        whose cancel was requested ends as cancelled: it was asked to stop, and it stopped."""
         now = _now()
         with self.connect() as conn:
+            requested = (
+                "SELECT id FROM analysis_runs WHERE status = 'running' AND id IN "
+                "(SELECT run_id FROM run_cancel_requests WHERE run_kind = 'analysis')"
+            )
+            conn.execute(
+                "UPDATE server_analyses SET status = 'cancelled', completed_at = ?, "  # noqa: S608
+                "error = 'The run was cancelled before this server was analyzed.' "
+                f"WHERE status = 'waiting' AND run_id IN ({requested})",
+                (now,),
+            )
+            conn.execute(
+                "UPDATE server_analyses SET status = 'failed', completed_at = ?, "  # noqa: S608
+                "error = 'Analysis was interrupted (application stopped).' "
+                f"WHERE status = 'analyzing' AND run_id IN ({requested})",
+                (now,),
+            )
+            cancelled = conn.execute(
+                "UPDATE analysis_runs SET status = 'cancelled', completed_at = ?, "  # noqa: S608
+                f"progress_message = NULL WHERE id IN ({requested})",
+                (now,),
+            ).rowcount
             conn.execute(
                 "UPDATE server_analyses SET status = 'failed', completed_at = ?, "
                 "error = 'Analysis was interrupted (application stopped).' "
@@ -1200,7 +1245,7 @@ class Database:
                 "WHERE status = 'running'",
                 (now,),
             )
-        return cur.rowcount
+        return cur.rowcount + cancelled
 
     def list_analysis_runs(self, limit: int = 20) -> list[AnalysisRun]:
         with self.connect() as conn:
@@ -1439,6 +1484,86 @@ class Database:
     def delete_setting(self, key: str) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+    # --- run progress: step events and cancel requests --------------------------------
+
+    def add_run_event(
+        self,
+        run_kind: str,
+        run_id: int,
+        server: str | None,
+        phase: str,
+        message: str,
+        level: str,
+        duration_ms: int | None,
+    ) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO run_events (run_kind, run_id, ts, server, phase, message, level, "
+                "duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_kind, run_id, _now(), server, phase, message, level, duration_ms),
+            )
+            return cur.lastrowid
+
+    def list_run_events(
+        self, run_kind: str, run_id: int, after: int = 0, limit: int = 500
+    ) -> list[sqlite3.Row]:
+        """The events of one run newer than the id ``after``, oldest first."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM run_events WHERE run_id = ? AND run_kind = ? AND id > ? "
+                "ORDER BY id LIMIT ?",
+                (run_id, run_kind, after, limit),
+            ).fetchall()
+
+    def count_cve_lookup_events(self, run_kind: str, run_id: int, server: str) -> int:
+        """CVEs looked up so far for ``server``: per-CVE events of Canonical or, on systems
+        without a per-CVE Canonical lookup, of NVD."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(message GLOB 'CVE-*'), 0) AS canonical, "
+                "COALESCE(SUM(message GLOB 'NVD CVE-*'), 0) AS nvd FROM run_events "
+                "WHERE run_id = ? AND run_kind = ? AND server = ? AND phase = 'lookups'",
+                (run_id, run_kind, server),
+            ).fetchone()
+        return max(row["canonical"], row["nvd"])
+
+    def request_run_cancel(self, run_kind: str, run_id: int) -> bool:
+        """Record a cancel request; False if one was already recorded."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO run_cancel_requests (run_kind, run_id, requested_at) "
+                "VALUES (?, ?, ?)",
+                (run_kind, run_id, _now()),
+            )
+            return cur.rowcount > 0
+
+    def run_cancel_requested(self, run_kind: str, run_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM run_cancel_requests WHERE run_kind = ? AND run_id = ?",
+                (run_kind, run_id),
+            ).fetchone()
+        return row is not None
+
+    def clear_run_cancel(self, run_kind: str, run_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM run_cancel_requests WHERE run_kind = ? AND run_id = ?",
+                (run_kind, run_id),
+            )
+
+    def reported_cve_counts(self, analysis_ids: list[int]) -> dict[int, int]:
+        """Reported CVEs per server analysis, without loading its findings and plan."""
+        if not analysis_ids:
+            return {}
+        marks = ",".join("?" * len(analysis_ids))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, reported_cves FROM server_analyses WHERE id IN ({marks})",  # noqa: S608
+                analysis_ids,
+            ).fetchall()
+        return {r["id"]: len(json.loads(r["reported_cves"] or "[]")) for r in rows}
 
     # --- patch executions (Phase 3) -----------------------------------------------
 

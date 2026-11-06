@@ -323,7 +323,8 @@ class AnalysisRun:
     report: dict[str, list[str]]
     started_at: str
     completed_at: str | None
-    status: str  # running | completed | completed_with_errors | failed | interrupted
+    # running | completed | completed_with_errors | failed | interrupted | cancelled
+    status: str
     progress_message: str | None
     metadata_source: str | None
     metadata_updated_at: str | None

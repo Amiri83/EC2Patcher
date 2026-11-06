@@ -1,8 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Analysis #{{ run.id }}{% endblock %}
-{% block head %}{% if run.is_running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block head %}{% if run.is_running %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}
 {% block heading %}Pre-Patch Analysis #{{ run.id }}{% endblock %}
-{% block header_actions %}<a href="/reports#analysis" class="btn btn-secondary">Back to Reports</a>{% endblock %}
+{% block header_actions %}<div class="header-actions">
+  <button type="button" class="btn btn-secondary rp-needs-js" data-rp-show>Show progress</button>
+  <a href="/reports#analysis" class="btn btn-secondary">Back to Reports</a>
+</div>{% endblock %}
+{% block overlay %}{% with progress_ref=run.id, progress_active=run.is_running %}{% include "_run_progress.html" %}{% endwith %}{% endblock %}
 {% block content %}
 <div class="card">
   <div class="card-header">
@@ -38,19 +42,19 @@
     {% for s in run.servers %}
       {% set sm = summaries[s.id] %}
       <li class="progress-item progress-{{ s.status }}">
-        <span class="progress-icon" aria-hidden="true">{% if s.status == "complete" %}&#10003;{% elif s.status == "analyzing" %}&#9679;{% elif s.status == "waiting" %}&#9675;{% elif s.status == "unsupported" %}&#8856;{% else %}&#10005;{% endif %}</span>
+        <span class="progress-icon" aria-hidden="true">{% if s.status == "complete" %}&#10003;{% elif s.status == "analyzing" %}&#9679;{% elif s.status == "waiting" %}&#9675;{% elif s.status in ("unsupported", "cancelled") %}&#8856;{% else %}&#10005;{% endif %}</span>
         <div class="progress-main">
           <div>
             <strong>{{ s.server_name }}</strong>
             {% if s.display_name %}<span class="muted">&middot; {{ s.display_name }}</span>{% endif %}
             <span class="progress-state">
-              {% if s.status == "complete" %}Complete{% elif s.status == "analyzing" %}Analyzing{% elif s.status == "waiting" %}Waiting{% elif s.status == "unsupported" %}Not supported{% else %}Failed{% endif %}
+              {% if s.status == "complete" %}Complete{% elif s.status == "analyzing" %}Analyzing{% elif s.status == "waiting" %}Waiting{% elif s.status == "unsupported" %}Not supported{% elif s.status == "cancelled" %}Cancelled{% else %}Failed{% endif %}
             </span>
           </div>
           {% if s.transport %}<div class="muted small server-transport">Transport: {{ s.transport }}</div>{% endif %}
           {% if s.status == "failed" %}
             <div class="progress-error">{{ s.error }}</div>
-          {% elif s.status == "unsupported" %}
+          {% elif s.status in ("unsupported", "cancelled") %}
             <div class="muted">{{ s.error }}</div>
           {% elif s.status == "complete" %}
             <div class="server-meta">

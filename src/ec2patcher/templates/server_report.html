@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ analysis.server_name }} - Pre-Patch Report{% endblock %}
-{% block head %}{% if run.is_running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block head %}{% if run.is_running %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}
+{% block overlay %}{% if run.is_running %}{% with progress_ref=run.id, progress_active=true %}{% include "_run_progress.html" %}{% endwith %}{% endif %}{% endblock %}
 {% block heading %}Pre-Patch Report: {{ analysis.server_name }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
   {% if analysis.server_id and not run.is_running %}

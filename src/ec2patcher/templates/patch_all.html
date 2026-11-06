@@ -1,16 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Patch All #{{ queue.id }}{% endblock %}
-{% block head %}{% if queue.is_running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block head %}{% if queue.is_running %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}
 {% block heading %}Patch All #{{ queue.id }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
+  <button type="button" class="btn btn-secondary rp-needs-js" data-rp-show>Show progress</button>
   <a href="/analysis/{{ queue.analysis_run_id }}" class="btn btn-secondary">Analysis #{{ queue.analysis_run_id }}</a>
   <a href="/history" class="btn btn-secondary">History</a>
 </div>{% endblock %}
+{% block overlay %}{% with progress_ref="queue-%d"|format(queue.id), progress_active=queue.is_running %}{% include "_run_progress.html" %}{% endwith %}{% endblock %}
 {% block content %}
 <div class="card {% if queue.state == 'COMPLETED' %}result-ok{% elif queue.state == 'STOPPED' %}result-fail{% endif %}">
   <div class="card-header">
-    <h2>{% if queue.is_running %}Patching servers one at a time{% elif queue.state == "COMPLETED" %}PATCH ALL COMPLETED{% else %}PATCH ALL STOPPED{% endif %}</h2>
-    <span class="badge {{ {'COMPLETED': 'badge-success', 'STOPPED': 'badge-danger'}.get(queue.state, 'badge-warning') }}">{{ queue.state }}</span>
+    <h2>{% if queue.is_running %}Patching servers one at a time{% elif queue.state == "COMPLETED" %}PATCH ALL COMPLETED{% elif queue.state == "CANCELLED" %}PATCH ALL CANCELLED{% else %}PATCH ALL STOPPED{% endif %}</h2>
+    <span class="badge {{ {'COMPLETED': 'badge-success', 'STOPPED': 'badge-danger', 'CANCELLED': 'badge-neutral'}.get(queue.state, 'badge-warning') }}">{{ queue.state }}</span>
   </div>
   <dl class="kv">
     <dt>Started</dt><dd>{{ queue.created_at|timestamp }}</dd>

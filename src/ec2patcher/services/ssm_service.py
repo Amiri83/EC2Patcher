@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import subprocess  # noqa: S404 - runs the aws CLI as an argument list
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -565,6 +566,9 @@ class Transport:
     label: str
     target: SsmTarget | None = None
     error: str | None = None
+    # For the progress panel; None when no preflight applied (direct SSH, bad settings).
+    preflight_ms: int | None = field(default=None, compare=False)
+    preflight_failed: bool = field(default=False, compare=False)
 
 
 @dataclass
@@ -600,16 +604,18 @@ class TransportResolver:
             return Transport(base, error=error)
         profile, region = _aws_settings(server, defaults)
         unresolved = f"{base} (profile {profile}, region {region})"
+        started = time.monotonic()
         error = self._preflight_error(profile, region)
+        elapsed = int((time.monotonic() - started) * 1000)
         if error:
-            return Transport(unresolved, error=error)
+            return Transport(unresolved, error=error, preflight_ms=elapsed, preflight_failed=True)
         try:
             instance_id = self._instance_id(server, profile, region, force_refresh)
         except SsmError as exc:
             logger.warning("SSM target of %s: %s", server.name, exc)
-            return Transport(unresolved, error=str(exc))
+            return Transport(unresolved, error=str(exc), preflight_ms=elapsed)
         target = SsmTarget(instance_id, profile, region)
-        return Transport(transport_label(target), target)
+        return Transport(transport_label(target), target, preflight_ms=elapsed)
 
     def _instance_id(self, server, profile: str, region: str, force_refresh: bool) -> str:
         if server.instance_id_override:

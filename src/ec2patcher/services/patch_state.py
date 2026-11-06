@@ -27,6 +27,9 @@ ALREADY_PATCHED = "ALREADY_PATCHED"
 # The worker stopped (app restart / crashed thread) before the install could have started:
 # the server's packages are unchanged. Later stages end as UNKNOWN instead (not provable).
 INTERRUPTED = "INTERRUPTED"
+# The operator cancelled before the install started: the server's packages are unchanged. Once
+# the install has started a cancel can no longer stop it, so INSTALLING has no way here.
+CANCELLED = "CANCELLED"
 
 # Pipeline order (used for progress display).
 PIPELINE = [
@@ -44,13 +47,13 @@ PIPELINE = [
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     PENDING_REVIEW: frozenset({APPROVED, REJECTED}),
-    APPROVED: frozenset({REVALIDATING, FAILED, INTERRUPTED}),
-    REVALIDATING: frozenset({DOWNLOADING, FAILED, ALREADY_PATCHED, INTERRUPTED}),
-    DOWNLOADING: frozenset({VERIFYING_DOWNLOADS, FAILED, INTERRUPTED}),
-    VERIFYING_DOWNLOADS: frozenset({TRANSFERRING, FAILED, INTERRUPTED}),
-    TRANSFERRING: frozenset({VERIFYING_TRANSFER, FAILED, INTERRUPTED}),
-    VERIFYING_TRANSFER: frozenset({SIMULATING_INSTALL, FAILED, INTERRUPTED}),
-    SIMULATING_INSTALL: frozenset({INSTALLING, FAILED, INTERRUPTED}),
+    APPROVED: frozenset({REVALIDATING, FAILED, INTERRUPTED, CANCELLED}),
+    REVALIDATING: frozenset({DOWNLOADING, FAILED, ALREADY_PATCHED, INTERRUPTED, CANCELLED}),
+    DOWNLOADING: frozenset({VERIFYING_DOWNLOADS, FAILED, INTERRUPTED, CANCELLED}),
+    VERIFYING_DOWNLOADS: frozenset({TRANSFERRING, FAILED, INTERRUPTED, CANCELLED}),
+    TRANSFERRING: frozenset({VERIFYING_TRANSFER, FAILED, INTERRUPTED, CANCELLED}),
+    VERIFYING_TRANSFER: frozenset({SIMULATING_INSTALL, FAILED, INTERRUPTED, CANCELLED}),
+    SIMULATING_INSTALL: frozenset({INSTALLING, FAILED, INTERRUPTED, CANCELLED}),
     # From here on packages may have changed: an unprovable outcome is UNKNOWN, never FAILED
     # or SUCCESS by assumption.
     INSTALLING: frozenset({VERIFYING_INSTALL, FAILED, UNKNOWN}),
@@ -63,6 +66,7 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     UNKNOWN: frozenset(),
     ALREADY_PATCHED: frozenset(),
     INTERRUPTED: frozenset(),
+    CANCELLED: frozenset(),
 }
 
 TERMINAL = frozenset(s for s, targets in ALLOWED_TRANSITIONS.items() if not targets)
@@ -92,10 +96,12 @@ LABELS = {
     UNKNOWN: "EXECUTION STATE UNKNOWN",
     ALREADY_PATCHED: "ALREADY PATCHED",
     INTERRUPTED: "INTERRUPTED",
+    CANCELLED: "CANCELLED",
 }
 
 BADGES = {
     INTERRUPTED: "badge-danger",
+    CANCELLED: "badge-neutral",
     REJECTED: "badge-neutral",
     SUCCESS: "badge-success",
     SUCCESS_WITH_CLEANUP_WARNING: "badge-success",
@@ -142,6 +148,7 @@ REBOOT_BADGES = {
 QUEUE_RUNNING = "RUNNING"
 QUEUE_COMPLETED = "COMPLETED"
 QUEUE_STOPPED = "STOPPED"  # a server failed; the remaining servers were not run
+QUEUE_CANCELLED = "CANCELLED"  # the operator cancelled; the remaining servers were not run
 
 ITEM_PENDING = "PENDING"
 ITEM_RUNNING = "RUNNING"
@@ -149,12 +156,14 @@ ITEM_SUCCESS = "SUCCESS"
 ITEM_FAILED = "FAILED"
 ITEM_SKIPPED = "SKIPPED"  # not eligible; never touched
 ITEM_NOT_RUN = "NOT_RUN"  # eligible, but the queue stopped before its turn
+ITEM_CANCELLED = "CANCELLED"  # the operator cancelled before or during its turn
 
 ITEM_BADGES = {
     ITEM_SUCCESS: "badge-success",
     ITEM_FAILED: "badge-danger",
     ITEM_SKIPPED: "badge-neutral",
     ITEM_NOT_RUN: "badge-warning",
+    ITEM_CANCELLED: "badge-neutral",
 }
 
 
