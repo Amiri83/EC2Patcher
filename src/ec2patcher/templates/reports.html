@@ -119,7 +119,8 @@
   <dl class="kv metadata-kv">
     <dt>Canonical security metadata</dt>
     <dd>
-      Canonical security data is queried online per CVE during analysis.
+      Each CVE is resolved by the first source that answers: Canonical's OVAL feed, the USN
+      notices, the package's changelog, then the per-CVE JSON as a last resort.
     </dd>
   </dl>
   {% if metadata_status.warning %}<div class="alert alert-warning">{{ metadata_status.warning }}</div>{% endif %}

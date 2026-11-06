@@ -307,7 +307,8 @@ def test_default_fetcher_uses_configured_timeout(monkeypatch):
     monkeypatch.setattr(
         security_metadata, "http_get", lambda url, timeout=None: seen.append(timeout) or {}
     )
-    assert SecurityMetadata().timeout == 20  # default per-request timeout
+    # default per-request timeout: short, the per-CVE JSON is only the last resort
+    assert SecurityMetadata().timeout == security_metadata.REQUEST_TIMEOUT_SECONDS == 5
     meta = SecurityMetadata(timeout=7)
     with pytest.raises(ValueError):
         meta.lookup("CVE-2026-50001")

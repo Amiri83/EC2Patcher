@@ -300,6 +300,7 @@ def test_full_web_flow_real_analysis_then_patch(web, pem_file, tmp_path, monkeyp
         def no_nvd(*args, **kwargs):
             raise AssertionError("NVD must not be called during patch execution")
 
+        offline_nvd = nvd.http_get  # conftest's offline stub
         monkeypatch.setattr(nvd, "http_get", no_nvd)
         r = c.post(f"{report_url}/approve", data={"confirm": "yes"}, follow_redirects=False)
         assert r.status_code == 303 and r.headers["location"].startswith("/patch/")
@@ -327,7 +328,9 @@ def test_full_web_flow_real_analysis_then_patch(web, pem_file, tmp_path, monkeyp
         assert "4/4 verified" in history and "Rebooted" in history
 
         # A fresh analysis sees the patched versions (Phase 2 remains read-only).
-        monkeypatch.undo()
+        # Only the NVD guard is lifted: monkeypatch.undo() would also drop conftest's
+        # offline fakes (shared monkeypatch), and the analysis would reach the network.
+        monkeypatch.setattr(nvd, "http_get", offline_nvd)
         upload(c, {SERVER: ["CVE-2026-63076"]})
         run_url = c.post("/reports/analyze", follow_redirects=False).headers["location"]
         run_page = c.get(run_url).text
