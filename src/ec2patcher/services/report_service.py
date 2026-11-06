@@ -48,6 +48,11 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return seen
 
 
+def dump_report(servers: dict[str, list[str]]) -> bytes:
+    """A report as a JSON file, in the format :func:`validate_report` accepts."""
+    return json.dumps(servers, indent=2).encode()
+
+
 def safe_filename(filename: str | None) -> str:
     name = os.path.basename((filename or "").replace("\\", "/")).strip()
     return name[:255] or "report.json"

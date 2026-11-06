@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Paste Security List{% endblock %}
+{% block heading %}Paste Security List{% endblock %}
+{% block header_actions %}<a href="/reports" class="btn btn-secondary">Back to Reports</a>{% endblock %}
+{% block content %}
+{% if loaded %}
+  <div class="card result-ok" id="import-loaded">
+    <div class="card-header">
+      <h2>Loaded</h2>
+      <span class="badge badge-success">VALID</span>
+    </div>
+    <dl class="kv">
+      <dt>Report</dt><dd>{{ loaded.filename }}</dd>
+      <dt>Servers in report</dt><dd>{{ loaded.server_count }}</dd>
+      <dt>CVEs in report</dt><dd>{{ loaded.cve_count }}</dd>
+      <dt>Patch report rows</dt><dd>{{ report_rows }}</dd>
+    </dl>
+    <p class="muted small">It is now the latest report, ready to analyze.</p>
+    <div class="form-actions">
+      <a href="/reports/latest/download" class="btn btn-secondary">Download JSON</a>
+      <a href="/patch-report" class="btn btn-secondary">Patch Report</a>
+      <span class="spacer"></span>
+      <a href="/reports#analysis" class="btn btn-primary">Go to Analysis</a>
+    </div>
+  </div>
+{% endif %}
+
+<div class="card">
+  <h2>Raw text</h2>
+  <p class="muted small">Paste the list exactly as received: a chat table or plain lines, wrapped or not. Each record is comma-separated CVE IDs, a host (<code>ip-10-0-0-1</code> or <code>ip-10-0-0-1.us-east-1.compute.internal</code>) and a title like "Ubuntu Security Notification for example-package Vulnerabilities (USN-0000-1)". Other columns and text are ignored.</p>
+  <form method="post" action="/reports/import">
+    <div class="field">
+      <label for="raw_text">Pasted security list</label>
+      <textarea id="raw_text" name="raw_text" rows="12" spellcheck="false" class="paste-area">{{ raw_text }}</textarea>
+    </div>
+    <div class="form-actions">
+      <button type="submit" name="action" value="preview" class="btn btn-secondary">Preview</button>
+      {% if matched and not loaded %}
+        <span class="spacer"></span>
+        <button type="submit" name="action" value="confirm" class="btn btn-primary"{% if not (matched|selectattr("server_name")|list) %} disabled{% endif %}>Confirm and Load</button>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+{% if parsed %}
+  {% set unknown = matched|rejectattr("server_name")|list %}
+  {% if unknown %}
+    <div class="alert alert-warning" id="import-unknown">{{ unknown|length }} record{{ "" if unknown|length == 1 else "s" }} name{{ "s" if unknown|length == 1 else "" }} a host without a saved server and {{ "is" if unknown|length == 1 else "are" }} left out of the report. Add the server, then paste the list again.</div>
+  {% endif %}
+  {% if parsed.without_host %}
+    <div class="alert alert-warning" id="import-no-host">{{ parsed.without_host|length }} CVE run{{ "" if parsed.without_host|length == 1 else "s" }} had no host in the text and {{ "was" if parsed.without_host|length == 1 else "were" }} dropped: {% for run in parsed.without_host %}{{ run|join(", ") }}{% if not loop.last %}; {% endif %}{% endfor %}</div>
+  {% endif %}
+  {% if parsed.invalid_cves %}
+    <div class="alert alert-warning" id="import-invalid">Not valid CVE IDs, ignored: {{ parsed.invalid_cves|join(", ") }}</div>
+  {% endif %}
+  {% if matched %}
+    <div class="card" id="import-preview">
+      <div class="card-header">
+        <h2>Preview</h2>
+        <span class="badge badge-neutral">{{ matched|length }} record{{ "" if matched|length == 1 else "s" }}</span>
+      </div>
+      <div class="table-scroll">
+        <table class="table small">
+          <thead><tr><th>Host</th><th>Server</th><th class="num">CVEs</th><th>USNs</th><th>Package</th><th>Title</th></tr></thead>
+          <tbody>
+            {% for item in matched %}
+              <tr>
+                <td class="wrap"><code>{{ item.record.host }}</code></td>
+                <td>
+                  {% if item.server_name %}<strong>{{ item.server_name }}</strong> <span class="muted small">by {{ item.matched_by }}</span>
+                  {% elif item.candidates %}<span class="badge badge-warning">unknown</span> <span class="muted small">ambiguous: {{ item.candidates|join(", ") }} share this IP</span>
+                  {% else %}<span class="badge badge-warning">unknown</span>{% endif %}
+                </td>
+                <td class="num" title="{{ item.record.cves|join(', ') }}">{{ item.record.cves|length }}</td>
+                <td>{% for usn in item.record.usns %}<code>{{ usn }}</code>{% if not loop.last %} {% endif %}{% else %}<span class="muted">none</span>{% endfor %}</td>
+                <td>{{ item.record.package or "-" }}</td>
+                <td>{{ item.record.title or "-" }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endif %}
+{% endif %}
+{% endblock %}

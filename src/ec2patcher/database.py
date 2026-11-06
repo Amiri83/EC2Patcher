@@ -6,7 +6,7 @@ Only the PEM *path* is stored; private key contents are never read or persisted.
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +22,7 @@ from ec2patcher.models import (
     PatchPackageResult,
     PatchQueue,
     PatchQueueItem,
+    PatchReportRow,
     Server,
     ServerAnalysis,
     StoredReport,
@@ -29,7 +30,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -370,6 +371,30 @@ _MIGRATIONS = {
             PRIMARY KEY (private_ip, profile, region)
         );
     """,
+    # Patch report, one row per server x CVE. Keyed by server name, not id: the rows are history
+    # and outlive the server (a rename carries them along, see update_server).
+    17: """
+        CREATE TABLE patch_report (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_name     TEXT NOT NULL COLLATE NOCASE,
+            cve             TEXT NOT NULL,
+            hostname        TEXT,
+            usn             TEXT,
+            package         TEXT,
+            title           TEXT,
+            priority        TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN
+                ('pending', 'patched', 'failed', 'not-affected', 'reboot-required')),
+            version_before  TEXT,
+            version_after   TEXT,
+            imported_at     TEXT,
+            patched_at      TEXT,
+            run_id          INTEGER,
+            error           TEXT,
+            updated_at      TEXT NOT NULL,
+            UNIQUE (server_name, cve)
+        );
+    """,
 }
 
 
@@ -654,6 +679,16 @@ def _row_to_execution_cve(row: sqlite3.Row) -> PatchCveResult:
 _TRANSPORT_COLUMNS = ("connection_type", "instance_id_override", "aws_profile", "aws_region")
 
 
+_REPORT_FIELDS = (
+    "server_name", "cve", "hostname", "usn", "package", "title", "priority", "status",
+    "version_before", "version_after", "imported_at", "patched_at", "run_id", "error",
+)  # fmt: skip
+
+
+def _row_to_patch_report(row: sqlite3.Row) -> PatchReportRow:
+    return PatchReportRow(updated_at=row["updated_at"], **{k: row[k] for k in _REPORT_FIELDS})
+
+
 def _transport_values(transport: dict[str, str | None] | None) -> list[str | None]:
     return [(transport or {}).get(column) or None for column in _TRANSPORT_COLUMNS]
 
@@ -803,6 +838,9 @@ class Database:
             _check_duplicate_keys(tags)
         try:
             with self.connect() as conn:
+                old_name = conn.execute(
+                    "SELECT name FROM servers WHERE id = ?", (server_id,)
+                ).fetchone()
                 cur = conn.execute(
                     "UPDATE servers SET name = ?, ip_address = ?, pem_path = ?, "
                     "ssh_user = COALESCE(?, ssh_user), auth_method = COALESCE(?, auth_method), "
@@ -810,6 +848,13 @@ class Database:
                     (name, ip_address, pem_path, ssh_user, auth_method, _now(), server_id),
                 )
                 updated = cur.rowcount == 1
+                if updated and old_name[0] != name:
+                    # Its patch report rows follow the rename (a deleted server's old rows of
+                    # that name give way).
+                    conn.execute(
+                        "UPDATE OR REPLACE patch_report SET server_name = ? WHERE server_name = ?",
+                        (name, old_name[0]),
+                    )
                 if updated and tags is not None:
                     self._replace_tags(conn, server_id, tags)
                 if updated and transport is not None:
@@ -954,6 +999,86 @@ class Database:
                 "INSERT INTO reports (filename, content, uploaded_at, status) VALUES (?, ?, ?, ?)",
                 (filename, content, _now(), status),
             )
+
+    # --- patch report ---------------------------------------------------------
+
+    def merge_patch_report(
+        self,
+        server_name: str,
+        merge: Callable[[dict[str, PatchReportRow]], Iterable[PatchReportRow]],
+    ) -> None:
+        """Replace rows of one server with what ``merge`` makes of its current rows (cve -> row),
+        in one transaction: the import, analysis and patch flows may touch the same rows."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT * FROM patch_report WHERE server_name = ?", (server_name,)
+            ).fetchall()
+            current = {r["cve"]: _row_to_patch_report(r) for r in rows}
+            names = ", ".join(_REPORT_FIELDS)
+            marks = ", ".join("?" * len(_REPORT_FIELDS))
+            updates = ", ".join(f"{k} = excluded.{k}" for k in _REPORT_FIELDS)
+            now = _now()
+            for row in merge(current):
+                conn.execute(
+                    f"INSERT INTO patch_report ({names}, updated_at) "  # noqa: S608
+                    f"VALUES ({marks}, ?) ON CONFLICT (server_name, cve) "
+                    f"DO UPDATE SET {updates}, updated_at = excluded.updated_at",
+                    (*(getattr(row, k) for k in _REPORT_FIELDS), now),
+                )
+
+    def list_patch_report(
+        self,
+        server: str | None = None,
+        status: str | None = None,
+        usn: str | None = None,
+        cve: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[PatchReportRow]:
+        """The rows matching every given filter, by server and CVE. ``date_from``/``date_to``
+        (YYYY-MM-DD, local time, inclusive) match the imported or the patched date of a row, or
+        the date it was last updated if it has neither."""
+        clauses, params = [], []
+        if server:
+            clauses.append("server_name = ?")
+            params.append(server)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if usn:
+            # Exact match of one entry of the comma-separated list.
+            clauses.append("instr(',' || REPLACE(UPPER(usn), ' ', '') || ',', ?) > 0")
+            params.append(f",{usn.strip().upper()},")
+        if cve:
+            clauses.append("cve = ?")
+            params.append(cve.strip().upper())
+        if date_from or date_to:
+            span = (date_from or "0000-01-01", date_to or "9999-12-31")
+            between = "date({}, 'localtime') BETWEEN ? AND ?"
+            clauses.append(
+                f"({between.format('imported_at')} OR {between.format('patched_at')} OR "
+                f"(imported_at IS NULL AND patched_at IS NULL AND {between.format('updated_at')}))"
+            )
+            params += span * 3
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM patch_report {where} "  # noqa: S608
+                "ORDER BY server_name COLLATE NOCASE, cve",
+                params,
+            ).fetchall()
+            tags = conn.execute(
+                "SELECT s.name, t.key, t.value FROM server_tags t "
+                "JOIN servers s ON s.id = t.server_id ORDER BY t.key COLLATE NOCASE, t.id"
+            ).fetchall()
+        by_server: dict[str, list[str]] = {}
+        for name, key, value in tags:
+            by_server.setdefault(name.casefold(), []).append(f"{key}={value}" if value else key)
+        result = [_row_to_patch_report(r) for r in rows]
+        for row in result:
+            row.tags = by_server.get(row.server_name.casefold(), [])
+        return result
 
     # --- analysis runs (Phase 2) ----------------------------------------------
 
@@ -1510,7 +1635,8 @@ class Database:
         count = 0
         with self.connect() as conn:
             rows = conn.execute(
-                f"SELECT id, state, reboot_status FROM patch_executions WHERE state IN "  # noqa: S608
+                "SELECT id, state, reboot_status, server_name, server_analysis_id, "  # noqa: S608
+                f"analysis_run_id FROM patch_executions WHERE state IN "
                 f"({','.join('?' * len(patch_state.ACTIVE))})",
                 tuple(sorted(patch_state.ACTIVE)),
             ).fetchall()
@@ -1547,6 +1673,15 @@ class Database:
                     "WHERE id = ? AND state = ?",
                     (target, *values, row["id"], state),
                 )
+                if title:  # no worker is left to say so in the patch report
+                    conn.execute(
+                        "UPDATE patch_report SET status = 'failed', error = ?, run_id = ?, "
+                        "patched_at = NULL, updated_at = ? WHERE server_name = ? AND cve IN "
+                        "(SELECT cve FROM cve_findings WHERE server_analysis_id = ? "
+                        "AND status = 'PATCH_AVAILABLE')",
+                        (f"{title}: {fields['error_summary']}", row["analysis_run_id"], now,
+                         row["server_name"], row["server_analysis_id"]),
+                    )  # fmt: skip
                 count += 1
             # Patched, but the app stopped before/while rebooting: the reboot is not proven.
             successful = tuple(sorted(patch_state.SUCCESSFUL))

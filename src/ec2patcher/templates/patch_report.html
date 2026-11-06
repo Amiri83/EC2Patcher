@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Patch Report{% endblock %}
+{% block heading %}Patch Report{% endblock %}
+{% block header_actions %}<a href="/patch-report/export.xlsx{% if export_query %}?{{ export_query }}{% endif %}" class="btn btn-primary" id="export-xlsx">Export .xlsx</a>{% endblock %}
+{% block content %}
+<div class="card">
+  <form method="get" action="/patch-report" class="filter-form">
+    <label>Server
+      <select name="server">
+        <option value="">All</option>
+        {% for name in server_options %}<option value="{{ name }}"{% if filters.server|lower == name|lower %} selected{% endif %}>{{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Status
+      <select name="status">
+        <option value="">All</option>
+        {% for status in report_statuses %}<option value="{{ status }}"{% if filters.status == status %} selected{% endif %}>{{ status }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>USN <input type="text" name="usn" value="{{ filters.usn }}" list="usn-options" placeholder="USN-0000-1" autocomplete="off"></label>
+    <datalist id="usn-options">{% for usn in usn_options %}<option value="{{ usn }}"></option>{% endfor %}</datalist>
+    <label>CVE <input type="text" name="cve" value="{{ filters.cve }}" list="cve-options" placeholder="CVE-2000-0001" autocomplete="off"></label>
+    <datalist id="cve-options">{% for cve in cve_options %}<option value="{{ cve }}"></option>{% endfor %}</datalist>
+    <label>Date <input type="date" name="date" value="{{ filters.date }}"></label>
+    <label>From <input type="date" name="date_from" value="{{ filters.date_from }}"></label>
+    <label>To <input type="date" name="date_to" value="{{ filters.date_to }}"></label>
+    <button type="submit" class="btn btn-secondary">Apply</button>
+    <a href="/patch-report" class="btn btn-ghost">Clear</a>
+  </form>
+  <p class="muted small">Dates match the day a row was imported or patched, in this machine's time zone.</p>
+</div>
+
+<div class="card" id="report-summary">
+  <div class="card-header">
+    <h2>Summary per server</h2>
+    <span class="badge badge-neutral">{{ rows|length }} of {{ total }} rows</span>
+  </div>
+  {% if summaries %}
+    <div class="table-scroll">
+      <table class="table small">
+        <thead><tr><th>Server</th><th class="num">Total</th>{% for status in report_statuses %}<th class="num">{{ status }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for s in summaries %}
+            <tr data-summary="{{ s.server }}">
+              <td><strong>{{ s.server }}</strong></td>
+              <td class="num">{{ s.total }}</td>
+              {% for status in report_statuses %}<td class="num" data-count="{{ status }}">{{ s.counts[status] }}</td>{% endfor %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <p class="muted">No rows to count.</p>
+  {% endif %}
+</div>
+
+<div class="card" id="report-details">
+  <h2>Details</h2>
+  {% if rows %}
+    <div class="table-scroll">
+      <table class="table small">
+        <thead>
+          <tr><th>Hostname</th><th>Server</th><th>Tags</th><th>CVE</th><th>USN</th><th>Package</th><th>Title</th><th>Ubuntu priority</th><th>Status</th><th>Version before</th><th>Version after</th><th>Imported at</th><th>Patched at</th><th>Run</th><th>Error</th></tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+            <tr>
+              <td class="wrap">{{ r.hostname or "" }}</td>
+              <td><strong>{{ r.server_name }}</strong></td>
+              <td>{% for tag in r.tags %}<span class="tag">{{ tag }}</span> {% endfor %}</td>
+              <td><code>{{ r.cve }}</code></td>
+              <td>{{ r.usn or "" }}</td>
+              <td>{{ r.package or "" }}</td>
+              <td>{{ r.title or "" }}</td>
+              <td>{{ r.priority or "" }}</td>
+              <td><span class="badge {{ report_status_badges[r.status] }}">{{ r.status }}</span></td>
+              <td>{{ r.version_before or "" }}</td>
+              <td>{{ r.version_after or "" }}</td>
+              <td class="num">{% if r.imported_at %}{{ r.imported_at|timestamp }}{% endif %}</td>
+              <td class="num">{% if r.patched_at %}{{ r.patched_at|timestamp }}{% endif %}</td>
+              <td>{% if r.run_id %}<a href="/analysis/{{ r.run_id }}">#{{ r.run_id }}</a>{% endif %}</td>
+              <td>{{ r.error or "" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% elif total %}
+    <p class="muted">No rows match these filters.</p>
+  {% else %}
+    <div class="empty-state">
+      <p class="empty-title">Nothing to report yet</p>
+      <p class="muted"><a href="/reports/import">Paste a security list</a> or analyze a report to fill this page.</p>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

@@ -7,6 +7,7 @@ import subprocess  # noqa: S404 - default runner handed to the ssh service
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
@@ -34,9 +35,11 @@ from ec2patcher.services import (
     local_apt,
     nvd,
     os_adapters,
+    patch_report,
     patch_service,
     report_service,
     secret_store,
+    security_list,
     ssh_service,
     ssm_plugin,
     ssm_service,
@@ -298,6 +301,8 @@ def create_app(
     templates.env.globals["aws_profiles"] = aws_config.read_profiles
     templates.env.globals["aws_regions"] = aws_config.COMMERCIAL_REGIONS
     templates.env.globals["aws_dropdown_view"] = aws_config.dropdown
+    templates.env.globals["report_statuses"] = models.REPORT_STATUSES
+    templates.env.globals["report_status_badges"] = patch_report.BADGES
     app.state.analyzer = analyzer
     app.state.patcher = patcher
     app.state.credentials = credentials
@@ -416,17 +421,29 @@ def create_app(
         except SecretError as exc:
             return None, str(exc)
 
-    def server_form(request: Request, server_id: int | None, form: dict, status_code=200, **ctx):
+    def server_form(
+        request: Request,
+        server_id: int | None,
+        form: dict,
+        status_code=200,
+        clone_source: models.Server | None = None,
+        **ctx,
+    ):
         # The password field is always rendered empty; only "a password is stored" is shown.
         server = db.get_server(server_id) if server_id is not None else None
-        has_stored = server is not None and server.has_password
+        kept_from = server or clone_source
+        has_stored = kept_from is not None and kept_from.has_password
         connection = ssm_service.connection_view(db, server) if server else None
         return render(
             request, "server_form.html", "servers", status_code=status_code,
             server_id=server_id, form=form, errors=ctx.pop("errors", {}),
-            has_stored_password=has_stored, connection=connection,
-            stored_password_error=stored_password(server_id)[1] if has_stored else None, **ctx,
+            has_stored_password=has_stored, connection=connection, clone_source=clone_source,
+            stored_password_error=stored_password(kept_from.id)[1] if has_stored else None, **ctx,
         )  # fmt: skip
+
+    def clone_source_of(raw: str) -> models.Server | None:
+        """The server a ``clone`` value names, if any (the id of the row, nothing else of it)."""
+        return db.get_server(int(raw)) if raw.isdecimal() and len(raw) < 19 else None
 
     def handle_server_form(
         request: Request,
@@ -442,7 +459,11 @@ def create_app(
         ssh_password: str = "",
         transport: dict[str, str] | None = None,
         others: dict[str, str] | None = None,
+        clone_source: models.Server | None = None,
     ):
+        def show(status_code: int = 200, **ctx):
+            return server_form(request, server_id, form, status_code, clone_source, **ctx)
+
         transport, other_chosen = aws_config.resolve_choices(transport or {}, others or {})
         form = {
             "name": name, "ip_address": ip, "pem_path": pem, "ssh_user": ssh_user,
@@ -459,7 +480,7 @@ def create_app(
             if use_password and ssh_password:
                 password, error = ssh_password, check_ssh_password(ssh_password)
             elif use_password:
-                password, error = stored_password(server_id)
+                password, error = stored_password(clone_source.id if clone_source else server_id)
                 if password is None and error is None:
                     error = "Enter the SSH password to test the connection."
             error = error or next(iter(other_errors.values()), None)
@@ -475,7 +496,7 @@ def create_app(
                     **{key: value.strip() or None for key, value in transport.items()},
                 )  # fmt: skip
                 result = run_connection_test(probe, password)
-            return server_form(request, server_id, form, ssh_result=result, errors=other_errors)
+            return show(ssh_result=result, errors=other_errors)
 
         data = validate_server_input(
             db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values,
@@ -487,19 +508,28 @@ def create_app(
             error = check_ssh_password(ssh_password)
             if not ssh_password and existing is not None and existing.has_password:
                 error = None
+            if not ssh_password and clone_source is not None and clone_source.has_password:
+                error = stored_password(clone_source.id)[1]  # a credential that cannot be used
             if error:
                 data.errors["ssh_password"] = error
+        if clone_source is not None and over_ssm and not data.instance_id_override:
+            # A clone is another machine: it must not resolve to, or reuse, the source's instance.
+            data.errors["instance_id_override"] = (
+                "Instance ID is required for a cloned server: enter the ID of the new instance."
+            )
         data.errors.update(other_errors)
         if not data.is_valid:
-            return server_form(request, server_id, form, status_code=422, errors=data.errors)
+            return show(status_code=422, errors=data.errors)
         encrypted = None
         if data.auth_method == AUTH_PASSWORD and ssh_password:
             try:
                 encrypted = credentials.encrypt(ssh_password)
             except SecretError as exc:
                 logger.error("Cannot store the SSH password of %s: %s", data.name, exc)
-                errors = {"ssh_password": str(exc)}
-                return server_form(request, server_id, form, status_code=422, errors=errors)
+                return show(status_code=422, errors={"ssh_password": str(exc)})
+        elif data.auth_method == AUTH_PASSWORD and clone_source is not None:
+            # The ciphertext as stored, for the new row; it is never decrypted here.
+            encrypted = db.get_server_password(clone_source.id)
         try:
             if server_id is None:
                 db.create_server(
@@ -511,6 +541,8 @@ def create_app(
                     "Server created: %s (%s@%s, %s login), %d tag(s)",
                     data.name, data.ssh_user, data.ip_address, data.auth_method, len(data.tags),
                 )  # fmt: skip
+                if clone_source is not None:
+                    logger.info("Server %s cloned from %s", data.name, clone_source.name)
                 return redirect("/servers", notice="created", name=data.name)
             if not db.update_server(
                 server_id, data.name, data.ip_address, data.pem_path, tags=data.tags,
@@ -530,10 +562,9 @@ def create_app(
             return redirect("/servers", notice="updated", name=data.name)
         except DuplicateServerNameError:
             errors = {"name": f"A server named '{data.name}' already exists. Names must be unique."}
-            return server_form(request, server_id, form, status_code=422, errors=errors)
+            return show(status_code=422, errors=errors)
         except DuplicateTagKeyError as exc:
-            errors = {"tags": f"Duplicate tag key: {exc.args[0]}"}
-            return server_form(request, server_id, form, status_code=422, errors=errors)
+            return show(status_code=422, errors={"tags": f"Duplicate tag key: {exc.args[0]}"})
 
     @app.get("/servers/new", response_class=HTMLResponse)
     def new_server(request: Request):
@@ -542,7 +573,20 @@ def create_app(
             "auth_method": AUTH_PEM, "connection_type": "", "instance_id_override": "",
             "aws_profile": "", "aws_region": "",
         }  # fmt: skip
-        return server_form(request, None, {**form, "tags": []})
+        clone = request.query_params.get("clone")
+        if clone is None:
+            return server_form(request, None, {**form, "tags": []})
+        source = clone_source_of(clone)
+        if source is None:
+            return redirect("/servers", notice="not_found")
+        # Name, IP, PEM file and instance ID identify the source: they stay empty.
+        form.update(
+            ssh_user=source.ssh_user, auth_method=source.auth_method,
+            connection_type=source.connection_type or "", aws_profile=source.aws_profile or "",
+            aws_region=source.aws_region or "",
+        )  # fmt: skip
+        tags = [{"key": t.key, "value": t.value} for t in source.tags]
+        return server_form(request, None, {**form, "tags": tags}, clone_source=source)
 
     @app.post("/servers/new", response_class=HTMLResponse)
     def create_server(
@@ -562,7 +606,11 @@ def create_app(
         aws_region: str = Form(""),
         aws_profile_other: str = Form(""),
         aws_region_other: str = Form(""),
+        clone_from: str = Form(""),
     ):
+        source = clone_source_of(clone_from) if clone_from else None
+        if clone_from and source is None:
+            return redirect("/servers", notice="not_found")
         transport = {
             "connection_type": connection_type, "instance_id_override": instance_id_override,
             "aws_profile": aws_profile, "aws_region": aws_region,
@@ -570,7 +618,7 @@ def create_app(
         others = {"aws_profile": aws_profile_other, "aws_region": aws_region_other}
         return handle_server_form(
             request, None, action, name, ip_address, pem_path, tag_key, tag_value, ssh_user,
-            auth_method, ssh_password, transport, others,
+            auth_method, ssh_password, transport, others, clone_source=source,
         )  # fmt: skip
 
     @app.get("/servers/{server_id}/edit", response_class=HTMLResponse)
@@ -705,6 +753,100 @@ def create_app(
             result.filename, result.server_count, result.cve_count,
         )  # fmt: skip
         return reports_page(request, validation=result)
+
+    @app.get("/reports/latest/download")
+    def download_latest_report():
+        report = db.get_latest_report()
+        if report is None:
+            raise StarletteHTTPException(404)
+        filename = report_service.safe_filename(report.filename).replace('"', "_")
+        return Response(
+            report_service.dump_report(report.servers),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # --- paste import of a security list -----------------------------------------
+
+    def import_page(request: Request, status_code: int = 200, **ctx):
+        ctx.setdefault("raw_text", "")
+        ctx.setdefault("parsed", None)
+        ctx.setdefault("matched", [])
+        ctx.setdefault("loaded", None)
+        return render(request, "report_import.html", "reports", status_code=status_code, **ctx)
+
+    @app.get("/reports/import", response_class=HTMLResponse)
+    def report_import(request: Request):
+        return import_page(request)
+
+    @app.post("/reports/import", response_class=HTMLResponse)
+    def import_security_list(
+        request: Request, action: str = Form("preview"), raw_text: str = Form("")
+    ):
+        """Stateless: the pasted text is parsed again on Confirm, and its contents never logged."""
+        if len(raw_text) > security_list.MAX_PASTE_CHARS:
+            error = f"The pasted text is too long (limit {security_list.MAX_PASTE_CHARS} chars)."
+            return import_page(request, status_code=422, error=error)
+        parsed = security_list.parse_security_list(raw_text)
+        matched = security_list.match_servers(parsed.records, db.list_servers())
+        page = {"raw_text": raw_text, "parsed": parsed, "matched": matched}
+        if not parsed.records:
+            error = "No record with a CVE and a host (ip-a-b-c-d) was found in the pasted text."
+            return import_page(request, status_code=422, error=error, **page)
+        if action != "confirm":
+            return import_page(request, **page)
+        servers = security_list.build_report(matched)
+        if not servers:
+            error = "No host matches a saved server, so nothing was loaded. Add the servers first."
+            return import_page(request, status_code=422, error=error, **page)
+        name = f"security-list-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        result = report_service.validate_report(
+            report_service.dump_report(servers), name, db.server_names()
+        )
+        if not result.valid:
+            error = "The generated report was not accepted: " + "; ".join(result.errors)
+            return import_page(request, status_code=422, error=error, **page)
+        db.save_report(result.filename, result.servers, status="VALID")
+        rows = patch_report.record_import(db, matched)
+        logger.info(
+            "Security list imported: %s (%d records, %d servers, %d CVEs, %d unknown hosts)",
+            result.filename, len(parsed.records), result.server_count, result.cve_count,
+            sum(m.server_name is None for m in matched),
+        )  # fmt: skip
+        return import_page(request, loaded=result, report_rows=rows, **page)
+
+    # --- patch report --------------------------------------------------------------
+
+    @app.get("/patch-report", response_class=HTMLResponse)
+    def patch_report_page(request: Request):
+        patcher.reconcile()  # a patch cut short shows as failed, not pending
+        filters, problems = patch_report.parse_filters(request.query_params)
+        rows = db.list_patch_report(**filters.query())
+        everything = db.list_patch_report()
+        usns = {u.strip() for r in everything for u in (r.usn or "").split(",") if u.strip()}
+        return render(
+            request, "patch_report.html", "patch-report", status_code=422 if problems else 200,
+            error=" ".join(problems) or None, rows=rows, filters=filters,
+            summaries=patch_report.summarize(rows), total=len(everything),
+            server_options=list(dict.fromkeys(r.server_name for r in everything)),
+            usn_options=sorted(usns), cve_options=sorted({r.cve for r in everything}),
+            export_query=filters.query_string(),
+        )  # fmt: skip
+
+    @app.get("/patch-report/export.xlsx")
+    def export_patch_report(request: Request):
+        # Not with a filter left out: the file would claim more than was asked for.
+        filters, problems = patch_report.parse_filters(request.query_params)
+        if problems:
+            raise StarletteHTTPException(422, " ".join(problems))
+        rows = db.list_patch_report(**filters.query())
+        filename = excel_export.patch_report_filename()
+        logger.info("Patch report export: %s (%d rows)", filename, len(rows))
+        return Response(
+            excel_export.build_patch_report_workbook(rows, patch_report.summarize(rows)),
+            media_type=excel_export.MEDIA_TYPE,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     # --- analysis (Phase 2, read-only) -----------------------------------------
 

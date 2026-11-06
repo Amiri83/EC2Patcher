@@ -282,6 +282,38 @@ class PatchQueue:
         return self.state == "RUNNING"
 
 
+# --- Patch report: one row per server x CVE ----------------------------------------------
+
+REPORT_PENDING = "pending"
+REPORT_PATCHED = "patched"
+REPORT_FAILED = "failed"
+REPORT_NOT_AFFECTED = "not-affected"
+REPORT_REBOOT_REQUIRED = "reboot-required"
+REPORT_STATUSES = (
+    REPORT_PENDING, REPORT_PATCHED, REPORT_FAILED, REPORT_NOT_AFFECTED, REPORT_REBOOT_REQUIRED,
+)  # fmt: skip
+
+
+@dataclass
+class PatchReportRow:
+    server_name: str
+    cve: str
+    status: str = REPORT_PENDING
+    hostname: str | None = None
+    usn: str | None = None  # comma-separated when a pasted list names several for this CVE
+    package: str | None = None
+    title: str | None = None
+    priority: str | None = None  # Canonical's, only when an analysis supplied it
+    version_before: str | None = None
+    version_after: str | None = None
+    imported_at: str | None = None  # None: not from a pasted list (analysis of an uploaded report)
+    patched_at: str | None = None  # None: not patched by EC2Patcher (or found already fixed)
+    run_id: int | None = None
+    error: str | None = None
+    updated_at: str | None = None
+    tags: list[str] = field(default_factory=list)  # "key=value" of the server, when still saved
+
+
 @dataclass
 class AnalysisRun:
     id: int

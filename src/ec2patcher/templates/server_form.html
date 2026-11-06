@@ -7,7 +7,11 @@
   {% if errors %}
     <div class="alert alert-error" role="alert">Please correct the highlighted fields.</div>
   {% endif %}
+  {% if clone_source %}
+    <div class="alert alert-warning clone-note" role="status">Cloning <strong>{{ clone_source.name }}</strong>: enter this server's own name, IP address, PEM file and instance ID. Everything else is copied; saving creates a new server and leaves {{ clone_source.name }} unchanged.</div>
+  {% endif %}
   <form method="post" action="{{ '/servers/%d/edit' % server_id if editing else '/servers/new' }}" novalidate>
+    {% if clone_source %}<input type="hidden" name="clone_from" value="{{ clone_source.id }}">{% endif %}
     <div class="field{% if errors.name %} has-error{% endif %}">
       <label for="name">Server Name</label>
       <input type="text" id="name" name="name" value="{{ form.name }}" placeholder="app-prod-01"
@@ -49,7 +53,7 @@
       <input type="password" id="ssh_password" name="ssh_password" value="" autocomplete="new-password" spellcheck="false">
       {% if errors.ssh_password %}<div class="field-error">{{ errors.ssh_password }}</div>{% endif %}
       {% if stored_password_error %}<div class="field-error stored-password-error">{{ stored_password_error }}</div>{% endif %}
-      <div class="hint">{% if has_stored_password %}<span class="badge badge-success">Password stored</span> Leave empty to keep the stored password. {% endif %}Stored encrypted per server; never shown, logged or put on a command line. Requires <code>sshpass</code> on this machine. <code>sudo</code> on the server must still be passwordless.</div>
+      <div class="hint">{% if has_stored_password and clone_source %}<span class="badge badge-success">Password stored</span> Stored credential of {{ clone_source.name }}: leave empty to use it for this server too. {% elif has_stored_password %}<span class="badge badge-success">Password stored</span> Leave empty to keep the stored password. {% endif %}Stored encrypted per server; never shown, logged or put on a command line. Requires <code>sshpass</code> on this machine. <code>sudo</code> on the server must still be passwordless.</div>
     </div>
     <div class="field{% if errors.ssh_user %} has-error{% endif %}">
       <label for="ssh_user">SSH User</label>
@@ -74,10 +78,11 @@
     </div>
     <div data-connection-only="ssm">
       <div class="field{% if errors.instance_id_override %} has-error{% endif %}">
-        <label for="instance_id_override">Instance ID <span class="muted small">(optional)</span></label>
+        <label for="instance_id_override">Instance ID {% if not clone_source %}<span class="muted small">(optional)</span>{% endif %}</label>
         <input type="text" id="instance_id_override" name="instance_id_override" value="{{ form.instance_id_override }}"
-               placeholder="i-0123456789abcdef0" maxlength="19" autocomplete="off" spellcheck="false">
-        <div class="hint">Empty: found by private IP (from a name like <code>ip-10-0-0-1</code>, else the IP address above) and cached. A value here always wins.{% if connection and connection.instance_source == "resolved" %} Currently resolved: <code class="resolved-instance">{{ connection.instance_id }}</code>.{% endif %}</div>
+               placeholder="i-0123456789abcdef0" maxlength="19" autocomplete="off" spellcheck="false"{% if clone_source %} required{% endif %}>
+        {% if clone_source %}<div class="hint">Required for a cloned server: the ID of the new instance.</div>
+        {% else %}<div class="hint">Empty: found by private IP (from a name like <code>ip-10-0-0-1</code>, else the IP address above) and cached. A value here always wins.{% if connection and connection.instance_source == "resolved" %} Currently resolved: <code class="resolved-instance">{{ connection.instance_id }}</code>.{% endif %}</div>{% endif %}
         {% if errors.instance_id_override %}<div class="field-error">{{ errors.instance_id_override }}</div>{% endif %}
       </div>
       <div class="field{% if errors.aws_profile %} has-error{% endif %}">
