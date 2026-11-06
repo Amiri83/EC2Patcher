@@ -421,6 +421,15 @@ def candidate_query_packages(findings: list[Finding], facts: ServerFacts) -> lis
     return sorted(names)
 
 
+def kernel_meta_target(fixed_version: str, meta_candidate: str) -> str:
+    """The version a kernel meta package must reach for ``fixed_version``. Older meta packages
+    use the dotted scheme (kernel 6.8.0-1024.26 -> meta 6.8.0.1024.26); newer ones (e.g.
+    noble's linux-aws 7.0.0-1014.14~24.04.1) carry the kernel version unchanged. Comparing a
+    dash-scheme candidate with the dotted target would always find it older."""
+    upstream = meta_candidate.split(":", 1)[-1]
+    return fixed_version if "-" in upstream else kernel_meta_version(fixed_version)
+
+
 def kernel_meta_version(kernel_version: str) -> str:
     """Ubuntu kernel meta packages use '.' where the kernel uses the ABI '-':
     kernel 6.8.0-1024.26 -> meta 6.8.0.1024.26."""
@@ -450,7 +459,6 @@ def apply_candidates(
                 "No kernel meta package (e.g. linux-aws) is installed to select the fixed kernel."
             )
             continue
-        wanted = kernel_meta_version(f.fixed_version) if f.is_kernel else f.fixed_version
         ok: dict[str, str] = {}
         problems: list[str] = []
         at_target: list[str] = []
@@ -466,6 +474,11 @@ def apply_candidates(
                 problems.append(f"{name}: no installation candidate in the Ubuntu archive")
                 continue
             compare_to = cand.candidate if f.is_kernel else (cand.source_version or cand.candidate)
+            wanted = (
+                kernel_meta_target(f.fixed_version, cand.candidate)
+                if f.is_kernel
+                else f.fixed_version
+            )
             try:
                 good = debversion.compare_versions(compare_to, wanted) >= 0
             except debversion.InvalidVersionError:

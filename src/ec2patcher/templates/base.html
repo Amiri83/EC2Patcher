@@ -16,7 +16,8 @@
     </div>
     <nav class="nav">
       {% set items = [('dashboard', '/', 'Dashboard'), ('servers', '/servers', 'Servers'),
-                      ('reports', '/reports', 'Reports'), ('patch-report', '/patch-report', 'Patch Report'),
+                      ('reports', '/reports', 'Reports'),
+                      ('analysis', '/analysis/latest', 'Analysis'), ('patch-report', '/patch-report', 'Patch Report'),
                       ('history', '/history', 'History'),
                       ('settings', '/settings', 'Settings')] %}
       {% for key, href, label in items %}

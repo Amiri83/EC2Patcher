@@ -895,3 +895,17 @@ def test_starter_failure_does_not_block_future_runs(setup, metadata):
         service.start(setup.get_latest_report())
     assert not service.is_running
     assert setup.get_latest_analysis_run().status == "failed"
+
+
+def test_analysis_menu_entry_opens_the_latest_run(web, pem_file):
+    with web(ssh=ScriptedSSH()) as c:
+        empty = c.get("/analysis/latest", follow_redirects=False)
+        assert empty.status_code == 303 and empty.headers["location"] == "/reports"
+        assert 'href="/analysis/latest"' in c.get("/").text
+        add_servers(c, pem_file)
+        upload(c, REAL_REPORT)
+        run_url = c.post("/reports/analyze", follow_redirects=False).headers["location"]
+        latest = c.get("/analysis/latest", follow_redirects=False)
+        assert latest.status_code == 303 and latest.headers["location"] == run_url
+        page = c.get(run_url).text
+        assert 'href="/analysis/latest" class="nav-link active"' in page
