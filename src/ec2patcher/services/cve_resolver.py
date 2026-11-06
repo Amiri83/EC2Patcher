@@ -395,12 +395,29 @@ def meta_packages(facts: ServerFacts) -> list[str]:
     return sorted(p.name for p in facts.packages if p.source.startswith("linux-meta"))
 
 
+def kernel_meta_source(source: str) -> str:
+    """The meta source package of a kernel source: linux -> linux-meta,
+    linux-aws-7.0 -> linux-meta-aws-7.0 (linux-signed-aws -> linux-meta-aws)."""
+    flavour = source.removeprefix("linux").removeprefix("-signed")
+    return f"linux-meta{flavour}"
+
+
+def kernel_meta_packages(facts: ServerFacts, source: str | None) -> list[str]:
+    """Installed meta packages of *this* kernel source. A server often has several kernel
+    lines (e.g. linux-aws 6.8 and linux-aws-7.0); another line's meta package can never
+    reach this source's fixed version, so it must not decide the finding. Falls back to all
+    meta packages when none matches the source."""
+    meta_source = kernel_meta_source(source) if source else None
+    own = sorted(p.name for p in facts.packages if meta_source and p.source == meta_source)
+    return own or meta_packages(facts)
+
+
 def candidate_query_packages(findings: list[Finding], facts: ServerFacts) -> list[str]:
     names: set[str] = set()
     for f in findings:
         if not needs_candidate_check(f):
             continue
-        names.update(meta_packages(facts) if f.is_kernel else f.binaries)
+        names.update(kernel_meta_packages(facts, f.source) if f.is_kernel else f.binaries)
     return sorted(names)
 
 
@@ -426,7 +443,7 @@ def apply_candidates(
     for f in findings:
         if not needs_candidate_check(f):
             continue
-        names = meta_packages(facts) if f.is_kernel else f.binaries
+        names = kernel_meta_packages(facts, f.source) if f.is_kernel else f.binaries
         if not names:
             f.status = FIX_NOT_IN_CONFIGURED_REPOS
             f.detail = (

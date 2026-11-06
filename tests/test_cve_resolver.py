@@ -243,6 +243,54 @@ def test_missing_kernel_meta_package_is_not_in_repos():
     assert kernel.status == cr.FIX_NOT_IN_CONFIGURED_REPOS
 
 
+def _second_kernel_line(f):
+    """A server with the linux-aws (6.8) line plus a newer linux-aws-7.0 line."""
+    from ec2patcher.services.server_state import InstalledPackage
+
+    for name in ("linux-aws-7.0", "linux-image-aws-7.0"):
+        f.packages.append(
+            InstalledPackage(name, "7.0.0.1013.13~24.04.1", "linux-meta-aws-7.0",
+                             "7.0.0.1013.13~24.04.1", "amd64")
+        )  # fmt: skip
+    return f
+
+
+def test_kernel_meta_source_mapping():
+    assert cr.kernel_meta_source("linux") == "linux-meta"
+    assert cr.kernel_meta_source("linux-aws") == "linux-meta-aws"
+    assert cr.kernel_meta_source("linux-aws-7.0") == "linux-meta-aws-7.0"
+    assert cr.kernel_meta_source("linux-signed-aws-7.0") == "linux-meta-aws-7.0"
+
+
+def test_kernel_fix_only_checks_the_meta_packages_of_its_own_kernel_line():
+    """The 6.8 linux-aws meta packages can never reach a linux-aws-7.0 fix; they must not
+    turn an available 7.0 kernel into 'not in configured repositories'."""
+    f = _second_kernel_line(facts())
+    kernel = cr.Finding("CVE-1", "linux-aws-7.0", cr.FIX_NOT_IN_CONFIGURED_REPOS,
+                        fixed_version="7.0.0-1014.14~24.04.1", is_kernel=True)  # fmt: skip
+    candidates = {
+        name: apt_planner.Candidate(name, "7.0.0.1013.13~24.04.1", "7.0.0.1014.14~24.04.1")
+        for name in ("linux-aws-7.0", "linux-image-aws-7.0")
+    } | {
+        name: apt_planner.Candidate(name, "6.8.0.1021.23", "6.8.0.1024.26")
+        for name in ("linux-aws", "linux-image-aws")
+    }
+    assert cr.candidate_query_packages([kernel], f) == ["linux-aws-7.0", "linux-image-aws-7.0"]
+    requests = cr.apply_candidates([kernel], candidates, f)
+    assert kernel.status == cr.PATCH_AVAILABLE, kernel.detail
+    assert requests == [
+        ("linux-aws-7.0", "7.0.0.1014.14~24.04.1"),
+        ("linux-image-aws-7.0", "7.0.0.1014.14~24.04.1"),
+    ]
+
+
+def test_kernel_source_without_own_meta_package_uses_all_meta_packages():
+    f = _second_kernel_line(facts())
+    assert cr.kernel_meta_packages(f, "linux") == [
+        "linux-aws", "linux-aws-7.0", "linux-image-aws", "linux-image-aws-7.0",
+    ]  # fmt: skip
+
+
 def test_pro_fix_without_pro_candidate_stays_pro():
     _, findings, _, _, requests = analyzed(("CVE-2026-10003",))
     assert findings[0].status == cr.PRO_OR_ESM_REQUIRED and requests == []
