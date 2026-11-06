@@ -40,6 +40,7 @@ verification and the reboot keep their own timeouts.
 """
 
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -112,6 +113,27 @@ def thread_starter(target: Callable[[], None]) -> threading.Thread:
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# apt/dpkg output lines that name the actual cause of a failed install; apt's own
+# "E: Sub-process /usr/bin/dpkg returned an error code (1)" says only that dpkg failed.
+_INSTALL_ERROR_RE = re.compile(
+    r"^(?:dpkg: (?:error|dependency problems)|E: |Errors were encountered|.*No space left on "
+    r"device|update-initramfs: failed|run-parts: .* exited with return code|.*Error! |"
+    r"Error! |.*returned error exit status|.*Bad return status)",
+    re.IGNORECASE,
+)
+MAX_INSTALL_ERROR_LINES = 6
+
+
+def install_error_lines(output: list[str]) -> list[str]:
+    """The lines of a failed ``apt-get install`` that explain it, cause first and apt's
+    summary last, deduplicated and capped."""
+    lines = [ln.strip() for ln in output if _INSTALL_ERROR_RE.match(ln.strip())]
+    causes = [ln for ln in lines if not ln.startswith("E: ")]
+    summary = [ln for ln in lines if ln.startswith("E: ")]
+    picked = list(dict.fromkeys(causes[: MAX_INSTALL_ERROR_LINES - 1] + summary[:1]))
+    return picked[:MAX_INSTALL_ERROR_LINES]
 
 
 def _tail(lines: list[str] | str, limit: int = MAX_STORED_OUTPUT) -> str:
@@ -1131,15 +1153,16 @@ class PatchService:
                 )  # fmt: skip
             return post
         if parsed.complete:
-            errors = [ln.strip() for ln in parsed.output if ln.strip().startswith("E:")]
+            errors = install_error_lines(parsed.output)
             self._set_all(ctx, install_result="FAILED")
             if post is not None:
                 self._record_post(ctx, post)
             raise PatchAbort(
                 f"apt-get install failed (exit {parsed.returncode})"
-                + (f": {'; '.join(errors[:3])}" if errors else ".")
-                + " No automatic retry or rollback was attempted. Run a new analysis before "
-                "retrying.",
+                + (f": {'; '.join(errors)}" if errors else ".")
+                + " The full apt output is under Install output below. No automatic retry or "
+                "rollback was attempted. Finish the install on the server with "
+                "'sudo dpkg --configure -a', then run a new analysis before retrying.",
                 title=PARTIAL_STATE, partial=True,
             )  # fmt: skip
         # The connection was lost or timed out: the outcome of apt is not known.
