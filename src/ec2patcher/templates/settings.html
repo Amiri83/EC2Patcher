@@ -59,6 +59,8 @@
 <div class="card form-card" id="connection">
   <h2>Connection</h2>
   <p class="muted">How servers without their own connection type are reached. SSH over SSM runs the same ssh and scp through <code>aws ssm start-session</code> as ProxyCommand; it needs the AWS CLI on this machine and the Session Manager plugin, which can be installed from here without sudo. AWS credentials stay in the AWS CLI configuration; only the profile name is stored here.</p>
+  {% from "_aws_dropdown.html" import aws_dropdown %}
+  {% set aws = aws_profiles() %}
   <form method="post" action="/settings/connection">
     <div class="field{% if connection_errors.connection_type %} has-error{% endif %}">
       <label for="default_connection_type">Default connection type</label>
@@ -71,12 +73,14 @@
     </div>
     <div class="field{% if connection_errors.aws_profile %} has-error{% endif %}">
       <label for="default_aws_profile">Default AWS profile</label>
-      <input type="text" id="default_aws_profile" name="aws_profile" value="{{ connection_form.aws_profile }}" placeholder="example" maxlength="128" autocomplete="off" spellcheck="false">
+      {{ aws_dropdown("profile", "aws_profile", "default_aws_profile", aws_dropdown_view(connection_form.aws_profile, aws.profiles, "aws_profile" in (connection_form.other_chosen or [])), "None", 128, "example") }}
+      <div class="hint">The list comes from your AWS CLI config.{% if aws.reason %} <span class="aws-config-reason">{{ aws.reason }}</span> Use Other… to type a name.{% endif %}</div>
       {% if connection_errors.aws_profile %}<div class="field-error">{{ connection_errors.aws_profile }}</div>{% endif %}
     </div>
     <div class="field{% if connection_errors.aws_region %} has-error{% endif %}">
       <label for="default_aws_region">Default AWS region</label>
-      <input type="text" id="default_aws_region" name="aws_region" value="{{ connection_form.aws_region }}" placeholder="us-east-1" maxlength="32" autocomplete="off" spellcheck="false">
+      {{ aws_dropdown("region", "aws_region", "default_aws_region", aws_dropdown_view(connection_form.aws_region, aws_regions, "aws_region" in (connection_form.other_chosen or [])), "None", 32, "us-east-1", connection_form.region_from_profile) }}
+      <div class="hint">Choosing a profile selects its region from the AWS CLI config, if it has one. Other… must look like <code>us-east-1</code>.</div>
       {% if connection_errors.aws_region %}<div class="field-error">{{ connection_errors.aws_region }}</div>{% endif %}
     </div>
     <div class="form-actions">

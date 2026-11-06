@@ -19,6 +19,8 @@ def isolated_metadata_cache(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(config.DATA_DIR_ENV, str(tmp_path / "appdata"))
     monkeypatch.setenv(config.CONFIG_DIR_ENV, str(tmp_path / "config"))
     monkeypatch.setenv(config.LOG_DIR_ENV, str(tmp_path / "logs"))
+    # The forms read the AWS CLI config: never the real one. Write this file to test with one.
+    monkeypatch.setenv(config.AWS_CONFIG_FILE_ENV, str(tmp_path / "aws" / "config"))
     monkeypatch.delenv(config.APT_STATE_DIR_ENV, raising=False)
     monkeypatch.delenv(config.APT_MAX_AGE_ENV, raising=False)
 

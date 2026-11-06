@@ -19,6 +19,9 @@ LOG_DIR_ENV = "EC2PATCHER_LOG_DIR"
 # Config directory holding the Fernet key file of the stored secrets (never the database).
 CONFIG_DIR_ENV = "EC2PATCHER_CONFIG_DIR"
 SECRET_KEY_FILENAME = "secret.key"  # noqa: S105 - a file name, not a secret
+# The AWS CLI's own variable for its config file: read here for the profile names, never written.
+AWS_CONFIG_FILE_ENV = "AWS_CONFIG_FILE"
+DEFAULT_AWS_CONFIG_FILE = "~/.aws/config"
 
 # Private APT state used to resolve candidates and .deb plans on the workstation.
 APT_STATE_DIRNAME = "apt"  # under the data directory
@@ -55,6 +58,11 @@ def get_config_dir() -> Path:
 def get_secret_key_path() -> Path:
     """Fernet key file that encrypts the stored secrets (kept outside the database)."""
     return get_config_dir() / SECRET_KEY_FILENAME
+
+
+def get_aws_config_path() -> Path:
+    """The config file the AWS CLI uses: $AWS_CONFIG_FILE, else ~/.aws/config."""
+    return Path(os.environ.get(AWS_CONFIG_FILE_ENV) or DEFAULT_AWS_CONFIG_FILE).expanduser()
 
 
 def get_default_log_dir() -> Path:

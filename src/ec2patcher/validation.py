@@ -34,7 +34,7 @@ NVD_API_KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
 # These three end up in an ssh ProxyCommand, which ssh runs through a shell after expanding its
 # % tokens: the allowlists leave out whitespace, shell metacharacters and '%'.
 INSTANCE_ID_RE = re.compile(r"i-[0-9a-f]{8,17}")
-AWS_REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]{1,2}")
+AWS_REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-[0-9]")
 AWS_PROFILE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_@+=:,./-]*")
 AWS_PROFILE_MAX_LENGTH = 128
 
