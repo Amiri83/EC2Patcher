@@ -11,6 +11,7 @@ import uvicorn
 from ec2patcher import __version__
 from ec2patcher.app import DEFAULT_ALLOWED_HOSTS, create_app
 from ec2patcher.config import (
+    DATA_DIR_ENV,
     DB_FILENAME,
     DEFAULT_APT_MAX_AGE_HOURS,
     DEFAULT_HOST,
@@ -55,6 +56,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--apt-max-age-hours must be a non-negative number")
 
     data_dir = get_data_dir(args.data_dir)
+    # Everything that looks the data directory up later (the app-managed plugin) sees this one.
+    os.environ[DATA_DIR_ENV] = str(data_dir)
     setup_console_logging()  # the rotating log file is set up by create_app (Settings)
 
     server: uvicorn.Server | None = None

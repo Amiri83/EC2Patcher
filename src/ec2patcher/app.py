@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import subprocess  # noqa: S404 - default runner handed to the ssh service
+import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,6 +37,7 @@ from ec2patcher.services import (
     report_service,
     secret_store,
     ssh_service,
+    ssm_plugin,
     ssm_service,
     staging,
 )
@@ -106,7 +108,12 @@ NOTICES = {
     ),
     "connection_applied": (
         "Connection defaults saved. Every server now follows them ({count} per-server connection "
-        "type(s) cleared)."
+        "setting(s) cleared; manual instance IDs are kept)."
+    ),
+    "ssm_plugin_installed": "Session Manager plugin {name} installed; its signature was verified.",
+    "ssm_plugin_unsigned": (
+        "Session Manager plugin {name} installed. Its signature was not checked because gpg is not "
+        "installed on this machine; the package name, architecture and format were."
     ),
 }
 
@@ -312,6 +319,8 @@ def create_app(
         result.transport = transport.label
         return result
 
+    plugin_install_lock = threading.Lock()
+
     def render(request: Request, template: str, active: str, status_code: int = 200, **ctx):
         ctx.setdefault("notice", None)
         ctx.setdefault("error", None)
@@ -401,10 +410,11 @@ def create_app(
         # The password field is always rendered empty; only "a password is stored" is shown.
         server = db.get_server(server_id) if server_id is not None else None
         has_stored = server is not None and server.has_password
+        connection = ssm_service.connection_view(db, server) if server else None
         return render(
             request, "server_form.html", "servers", status_code=status_code,
             server_id=server_id, form=form, errors=ctx.pop("errors", {}),
-            has_stored_password=has_stored,
+            has_stored_password=has_stored, connection=connection,
             stored_password_error=stored_password(server_id)[1] if has_stored else None, **ctx,
         )  # fmt: skip
 
@@ -615,6 +625,17 @@ def create_app(
         else:
             result = run_connection_test(server, password)
         return servers_page(request, ssh_result=result, tested_id=server_id)
+
+    @app.post("/servers/{server_id}/resolve-instance", response_class=HTMLResponse)
+    def resolve_server_instance(request: Request, server_id: int):
+        """Look the instance ID up now and cache it, as on first use. Only runs the aws CLI."""
+        server = db.get_server(server_id)
+        if server is None:
+            return redirect("/servers", notice="not_found")
+        runner = ssh_runner or subprocess.run
+        transport = ssm_service.TransportResolver(db, runner).for_server(server, force_refresh=True)
+        result = {"ok": transport.error is None, "error": transport.error}
+        return servers_page(request, instance_result=result, tested_id=server_id)
 
     @app.post("/servers/clear", response_class=HTMLResponse)
     def clear_servers(request: Request, confirm_text: str = Form("")):
@@ -940,7 +961,10 @@ def create_app(
             cache_ttl_errors=ctx.pop("cache_ttl_errors", {}),
             cache_ttl_labels=cache_settings.LABELS, cache_ttl_saved=bool(ttls.saved()),
             connection_form=connection_form,
-            connection_errors=ctx.pop("connection_errors", {}), **ctx,
+            connection_errors=ctx.pop("connection_errors", {}),
+            ssm_plugin_location=ssm_plugin.find_plugin(),
+            ssm_plugin_dir=config.get_plugin_bin_dir(), ssm_status=ctx.pop("ssm_status", None),
+            **ctx,
         )  # fmt: skip
 
     def nvd_key_view() -> dict:
@@ -983,9 +1007,30 @@ def create_app(
         )  # fmt: skip
         if action != "apply_all":
             return redirect("/settings", notice="connection_saved")
-        count = db.clear_server_connection_types()
+        count = db.clear_server_connection_settings()
         logger.info("All servers follow the default connection (%d cleared)", count)
         return redirect("/settings", notice="connection_applied", count=count)
+
+    @app.get("/settings/ssm-status", response_class=HTMLResponse)
+    def ssm_status_fragment(request: Request):
+        """The Settings badge, loaded apart from the page: it runs the aws CLI (read-only)."""
+        status = ssm_service.check_status(db, ssh_runner or subprocess.run)
+        return templates.TemplateResponse(request, "_ssm_status.html", {"ssm_status": status})
+
+    @app.post("/settings/ssm-plugin/install", response_class=HTMLResponse)
+    def install_ssm_plugin(request: Request):
+        if not plugin_install_lock.acquire(blocking=False):
+            error = "The Session Manager plugin is already being installed."
+            return settings_page(request, status_code=409, error=error)
+        try:
+            result = ssm_plugin.install(runner=ssh_runner or subprocess.run)
+        except ssm_plugin.PluginInstallError as exc:
+            logger.warning("Session Manager plugin not installed: %s", exc)
+            return settings_page(request, status_code=502, error=str(exc))
+        finally:
+            plugin_install_lock.release()
+        notice = "ssm_plugin_installed" if result.signature_checked else "ssm_plugin_unsigned"
+        return redirect("/settings", notice=notice, name=result.version)
 
     @app.post("/settings/nvd-key", response_class=HTMLResponse)
     def save_nvd_key(request: Request, action: str = Form("save"), nvd_api_key: str = Form("")):
@@ -1019,7 +1064,12 @@ def create_app(
         preview_name = request.query_params.get("server", "")
         if staging.safe_name_error(preview_name):
             preview_name = None
-        return settings_page(request, notice=notice_from_query(request), preview_name=preview_name)
+        status = None
+        if request.query_params.get("ssm_check"):  # the Check now link, also without JavaScript
+            status = ssm_service.check_status(db, ssh_runner or subprocess.run)
+        return settings_page(
+            request, notice=notice_from_query(request), preview_name=preview_name, ssm_status=status
+        )
 
     @app.post("/settings/cache-ttl", response_class=HTMLResponse)
     async def save_cache_ttl(request: Request):

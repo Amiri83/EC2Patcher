@@ -13,6 +13,7 @@ DEFAULT_PORT = 8080
 DB_FILENAME = "ec2patcher.db"
 LOG_FILENAME = "ec2patcher.log"
 DATA_DIR_ENV = "EC2PATCHER_DATA_DIR"
+PLUGIN_BIN_DIRNAME = "bin"  # under the data directory
 # Default log directory (the Settings page can choose another one, stored in the database).
 LOG_DIR_ENV = "EC2PATCHER_LOG_DIR"
 # Config directory holding the Fernet key file of the stored secrets (never the database).
@@ -37,6 +38,11 @@ def get_data_dir(override: str | None = None) -> Path:
     path = Path(raw).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def get_plugin_bin_dir() -> Path:
+    """Where the app keeps the session-manager-plugin it installed: <data dir>/bin (not created)."""
+    return get_data_dir() / PLUGIN_BIN_DIRNAME
 
 
 def get_config_dir() -> Path:

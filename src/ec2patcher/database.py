@@ -854,11 +854,14 @@ class Database:
             cur = conn.execute("DELETE FROM servers")
         return cur.rowcount
 
-    def clear_server_connection_types(self) -> int:
-        """Make every server follow the default connection type of Settings."""
+    def clear_server_connection_settings(self) -> int:
+        """Make every server follow the connection defaults of Settings: its own connection type,
+        AWS profile and region go. A manual instance ID stays: it identifies that one server."""
         with self.connect() as conn:
             cur = conn.execute(
-                "UPDATE servers SET connection_type = NULL WHERE connection_type IS NOT NULL"
+                "UPDATE servers SET connection_type = NULL, aws_profile = NULL, aws_region = NULL "
+                "WHERE connection_type IS NOT NULL OR aws_profile IS NOT NULL "
+                "OR aws_region IS NOT NULL"
             )
         return cur.rowcount
 

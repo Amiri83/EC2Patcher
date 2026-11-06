@@ -1,0 +1,30 @@
+{# ssm_status is None until the status is loaded: rendering a page runs no command. #}
+{% if not ssm_status %}
+<p class="muted small">Checking&hellip; <noscript>Use Check now to run the checks.</noscript></p>
+{% else %}
+<dl class="kv ssm-status">
+  <dt>Session Manager plugin</dt>
+  <dd>
+    {% if ssm_status.plugin.found %}
+      <span class="badge badge-success">{{ ssm_status.plugin.version }}</span>
+      <span class="muted small">{{ "app-managed" if ssm_status.plugin.managed else "on PATH" }}: <code>{{ ssm_status.plugin.path }}</code></span>
+    {% elif ssm_status.plugin.path %}
+      <span class="badge badge-danger">does not run</span> <code>{{ ssm_status.plugin.path }}</code>
+    {% else %}
+      <span class="badge badge-warning">not found</span>
+    {% endif %}
+  </dd>
+  <dt>AWS CLI</dt>
+  <dd>
+    {% if ssm_status.aws.found %}<span class="badge badge-success">{{ ssm_status.aws.version or "found" }}</span>
+    {% else %}<span class="badge badge-danger">not found</span> <span class="muted small">Install AWS CLI v2 on this machine.</span>{% endif %}
+  </dd>
+  <dt>AWS profile{% if ssm_status.profile.profile %} <code>{{ ssm_status.profile.profile }}</code>{% endif %}</dt>
+  <dd>
+    {% if ssm_status.profile.state == "ok" %}<span class="badge badge-success">{{ ssm_status.profile.message }}</span>
+    {% elif ssm_status.profile.state == "sso_expired" %}<span class="badge badge-danger">{{ ssm_status.profile.message }}</span> Run <code>{{ ssm_status.profile.hint }}</code>
+    {% elif ssm_status.profile.state == "failed" %}<span class="badge badge-danger">Failed</span> {{ ssm_status.profile.message }}
+    {% else %}<span class="muted small">{{ ssm_status.profile.message }}</span>{% endif %}
+  </dd>
+</dl>
+{% endif %}

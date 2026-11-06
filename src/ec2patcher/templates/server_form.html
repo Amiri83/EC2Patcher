@@ -60,7 +60,7 @@
     </div>
     {% set defaults = connection_defaults() %}
     <div class="field{% if errors.connection_type %} has-error{% endif %}">
-      <label for="connection_type">Connection type</label>
+      <label for="connection_type">Connection</label>
       <select id="connection_type" name="connection_type" data-connection-type data-default="{{ defaults.connection_type }}">
         <option value=""{% if not form.connection_type %} selected{% endif %}>Default from Settings: {{ connection_types[defaults.connection_type] }}</option>
         {% for key, label in connection_types.items() %}
@@ -75,7 +75,7 @@
         <label for="instance_id_override">Instance ID <span class="muted small">(optional)</span></label>
         <input type="text" id="instance_id_override" name="instance_id_override" value="{{ form.instance_id_override }}"
                placeholder="i-0123456789abcdef0" maxlength="19" autocomplete="off" spellcheck="false">
-        <div class="hint">Empty: found by private IP (from a name like <code>ip-10-0-0-1</code>, else the IP address above) and cached. A value here always wins.</div>
+        <div class="hint">Empty: found by private IP (from a name like <code>ip-10-0-0-1</code>, else the IP address above) and cached. A value here always wins.{% if connection and connection.instance_source == "resolved" %} Currently resolved: <code class="resolved-instance">{{ connection.instance_id }}</code>.{% endif %}</div>
         {% if errors.instance_id_override %}<div class="field-error">{{ errors.instance_id_override }}</div>{% endif %}
       </div>
       <div class="field{% if errors.aws_profile %} has-error{% endif %}">

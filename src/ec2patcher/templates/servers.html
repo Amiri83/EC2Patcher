@@ -27,7 +27,7 @@
               {% set conn = connection_view(s) %}
               <span class="server-connection"><span class="meta-label">Connection</span> {{ conn.label }}{% if conn.from_default %} <span class="muted small">(default)</span>{% endif %}</span>
               {% if conn.type == "ssm" %}
-              <span><span class="meta-label">Instance</span> {% if conn.instance_id %}<code>{{ conn.instance_id }}</code> <span class="muted small">({{ conn.instance_source }})</span>{% else %}<span class="muted small">resolved on first use</span>{% endif %}</span>
+              <span><span class="meta-label">Instance</span> {% if conn.instance_id %}<code>{{ conn.instance_id }}</code> <span class="muted small">({{ conn.instance_source }})</span>{% else %}<span class="muted small">not resolved yet (found on first use)</span>{% endif %}</span>
               <span><span class="meta-label">AWS</span> <code>{{ conn.profile or "no profile" }}</code> / <code>{{ conn.region or "no region" }}</code></span>
               {% endif %}
             </div>
@@ -46,12 +46,23 @@
             <form method="post" action="/servers/{{ s.id }}/test">
               <button type="submit" class="btn btn-secondary btn-sm">Test connection</button>
             </form>
+            {% if conn.type == "ssm" and conn.instance_source != "set manually" %}
+            <form method="post" action="/servers/{{ s.id }}/resolve-instance">
+              <button type="submit" class="btn btn-secondary btn-sm">Resolve instance ID</button>
+            </form>
+            {% endif %}
             <a href="/servers/{{ s.id }}/edit" class="btn btn-secondary btn-sm">Edit</a>
             <form method="post" action="/servers/{{ s.id }}/delete"
                   data-confirm="Delete server '{{ s.name }}'?">
               <button type="submit" class="btn btn-danger-outline btn-sm">Delete</button>
             </form>
           </div>
+          {% if instance_result and tested_id == s.id %}
+            <div class="server-result" role="status">
+              {% if instance_result.ok %}<span class="badge badge-success">Instance ID resolved</span>
+              {% else %}<span class="badge badge-danger">Instance ID not resolved</span> {{ instance_result.error }}{% endif %}
+            </div>
+          {% endif %}
           {% if ssh_result and tested_id == s.id %}
             <div class="server-result">{% include "_ssh_result.html" %}</div>
           {% endif %}

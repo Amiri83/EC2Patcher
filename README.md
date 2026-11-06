@@ -89,7 +89,9 @@ scp commands and the same PEM or password login, plus this option:
 
 **Prerequisites on the workstation**
 
-- AWS CLI v2 (`aws`) and the Session Manager plugin (`session-manager-plugin`) on `PATH`.
+- AWS CLI v2 (`aws`) on `PATH`.
+- The Session Manager plugin (`session-manager-plugin`) on `PATH` or managed by the app, see
+  [below](#session-manager-plugin).
 - A working profile. For SSO, sign in first: `aws sso login --profile example`.
 - On the server: `sshd` running, the SSM agent connected, and your login still valid. SSM only
   carries the connection; ssh still authenticates with the server's PEM key or password.
@@ -100,8 +102,41 @@ scp commands and the same PEM or password login, plus this option:
   credentials stay in the AWS CLI configuration; EC2 Patcher only stores the profile name.
 - A server follows the default until it gets its own connection type on the server form, where
   the profile and region can also be overridden.
-- **Save** changes the servers that follow the default. **Save and switch all servers** also
-  clears the connection type set on individual servers.
+- **Save** changes the servers that follow the default. **Apply to all servers** also clears the
+  connection type, AWS profile and region set on individual servers. Manual instance IDs are
+  kept, because each one identifies a single server.
+
+#### Session Manager plugin
+
+The app looks for `session-manager-plugin` in `<data dir>/bin` (by default
+`~/.local/share/ec2patcher/bin`) first and then on `PATH`. The aws CLI, directly and as the
+ProxyCommand of ssh and scp, runs with that directory first on its `PATH`.
+
+If the plugin is missing, **Settings → Connection → Install SSM plugin** installs it without sudo
+and changes nothing outside the data directory:
+
+1. It downloads the official Ubuntu package for this machine's architecture from AWS
+   (`https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb`,
+   or `ubuntu_arm64`).
+2. AWS publishes no checksum, so it verifies the detached GPG signature (`.deb.sig`) against the
+   signing key in the AWS documentation, using a throwaway keyring. A bad or missing signature
+   stops the install. If `gpg` is not installed, this step is skipped and the result says so.
+3. It checks that the file is a `dpkg-deb`-readable package named `session-manager-plugin` for
+   the right architecture.
+4. It unpacks the package with `dpkg-deb -x` into a temporary directory (no maintainer scripts run
+   and no dpkg state changes), and copies only the program to `<data dir>/bin` once it has run
+   `--version` successfully.
+
+A failed install leaves an existing plugin in place and reports why: no network, download failed,
+not a `.deb`, `dpkg-deb` missing, bad signature or wrong architecture. A plugin installed this way
+can be refreshed with **Update SSM plugin**; a plugin found on `PATH` is left to you.
+
+**Status badge**
+
+**Settings → Connection** shows the plugin version and where it was found, the AWS CLI version and
+whether the default profile works: **Profile OK**, or **SSO expired** with the
+`aws sso login --profile example` command to run. The checks load after the page, and **Check
+now** runs them again.
 
 **Instance ID**
 
@@ -113,12 +148,17 @@ scp commands and the same PEM or password login, plus this option:
   connection** always looks it up again.
 - The **Instance ID** field on the server form is a manual override and always wins. Use it when
   the lookup finds no instance or several, each of which is reported on that server.
+- The Servers page shows each SSM server's instance ID and whether it was resolved or set
+  manually. **Resolve instance ID** looks it up now; a failed lookup shows a short reason there.
+  The server form also shows the resolved ID.
 
 **Preflight and errors**
 
 - Before connecting, each analysis run and patch execution checks that `aws` and
-  `session-manager-plugin` are installed and that `aws sts get-caller-identity` works for the
-  profile and region. An analysis run checks each profile and region once.
+  `session-manager-plugin` are installed, that `aws sts get-caller-identity` works for the
+  profile and region, and that the instance ID is known. Each failure has its own message (missing
+  CLI, missing plugin, expired SSO, unknown profile, bad region, instance not found). An analysis
+  run checks each profile and region once. Direct SSH servers skip all of this.
 - An expired SSO session is reported as ``run `aws sso login --profile example` ``, not as a raw
   ssh error, including when it expires during a run. A failed preflight only fails the servers
   that use SSM; nothing is downloaded or changed on them.
