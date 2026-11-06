@@ -58,7 +58,9 @@
       <div class="hint">Login user for every SSH/SCP connection to this server (default <code>ubuntu</code>; e.g. <code>ec2-user</code> on Amazon Linux).</div>
       {% if errors.ssh_user %}<div class="field-error">{{ errors.ssh_user }}</div>{% endif %}
     </div>
+    {% from "_aws_dropdown.html" import aws_dropdown %}
     {% set defaults = connection_defaults() %}
+    {% set aws = aws_profiles() %}
     <div class="field{% if errors.connection_type %} has-error{% endif %}">
       <label for="connection_type">Connection</label>
       <select id="connection_type" name="connection_type" data-connection-type data-default="{{ defaults.connection_type }}">
@@ -80,16 +82,14 @@
       </div>
       <div class="field{% if errors.aws_profile %} has-error{% endif %}">
         <label for="aws_profile">AWS profile <span class="muted small">(optional)</span></label>
-        <input type="text" id="aws_profile" name="aws_profile" value="{{ form.aws_profile }}"
-               placeholder="{{ defaults.profile or 'example' }}" maxlength="128" autocomplete="off" spellcheck="false">
-        <div class="hint">Empty: the default from Settings{% if defaults.profile %} (<code>{{ defaults.profile }}</code>){% endif %}.</div>
+        {{ aws_dropdown("profile", "aws_profile", "aws_profile", aws_dropdown_view(form.aws_profile, aws.profiles, "aws_profile" in (form.other_chosen or [])), "Default from Settings", 128, defaults.profile or "example") }}
+        <div class="hint">Default from Settings{% if defaults.profile %} (<code>{{ defaults.profile }}</code>){% endif %} unless you choose one. The list comes from your AWS CLI config.{% if aws.reason %} <span class="aws-config-reason">{{ aws.reason }}</span> Use Other… to type a name.{% endif %}</div>
         {% if errors.aws_profile %}<div class="field-error">{{ errors.aws_profile }}</div>{% endif %}
       </div>
       <div class="field{% if errors.aws_region %} has-error{% endif %}">
         <label for="aws_region">AWS region <span class="muted small">(optional)</span></label>
-        <input type="text" id="aws_region" name="aws_region" value="{{ form.aws_region }}"
-               placeholder="{{ defaults.region or 'us-east-1' }}" maxlength="32" autocomplete="off" spellcheck="false">
-        <div class="hint">Empty: the default from Settings{% if defaults.region %} (<code>{{ defaults.region }}</code>){% endif %}.</div>
+        {{ aws_dropdown("region", "aws_region", "aws_region", aws_dropdown_view(form.aws_region, aws_regions, "aws_region" in (form.other_chosen or [])), "Default from Settings", 32, defaults.region or "us-east-1") }}
+        <div class="hint">Default from Settings{% if defaults.region %} (<code>{{ defaults.region }}</code>){% endif %} unless you choose one. Choosing a profile selects its region from the AWS CLI config, if it has one. Other… must look like <code>us-east-1</code>.</div>
         {% if errors.aws_region %}<div class="field-error">{{ errors.aws_region }}</div>{% endif %}
       </div>
     </div>

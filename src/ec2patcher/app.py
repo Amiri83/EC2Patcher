@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.background import BackgroundTask
@@ -26,6 +26,7 @@ from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.models import AUTH_METHODS, AUTH_PASSWORD, AUTH_PEM, DEFAULT_SSH_USER
 from ec2patcher.services import (
     analysis_service,
+    aws_config,
     cache_settings,
     cve_resolver,
     downloader,
@@ -294,6 +295,9 @@ def create_app(
     templates.env.globals["connection_types"] = models.CONNECTION_TYPES
     templates.env.globals["connection_defaults"] = lambda: ssm_service.load_defaults(db)
     templates.env.globals["connection_view"] = lambda s: ssm_service.connection_view(db, s)
+    templates.env.globals["aws_profiles"] = aws_config.read_profiles
+    templates.env.globals["aws_regions"] = aws_config.COMMERCIAL_REGIONS
+    templates.env.globals["aws_dropdown_view"] = aws_config.dropdown
     app.state.analyzer = analyzer
     app.state.patcher = patcher
     app.state.credentials = credentials
@@ -346,17 +350,23 @@ def create_app(
 
     # --- basic CSRF protection for a localhost app without authentication ---
 
+    def rejected_cross_site(request: Request) -> Response | None:
+        """The rejection of a request from another site, or None."""
+        origin = request.headers.get("origin")
+        host = request.headers.get("host", "")
+        cross_site = request.headers.get("sec-fetch-site") == "cross-site"
+        if cross_site or (origin and origin != "null" and urlsplit(origin).netloc != host):
+            logger.warning(
+                "Rejected cross-site %s to %s (origin=%s)",
+                request.method, request.url.path, origin,
+            )  # fmt: skip
+            return Response("Cross-site request rejected.", status_code=403)
+        return None
+
     @app.middleware("http")
     async def reject_cross_site_posts(request: Request, call_next):
-        if request.method == "POST":
-            origin = request.headers.get("origin")
-            host = request.headers.get("host", "")
-            cross_site = request.headers.get("sec-fetch-site") == "cross-site"
-            if cross_site or (origin and origin != "null" and urlsplit(origin).netloc != host):
-                logger.warning(
-                    "Rejected cross-site POST to %s (origin=%s)", request.url.path, origin
-                )
-                return Response("Cross-site request rejected.", status_code=403)
+        if request.method == "POST" and (rejected := rejected_cross_site(request)):
+            return rejected
         return await call_next(request)
 
     # --- error pages ---------------------------------------------------------
@@ -431,13 +441,18 @@ def create_app(
         auth_method: str = AUTH_PEM,
         ssh_password: str = "",
         transport: dict[str, str] | None = None,
+        others: dict[str, str] | None = None,
     ):
-        transport = transport or {}
+        transport, other_chosen = aws_config.resolve_choices(transport or {}, others or {})
         form = {
             "name": name, "ip_address": ip, "pem_path": pem, "ssh_user": ssh_user,
-            "auth_method": auth_method, **transport,
+            "auth_method": auth_method, **transport, "other_chosen": other_chosen,
         }  # fmt: skip
         form["tags"] = tag_rows(tag_keys, tag_values)
+        # Direct SSH hides the SSM fields and does not use them: an empty Other is no error there.
+        kind = transport.get("connection_type", "").strip()
+        over_ssm = (kind or ssm_service.load_defaults(db).connection_type) == models.CONNECTION_SSM
+        other_errors = aws_config.other_errors(transport, other_chosen) if over_ssm else {}
         use_password = auth_method == AUTH_PASSWORD
         if action == "test":  # never saves anything
             password, error = None, None
@@ -447,6 +462,7 @@ def create_app(
                 password, error = stored_password(server_id)
                 if password is None and error is None:
                     error = "Enter the SSH password to test the connection."
+            error = error or next(iter(other_errors.values()), None)
             if error:
                 result = ssh_service.SSHTestResult(
                     False, name.strip() or "(unsaved)", ip.strip(), error=error
@@ -459,7 +475,7 @@ def create_app(
                     **{key: value.strip() or None for key, value in transport.items()},
                 )  # fmt: skip
                 result = run_connection_test(probe, password)
-            return server_form(request, server_id, form, ssh_result=result)
+            return server_form(request, server_id, form, ssh_result=result, errors=other_errors)
 
         data = validate_server_input(
             db, name, ip, pem, exclude_id=server_id, tag_keys=tag_keys, tag_values=tag_values,
@@ -473,6 +489,7 @@ def create_app(
                 error = None
             if error:
                 data.errors["ssh_password"] = error
+        data.errors.update(other_errors)
         if not data.is_valid:
             return server_form(request, server_id, form, status_code=422, errors=data.errors)
         encrypted = None
@@ -543,14 +560,17 @@ def create_app(
         instance_id_override: str = Form(""),
         aws_profile: str = Form(""),
         aws_region: str = Form(""),
+        aws_profile_other: str = Form(""),
+        aws_region_other: str = Form(""),
     ):
         transport = {
             "connection_type": connection_type, "instance_id_override": instance_id_override,
             "aws_profile": aws_profile, "aws_region": aws_region,
         }  # fmt: skip
+        others = {"aws_profile": aws_profile_other, "aws_region": aws_region_other}
         return handle_server_form(
             request, None, action, name, ip_address, pem_path, tag_key, tag_value, ssh_user,
-            auth_method, ssh_password, transport,
+            auth_method, ssh_password, transport, others,
         )  # fmt: skip
 
     @app.get("/servers/{server_id}/edit", response_class=HTMLResponse)
@@ -601,9 +621,10 @@ def create_app(
             key: str(submitted.get(key, getattr(server, key) or ""))
             for key in ("connection_type", "instance_id_override", "aws_profile", "aws_region")
         }
+        others = {key: str(submitted.get(f"{key}_other", "")) for key in aws_config.CHOICE_FIELDS}
         return handle_server_form(
             request, server_id, action, name, ip_address, pem_path, tag_key, tag_value, user,
-            method, ssh_password, transport,
+            method, ssh_password, transport, others,
         )  # fmt: skip
 
     @app.post("/servers/{server_id}/delete")
@@ -935,10 +956,13 @@ def create_app(
         preview_name = ctx.pop("preview_name", None) or (names[0] if names else "ip-10-0-0-1")
         log_dir_value = ctx.pop("log_dir_value", None) or str(log_dir())
         defaults = ssm_service.load_defaults(db)
+        # With no region saved, the default profile's own region is the default selection.
+        profile_region = "" if defaults.region else aws_config.region_of(defaults.profile)
         connection_form = ctx.pop("connection_form", None) or {
             "connection_type": defaults.connection_type,
             "aws_profile": defaults.profile or "",
-            "aws_region": defaults.region or "",
+            "aws_region": defaults.region or profile_region,
+            "region_from_profile": bool(profile_region),
         }
         preview, preview_error = None, None
         try:
@@ -988,16 +1012,26 @@ def create_app(
         connection_type: str = Form(""),
         aws_profile: str = Form(""),
         aws_region: str = Form(""),
+        aws_profile_other: str = Form(""),
+        aws_region_other: str = Form(""),
     ):
+        choices, other_chosen = aws_config.resolve_choices(
+            {"aws_profile": aws_profile, "aws_region": aws_region},
+            {"aws_profile": aws_profile_other, "aws_region": aws_region_other},
+        )
         form = {
             "connection_type": connection_type.strip(),
-            "aws_profile": aws_profile.strip(),
-            "aws_region": aws_region.strip(),
+            "aws_profile": choices["aws_profile"].strip(),
+            "aws_region": choices["aws_region"].strip(),
         }
-        errors = ssm_service.check_defaults(*form.values())
+        errors = {
+            **ssm_service.check_defaults(*form.values()),
+            **aws_config.other_errors(choices, other_chosen),
+        }
         if errors:
+            shown = {**form, "other_chosen": other_chosen}
             return settings_page(
-                request, status_code=422, connection_form=form, connection_errors=errors
+                request, status_code=422, connection_form=shown, connection_errors=errors
             )
         ssm_service.save_defaults(db, *form.values())
         logger.info(
@@ -1010,6 +1044,12 @@ def create_app(
         count = db.clear_server_connection_settings()
         logger.info("All servers follow the default connection (%d cleared)", count)
         return redirect("/settings", notice="connection_applied", count=count)
+
+    @app.get("/settings/aws-options")
+    def aws_options(request: Request):
+        """The profiles of the AWS CLI config and the region list, for the connection forms.
+        Profile names say something about the user, so other sites must not read them."""
+        return rejected_cross_site(request) or JSONResponse(aws_config.options())
 
     @app.get("/settings/ssm-status", response_class=HTMLResponse)
     def ssm_status_fragment(request: Request):

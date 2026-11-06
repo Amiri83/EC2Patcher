@@ -228,6 +228,7 @@ input[type="radio"], input[type="checkbox"] { accent-color: var(--primary); widt
 .has-error input:focus { box-shadow: 0 0 0 3px var(--danger-bg); }
 .field-error { color: var(--danger); font-size: 13px; margin-top: var(--space-1); }
 .hint { color: var(--muted); font-size: 13px; margin-top: var(--space-1); }
+.other-input { margin-top: var(--space-2); }
 .form-actions { display: flex; align-items: center; gap: var(--space-2); margin-top: var(--space-5); flex-wrap: wrap; }
 .spacer { flex: 1; }
 .inline { display: flex; gap: var(--space-2); flex-wrap: wrap; align-items: center; }

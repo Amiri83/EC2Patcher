@@ -1,0 +1,15 @@
+{# An AWS profile or region: a list, the empty choice and Other... with its text input. Without JavaScript the input stays visible and only counts when Other... is selected. #}
+{% macro aws_dropdown(kind, name, id, view, empty_label, maxlength, placeholder, region_from_profile=false) %}
+<select id="{{ id }}" name="{{ name }}" data-aws-choice="{{ kind }}" data-other="{{ view.other_marker }}"{% if kind == "profile" %} data-aws-options-url="/settings/aws-options"{% endif %}{% if region_from_profile %} data-from-profile{% endif %}>
+  <option value=""{% if view.selected == "" %} selected{% endif %}>{{ empty_label }}</option>
+  {% for option in view.options %}
+    <option value="{{ option }}"{% if view.selected == option %} selected{% endif %}>{{ option }}</option>
+  {% endfor %}
+  <option value="{{ view.other_marker }}"{% if view.selected == view.other_marker %} selected{% endif %}>Other…</option>
+</select>
+<div class="other-input" data-other-input="{{ id }}">
+  <label for="{{ id }}_other" class="muted small">Other {{ kind }}</label>
+  <input type="text" id="{{ id }}_other" name="{{ name }}_other" value="{{ view.other_value }}"
+         placeholder="{{ placeholder }}" maxlength="{{ maxlength }}" autocomplete="off" spellcheck="false">
+</div>
+{% endmacro %}

@@ -32,6 +32,7 @@ PLUGIN_BINARY = ssm_plugin.PLUGIN_BINARY
 SSM_DOCUMENT = "AWS-StartSSHSession"
 DEFAULT_SSH_PORT = 22  # what ssh connects to when no port is configured
 AWS_TIMEOUT_SECONDS = 30
+AWS_LOOKUP_TIMEOUT_SECONDS = 10  # each call that explains a failed connection
 CREDENTIALS_CHECK = "The AWS credentials check"
 
 DEFAULT_CONNECTION_SETTING = "default_connection_type"
@@ -60,6 +61,13 @@ _REJECTED_MARKERS = ("invalidclienttokenid", "unrecognizedclient", "signaturedoe
 _DENIED_MARKERS = ("accessdenied", "unauthorizedoperation", "is not authorized to perform")
 _ARN_RE = re.compile(r"arn:aws[a-z-]*:\S+")
 _SESSION_NOISE_RE = re.compile(r"\s*(starting|exiting) session with sessionid\b", re.IGNORECASE)
+_INSTANCE_STATES = ("pending", "running", "shutting-down", "terminated", "stopping", "stopped")
+NOT_CONNECTED = (
+    "The instance is not connected to Systems Manager (stopped, SSM agent not running, "
+    "or no instance role). If it was replaced, try again: a cached instance ID is looked "
+    "up anew. Also check the instance ID set on this server, if any."
+)
+UNEXPECTED_ANSWER = "the AWS CLI returned an unexpected answer."
 
 
 class SsmError(Exception):
@@ -133,11 +141,7 @@ def describe_aws_error(stderr: str, profile: str) -> str | None:
     if any(s in lower for s in _REJECTED_MARKERS):
         return f"AWS rejected the credentials of profile {profile}."
     if "targetnotconnected" in lower or "invalidinstanceid" in lower:
-        return (
-            "The instance is not connected to Systems Manager (stopped, SSM agent not running, "
-            "or no instance role). If it was replaced, try again: a cached instance ID is looked "
-            "up anew. Also check the instance ID set on this server, if any."
-        )
+        return NOT_CONNECTED
     if any(s in lower for s in _DENIED_MARKERS):
         return f"Profile {profile} is not allowed to do this in AWS (access denied)."
     if "sessionmanagerplugin is not found" in lower:
@@ -172,14 +176,20 @@ def _failure(stderr: str, profile: str, action: str) -> str:
 # --- running the aws CLI ---------------------------------------------------------------
 
 
-def _run(command: list[str], runner: Runner, missing: str, action: str):
+def _run(
+    command: list[str],
+    runner: Runner,
+    missing: str,
+    action: str,
+    timeout: int = AWS_TIMEOUT_SECONDS,
+):
     """Run one local command. Raises :class:`SsmError` when it cannot be run at all."""
     try:
         return runner(
             command,
             capture_output=True,
             text=True,
-            timeout=AWS_TIMEOUT_SECONDS,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,
             check=False,
             env=ssm_plugin.aws_env(),  # finds the app-managed plugin too
@@ -187,7 +197,7 @@ def _run(command: list[str], runner: Runner, missing: str, action: str):
     except FileNotFoundError:
         raise SsmError(missing) from None
     except subprocess.TimeoutExpired:
-        raise SsmError(f"{action} did not finish within {AWS_TIMEOUT_SECONDS}s.") from None
+        raise SsmError(f"{action} did not finish within {timeout}s.") from None
     except OSError as exc:
         raise SsmError(f"{action} could not be run: {exc.strerror or exc}") from None
 
@@ -204,10 +214,10 @@ def preflight(profile: str, region: str, runner: Runner = subprocess.run) -> Non
         raise SsmError(_failure(proc.stderr or "", profile, CREDENTIALS_CHECK))
 
 
-def _caller_identity(profile: str, region: str, runner: Runner):
+def _caller_identity(profile: str, region: str, runner: Runner, timeout: int = AWS_TIMEOUT_SECONDS):
     return _run(
         [AWS_BINARY, "sts", "get-caller-identity", "--profile", profile, "--region", region],
-        runner, AWS_MISSING, CREDENTIALS_CHECK,
+        runner, AWS_MISSING, CREDENTIALS_CHECK, timeout,
     )  # fmt: skip
 
 
@@ -259,6 +269,106 @@ def resolve_instance_id(
             f"{', '.join(instances)}. Set the instance ID on this server."
         )
     return instances[0]
+
+
+# --- why a session could not start -----------------------------------------------------
+
+
+def explain_failure(target: SsmTarget, stderr: str, runner: Runner = subprocess.run) -> str | None:
+    """The message for a failed connection over SSM, or None when it is not an AWS failure.
+
+    SSM answers "not connected" for a wrong account or region and for a stopped instance as well
+    as for a missing agent, so only that answer is looked into. Every other one, expired
+    credentials first, is decided from ``stderr`` alone and calls nothing."""
+    known = describe_aws_error(stderr, target.profile)
+    if known != NOT_CONNECTED:
+        return known
+    try:
+        return _not_connected_cause(target, runner)
+    except SsmError as exc:
+        return _check_failed(target, str(exc))
+
+
+def _not_connected_cause(target: SsmTarget, runner: Runner) -> str:
+    """Asks in order: credentials (so EC2 is never asked with expired ones), EC2, then SSM."""
+    instance, profile, region = target.instance_id, target.profile, target.region
+    identity = _caller_identity(profile, region, runner, AWS_LOOKUP_TIMEOUT_SECONDS)
+    if identity.returncode != 0:
+        return _lookup_failed(target, identity.stderr)
+
+    proc = _lookup(
+        target, runner,
+        "ec2", "describe-instances", "--instance-ids", instance,
+        "--query", "Reservations[].Instances[].State.Name",
+    )  # fmt: skip
+    not_found = f"Instance {instance} not found in profile {profile} / region {region}."
+    if proc.returncode != 0:
+        if "invalidinstanceid" in (proc.stderr or "").lower():
+            return f"{not_found} Wrong account or region?"
+        return _lookup_failed(target, proc.stderr)
+    states = _json_list(proc.stdout)
+    if states == []:
+        return f"{not_found} Wrong account or region?"
+    if states is None or states[0] not in _INSTANCE_STATES:
+        return _check_failed(target, UNEXPECTED_ANSWER)
+    state = states[0]
+    if state != "running":
+        where = f"Instance {instance} is {state} in profile {profile} / region {region}"
+        restart = " Start it and try again." if state in ("stopped", "stopping") else ""
+        return f"{where}, so Systems Manager cannot reach it.{restart}"
+
+    proc = _lookup(
+        target, runner,
+        "ssm", "describe-instance-information", "--filters", f"Key=InstanceIds,Values={instance}",
+        "--query", "InstanceInformationList[].PingStatus",
+    )  # fmt: skip
+    if proc.returncode != 0:
+        return _lookup_failed(target, proc.stderr)
+    pings = _json_list(proc.stdout)
+    if pings is None:
+        return _check_failed(target, UNEXPECTED_ANSWER)
+    if "Online" in pings:
+        return (
+            f"Instance {instance} is running and online in Systems Manager, but the session "
+            "reported it as not connected. Try again in a moment."
+        )
+    return NOT_CONNECTED
+
+
+def _lookup(target: SsmTarget, runner: Runner, *arguments: str):
+    return _run(
+        [
+            AWS_BINARY, *arguments, "--output", "json",
+            "--profile", target.profile, "--region", target.region,
+        ],
+        runner, AWS_MISSING, f"'aws {arguments[0]} {arguments[1]}'", AWS_LOOKUP_TIMEOUT_SECONDS,
+    )  # fmt: skip
+
+
+def _json_list(stdout: str | None) -> list | None:
+    try:
+        found = json.loads(stdout or "")
+    except ValueError:
+        return None
+    return found if isinstance(found, list) else None
+
+
+def _lookup_failed(target: SsmTarget, stderr: str | None) -> str:
+    """A failed lookup: expired credentials get their own hint, anything else the AWS message
+    (without ARNs)."""
+    text = stderr or ""
+    lower = text.lower()
+    if is_sso_expired(text) or any(marker in lower for marker in _EXPIRED_MARKERS):
+        return describe_aws_error(text, target.profile) or NOT_CONNECTED
+    lines = [line.strip() for line in clean_session_stderr(text).splitlines() if line.strip()]
+    return _check_failed(target, lines[-1][:300] if lines else "no details from the AWS CLI.")
+
+
+def _check_failed(target: SsmTarget, reason: str) -> str:
+    return (
+        f"Instance {target.instance_id} is not connected to Systems Manager, and looking up why "
+        f"failed: {reason}"
+    )
 
 
 # --- settings --------------------------------------------------------------------------

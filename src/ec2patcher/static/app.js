@@ -72,6 +72,55 @@
     showConnectionFields();
   }
 
+  // AWS profile and region: Other… reveals its text input. Without JavaScript the input stays
+  // visible and only counts when Other… is selected.
+  var otherField = function (select) {
+    return document.querySelector('[data-other-input="' + select.id + '"]');
+  };
+  var otherInput = function (select) {
+    return otherField(select).querySelector("input");
+  };
+  var showOtherInput = function (select) {
+    otherField(select).hidden = select.value !== select.getAttribute("data-other");
+  };
+  document.querySelectorAll("select[data-other]").forEach(function (select) {
+    showOtherInput(select);
+    select.addEventListener("change", function () {
+      showOtherInput(select);
+      if (!otherField(select).hidden) { otherInput(select).focus(); }
+    });
+  });
+
+  // Choosing a profile selects its own region, until a region has been chosen by hand.
+  var profileSelect = document.querySelector('select[data-aws-choice="profile"]');
+  var regionSelect = document.querySelector('select[data-aws-choice="region"]');
+  if (profileSelect && regionSelect) {
+    var regionChosen = regionSelect.value !== "" && !regionSelect.hasAttribute("data-from-profile");
+    var profileRegions = {};
+    var markRegionChosen = function () { regionChosen = true; };
+    regionSelect.addEventListener("change", markRegionChosen);
+    otherInput(regionSelect).addEventListener("input", markRegionChosen);
+    fetch(profileSelect.getAttribute("data-aws-options-url"))
+      .then(function (response) { return response.ok ? response.json() : Promise.reject(); })
+      .then(function (data) { profileRegions = data.profile_regions || {}; })
+      .catch(function () { profileRegions = {}; });
+    var applyProfileRegion = function () {
+      if (regionChosen) { return; }
+      var isOther = profileSelect.value === profileSelect.getAttribute("data-other");
+      var profile = isOther ? otherInput(profileSelect).value.trim() : profileSelect.value;
+      var known = Object.prototype.hasOwnProperty.call(profileRegions, profile);
+      var region = known ? profileRegions[profile] : "";
+      var listed = Array.prototype.some.call(regionSelect.options, function (option) {
+        return option.value === region;
+      });
+      regionSelect.value = listed ? region : regionSelect.getAttribute("data-other");
+      otherInput(regionSelect).value = listed ? "" : region;
+      showOtherInput(regionSelect);
+    };
+    profileSelect.addEventListener("change", applyProfileRegion);
+    otherInput(profileSelect).addEventListener("change", applyProfileRegion);
+  }
+
   // Settings: the SSM status runs the aws CLI, so it loads after the page. The Check now link
   // does the same without JavaScript.
   var ssmStatus = document.querySelector("[data-ssm-status-url]");

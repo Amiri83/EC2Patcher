@@ -171,10 +171,12 @@ def _run_kwargs(password: str | None, ssm: SsmTarget | None) -> dict:
     return {"env": env} if env else {}
 
 
-def _connection_error(stderr: str, password: str | None, ssm: SsmTarget | None) -> str:
+def _connection_error(
+    stderr: str, password: str | None, ssm: SsmTarget | None, runner: Runner
+) -> str:
     """User-facing message for a failed connection; over SSM, AWS failures come first (they
     reach ssh's stderr through the ProxyCommand, followed by a meaningless ssh error)."""
-    aws_error = ssm_service.describe_aws_error(stderr, ssm.profile) if ssm else None
+    aws_error = ssm_service.explain_failure(ssm, stderr, runner) if ssm else None
     return aws_error or describe_ssh_error(stderr, password is not None)
 
 
@@ -303,7 +305,7 @@ def run_scp(
     stdout, stderr = proc.stdout or "", _stderr(proc, ssm)
     if proc.returncode != 0:
         message = _sshpass_error(proc.returncode, password) or _connection_error(
-            stderr, password, ssm
+            stderr, password, ssm, runner
         )
         return RemoteResult(False, stdout, stderr, proc.returncode, message)
     return RemoteResult(True, stdout, stderr, proc.returncode)
@@ -394,7 +396,7 @@ def run_remote(
         return RemoteResult(ok=False, error=f"Could not run ssh: {exc.strerror or exc}")
     stdout, stderr = proc.stdout or "", _stderr(proc, ssm)
     if proc.returncode == 255:
-        message = _connection_error(stderr, password, ssm)
+        message = _connection_error(stderr, password, ssm, runner)
         return RemoteResult(False, stdout, stderr, 255, message)
     sshpass_error = _sshpass_error(proc.returncode, password)
     if sshpass_error and proc.returncode not in accept_returncodes:
@@ -471,7 +473,7 @@ def check_connection(
                 server_name, proc.returncode, stderr.strip()[:1000],
             )  # fmt: skip
             result.error = _sshpass_error(proc.returncode, password) or _connection_error(
-                stderr, password, ssm
+                stderr, password, ssm, runner
             )
 
     if result.success:

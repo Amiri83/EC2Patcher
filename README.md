@@ -105,6 +105,19 @@ scp commands and the same PEM or password login, plus this option:
 - **Save** changes the servers that follow the default. **Apply to all servers** also clears the
   connection type, AWS profile and region set on individual servers. Manual instance IDs are
   kept, because each one identifies a single server.
+- **AWS profile** is a dropdown on both forms, read from the AWS CLI config (`~/.aws/config`, or
+  `AWS_CONFIG_FILE`) and never written to: `[default]` is `default`, `[profile x]` is `x`, and
+  other sections such as `[sso-session y]` are ignored. A missing or broken file leaves the list
+  empty and says why.
+- **AWS region** is a dropdown of the commercial AWS regions (a fixed list; no AWS call). Choosing
+  a profile selects its region from the config, if it has one, unless you already picked a
+  region. In Settings, a default profile with a region preselects it when no region is saved.
+- **Other…**, the last option of both, reveals a text input for a manual value. A manual region
+  must look like `us-east-1` (`^[a-z]{2}(-[a-z]+)+-\d$`). Other… left empty is refused instead of
+  saved as something else, and a saved value that is not in the list shows under Other…
+- On the server form the empty choice means the default from Settings.
+- `GET /settings/aws-options` returns both lists as JSON, with a `reason` when the config cannot
+  be used.
 
 #### Session Manager plugin
 
@@ -162,6 +175,17 @@ now** runs them again.
 - An expired SSO session is reported as ``run `aws sso login --profile example` ``, not as a raw
   ssh error, including when it expires during a run. A failed preflight only fails the servers
   that use SSM; nothing is downloaded or changed on them.
+- When a connection fails because SSM reports the instance as not connected, EC2 Patcher finds out
+  why with read-only calls using the same profile and region (`aws sts get-caller-identity`,
+  `aws ec2 describe-instances`, `aws ssm describe-instance-information`; 10 s each):
+  - not found: `Instance i-0123456789abcdef0 not found in profile example / region us-east-1.
+    Wrong account or region?`
+  - stopped: says the instance is stopped (other states, such as terminated, are named too)
+  - running but not in SSM: the SSM agent / instance role message
+
+  Expired credentials skip the EC2 and SSM calls and show the `aws sso login` hint. If a lookup
+  itself fails (denied, no network), the message gives the reason from AWS. Successful connections
+  and direct SSH never run these calls.
 
 **Testing and logs**
 

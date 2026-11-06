@@ -18,6 +18,7 @@ via argument-list subprocesses. Lint/format: ruff (line length 100).
   `patch_service`/`patch_remote`/`downloader`/`staging` (patching), `ssh_service`,
   `ssm_service` (SSH over SSM: ProxyCommand, preflight, instance IDs, status),
   `ssm_plugin` (app-managed session-manager-plugin: detection, PATH, install),
+  `aws_config` (read-only AWS CLI config: profiles, their regions; region list, form choices),
   `secret_store` (encrypted secrets, Fernet key file in the config dir)
 - `src/ec2patcher/templates/`, `static/` – UI
 - `tests/` – pytest; fixtures in `conftest.py`, `*_fixtures.py`, `tests/fixtures/`
