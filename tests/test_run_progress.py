@@ -18,7 +18,7 @@ from test_patch_report import legacy, version_of
 from ec2patcher.app import create_app
 from ec2patcher.database import _MIGRATIONS, SCHEMA_VERSION, Database
 from ec2patcher.models import CONNECTION_SSM
-from ec2patcher.services import cache_settings, run_events, ssm_service
+from ec2patcher.services import cache_settings, nvd, run_events, ssm_service
 from ec2patcher.services import patch_state as ps
 from ec2patcher.services.analysis_service import AnalysisService
 from ec2patcher.services.run_events import RunRef
@@ -43,8 +43,10 @@ def unknown_to_canonical(url):
 
 
 @pytest.fixture
-def metadata():
-    return SecurityMetadata(fetcher=unknown_to_canonical)
+def metadata(db):
+    # The app's Database as the cache (like the app does) and no pacing: a fresh cache DB
+    # migrates on first use, and that or a pacing sleep would overrun a TINY step timeout.
+    return SecurityMetadata(db, fetcher=unknown_to_canonical, pace=0)
 
 
 @pytest.fixture
@@ -77,6 +79,12 @@ def released():
     event = threading.Event()
     yield event
     event.set()
+
+
+def no_throttle_nvd(db):
+    """An NVD client on the app's Database that never sleeps between requests: its pacing
+    would overrun a TINY step timeout on a server that is not hung."""
+    return nvd.NvdClient(db, sleep=lambda seconds: None)
 
 
 def analyze(db, metadata, runner=None, **service):
@@ -480,7 +488,9 @@ def test_hung_ssh_step_times_out_and_the_run_moves_on(setup, metadata, released)
         if ip == "10.0.0.1":
             released.wait(30)
 
-    run = analyze(setup, metadata, Hooked(hook), step_timeout=TINY)
+    run = analyze(
+        setup, metadata, Hooked(hook), step_timeout=TINY, nvd_client=no_throttle_nvd(setup)
+    )
     assert run.status == "completed_with_errors" and not run.is_running
     first, second, third = run.servers
     assert first.status == "failed" and "timed out after 0.05 s" in first.error
@@ -500,7 +510,12 @@ def test_hung_lookup_times_out_and_the_run_moves_on(setup, released):
             released.wait(30)
         unknown_to_canonical(url)
 
-    run = analyze(setup, SecurityMetadata(fetcher=fetch), step_timeout=TINY)
+    run = analyze(
+        setup,
+        SecurityMetadata(setup, fetcher=fetch, pace=0),
+        step_timeout=TINY,
+        nvd_client=no_throttle_nvd(setup),
+    )
     assert run.status == "completed_with_errors"
     assert run.servers[0].status == "failed" and "timed out" in run.servers[0].error
     assert run.servers[1].status == "complete" and run.servers[2].status == "complete"
@@ -512,7 +527,14 @@ def test_hung_lookup_times_out_and_the_run_moves_on(setup, released):
 
 
 def test_hung_transport_lookup_times_out(setup, metadata, monkeypatch, released):
-    analyzer = AnalysisService(setup, metadata, runner=Hooked(), starter=sync, step_timeout=TINY)
+    analyzer = AnalysisService(
+        setup,
+        metadata,
+        runner=Hooked(),
+        starter=sync,
+        step_timeout=TINY,
+        nvd_client=no_throttle_nvd(setup),
+    )
     original = analyzer.transports.for_server
 
     def hanging(server, **kwargs):
