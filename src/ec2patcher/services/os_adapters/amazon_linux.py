@@ -298,6 +298,7 @@ class AmazonLinuxAdapter(OsAdapter):
                         detail=f"Analysis error: {exc}",
                     )
                 )  # fmt: skip
+        cve_resolver.mark_origin(findings, "updateinfo")
         ctx.lookups_done(findings)
         if facts.system_release and facts.system_release != releasever:
             warnings.append(

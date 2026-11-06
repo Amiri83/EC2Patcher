@@ -13,7 +13,7 @@
     <thead><tr><th>#</th><th>Server</th><th>Display Name</th><th>IP</th><th>Packages</th><th>Download</th><th>Expected Reboot</th></tr></thead>
     <tbody>
       {% for a, c in eligible %}
-      <tr><td class="num">{{ loop.index }}</td><td><strong>{{ a.server_name }}</strong>{% if c.superseded %}<div class="muted small latest-analysis">Patched from its <a href="/analysis/{{ a.run_id }}/servers/{{ a.id }}">latest analysis #{{ a.run_id }}</a> (this run's report is older).</div>{% endif %}{% if c.excluded_warning %}<div class="muted small excluded-warning">{{ c.excluded_warning }}</div>{% endif %}</td><td>{{ a.display_name or "-" }}</td>
+      <tr><td class="num">{{ loop.index }}</td><td><strong>{{ a.server_name }}</strong>{% if c.superseded %}<div class="muted small latest-analysis">Patched from its <a href="/analysis/{{ a.run_id }}/servers/{{ a.id }}">latest analysis #{{ a.run_id }}</a> (this run's report is older).</div>{% endif %}{% if c.excluded_warning %}<div class="muted small excluded-warning">{{ c.excluded_warning }}</div>{% endif %}{% if c.not_checked_warning %}<div class="muted small not-checked-warning">{{ c.not_checked_warning }}</div>{% endif %}</td><td>{{ a.display_name or "-" }}</td>
           <td><code>{{ a.ip_address }}</code></td><td>{{ c.packages }}</td><td>{{ c.download_bytes|filesize }}</td>
           <td>{% if a.expected_reboot %}YES EXPECTED{% else %}NO{% endif %}</td></tr>
       {% endfor %}
@@ -43,6 +43,8 @@
   <form method="post" action="/analysis/{{ run.id }}/patch-all" class="form-actions">
     <input type="hidden" name="confirm" value="yes">
     {% for a, c in eligible %}<input type="hidden" name="analysis_id" value="{{ a.id }}">{% endfor %}
+    {% set unresolved_total = eligible|map("last")|map(attribute="unresolved_count")|sum %}
+    {% if unresolved_total %}<label class="check-label unresolved-ack"><input type="checkbox" name="acknowledged_unresolved" value="{{ unresolved_total }}" required> Patch anyway: {{ unresolved_total }} unresolved CVE{{ "" if unresolved_total == 1 else "s" }} across these servers {{ "is" if unresolved_total == 1 else "are" }} not covered by the plans</label>{% endif %}
     <label class="check-label"><input type="checkbox" name="skip_reboot" value="1"{% if skip_reboot %} checked{% endif %}> Skip reboot</label>
     <a href="/analysis/{{ run.id }}" class="btn btn-secondary">Cancel</a>
     {% if eligible %}<button type="submit" class="btn btn-danger" data-once>Patch {{ eligible|length }} Server{{ "" if eligible|length == 1 else "s" }}</button>{% endif %}

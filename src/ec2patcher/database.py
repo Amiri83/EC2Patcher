@@ -30,7 +30,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -418,6 +418,68 @@ _MIGRATIONS = {
             PRIMARY KEY (run_kind, run_id)
         );
     """,
+    # Multi-source CVE resolver. source_feeds: state of each downloaded feed (oval:<codename>,
+    # notices, kev); the rows of an OVAL download only count once its generation is the feed's.
+    # Per finding and report row: the source that resolved it or why none did, KEV and EPSS.
+    19: """
+        CREATE TABLE source_feeds (
+            name         TEXT PRIMARY KEY,
+            fetched_at   TEXT,
+            generation   INTEGER NOT NULL DEFAULT 0,
+            entries      INTEGER NOT NULL DEFAULT 0,
+            complete     INTEGER NOT NULL DEFAULT 1,
+            next_offset  INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE oval_cve_packages (
+            codename       TEXT NOT NULL,
+            generation     INTEGER NOT NULL,
+            cve            TEXT NOT NULL,
+            package        TEXT NOT NULL,
+            status         TEXT NOT NULL,
+            fixed_version  TEXT,
+            note           TEXT,
+            priority       TEXT,
+            PRIMARY KEY (codename, generation, cve, package)
+        ) WITHOUT ROWID;
+        CREATE INDEX idx_oval_cve_packages_cve ON oval_cve_packages(cve);
+        CREATE TABLE usn_notices (
+            usn_id     TEXT PRIMARY KEY,
+            title      TEXT,
+            published  TEXT
+        );
+        CREATE TABLE usn_cves (
+            usn_id  TEXT NOT NULL REFERENCES usn_notices(usn_id) ON DELETE CASCADE,
+            cve     TEXT NOT NULL,
+            PRIMARY KEY (usn_id, cve)
+        );
+        CREATE INDEX idx_usn_cves_cve ON usn_cves(cve);
+        CREATE TABLE usn_packages (
+            usn_id    TEXT NOT NULL REFERENCES usn_notices(usn_id) ON DELETE CASCADE,
+            codename  TEXT NOT NULL,
+            package   TEXT NOT NULL,
+            version   TEXT NOT NULL,
+            PRIMARY KEY (usn_id, codename, package, version)
+        );
+        CREATE TABLE kev_cves (
+            cve         TEXT PRIMARY KEY,
+            date_added  TEXT
+        );
+        CREATE TABLE epss_scores (
+            cve         TEXT PRIMARY KEY,
+            score       REAL,
+            percentile  REAL,
+            fetched_at  TEXT NOT NULL
+        );
+        ALTER TABLE analysis_runs ADD COLUMN source_probes TEXT;
+        ALTER TABLE cve_findings ADD COLUMN resolution_source TEXT;
+        ALTER TABLE cve_findings ADD COLUMN failure_reason TEXT;
+        ALTER TABLE cve_findings ADD COLUMN kev INTEGER;
+        ALTER TABLE cve_findings ADD COLUMN epss REAL;
+        ALTER TABLE patch_report ADD COLUMN source TEXT;
+        ALTER TABLE patch_report ADD COLUMN failure_reason TEXT;
+        ALTER TABLE patch_report ADD COLUMN kev INTEGER;
+        ALTER TABLE patch_report ADD COLUMN epss REAL;
+    """,
 }
 
 
@@ -466,7 +528,7 @@ def _row_to_server(row: sqlite3.Row) -> Server:
 _RUN_COLUMNS = {
     "completed_at", "status", "progress_message", "metadata_source", "metadata_updated_at",
     "metadata_checked_at", "metadata_stale", "metadata_warning", "error", "metadata_lookups",
-    "cache_stats",
+    "cache_stats", "source_probes",
 }  # fmt: skip
 _SERVER_ANALYSIS_COLUMNS = {
     "status", "error", "started_at", "completed_at", "remote_hostname", "os_pretty_name",
@@ -499,6 +561,7 @@ def _row_to_run(row: sqlite3.Row) -> AnalysisRun:
         error=row["error"],
         metadata_lookups=json.loads(row["metadata_lookups"] or "{}"),
         cache_stats=json.loads(row["cache_stats"] or "{}"),
+        source_probes=json.loads(row["source_probes"] or "[]"),
     )
 
 
@@ -560,6 +623,10 @@ def _row_to_finding(row: sqlite3.Row) -> CveFindingRow:
         nvd_last_modified=row["nvd_last_modified"],
         nvd_status=row["nvd_status"],
         nvd_note=row["nvd_note"],
+        resolution_source=row["resolution_source"],
+        failure_reason=row["failure_reason"],
+        kev=_bool_or_none(row["kev"]),
+        epss=row["epss"],
     )
 
 
@@ -704,12 +771,15 @@ _TRANSPORT_COLUMNS = ("connection_type", "instance_id_override", "aws_profile", 
 
 _REPORT_FIELDS = (
     "server_name", "cve", "hostname", "usn", "package", "title", "priority", "status",
-    "version_before", "version_after", "imported_at", "patched_at", "run_id", "error",
+    "version_before", "version_after", "imported_at", "patched_at", "run_id", "error", "source",
+    "failure_reason", "kev", "epss",
 )  # fmt: skip
 
 
 def _row_to_patch_report(row: sqlite3.Row) -> PatchReportRow:
-    return PatchReportRow(updated_at=row["updated_at"], **{k: row[k] for k in _REPORT_FIELDS})
+    fields = {k: row[k] for k in _REPORT_FIELDS}
+    fields["kev"] = _bool_or_none(fields["kev"])
+    return PatchReportRow(updated_at=row["updated_at"], **fields)
 
 
 def _transport_values(transport: dict[str, str | None] | None) -> list[str | None]:
@@ -1172,8 +1242,10 @@ class Database:
                     "installed_version, fixed_version, status, detail, binary_packages, pocket, "
                     "priority, apt_candidate, canonical_status, cvss_severity, cvss_score, "
                     "cvss_version, cvss_vector, cvss_source, cvss_source_type, "
-                    "nvd_last_modified, nvd_status, nvd_note) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "nvd_last_modified, nvd_status, nvd_note, resolution_source, failure_reason, "
+                    "kev, epss) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    "?, ?, ?, ?)",
                     (
                         analysis_id, f.cve, f.source, f.installed_version, f.fixed_version,
                         f.status, f.detail, json.dumps(f.binaries), f.pocket, f.priority,
@@ -1183,6 +1255,7 @@ class Database:
                              c.last_modified, c.status, c.note)
                             if c else (None,) * 9
                         ),
+                        f.resolution_source, f.failure_reason, f.kev, f.epss,
                     ),
                 )  # fmt: skip
             for p in plan:
@@ -1404,6 +1477,198 @@ class Database:
     def clear_updateinfo_cache(self) -> int:
         with self.connect() as conn:
             return conn.execute("DELETE FROM amazon_updateinfo_cache").rowcount
+
+    # --- downloaded source feeds (OVAL, USN notices, KEV, EPSS) --------------------------
+
+    def get_source_feed(self, name: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM source_feeds WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else None
+
+    def put_source_feed(
+        self,
+        name: str,
+        fetched_at: str | None,
+        generation: int = 0,
+        entries: int = 0,
+        complete: bool = True,
+        next_offset: int = 0,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO source_feeds "
+                "(name, fetched_at, generation, entries, complete, next_offset) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, fetched_at, generation, entries, int(complete), next_offset),
+            )
+
+    def clear_source_caches(self) -> int:
+        """Forget all downloaded source data. Returns the number of feed rows and scores."""
+        with self.connect() as conn:
+            removed = conn.execute("DELETE FROM source_feeds").rowcount
+            removed += conn.execute("DELETE FROM epss_scores").rowcount
+            for table in ("oval_cve_packages", "usn_notices", "kev_cves"):
+                conn.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed names
+        return removed
+
+    def next_oval_generation(self, codename: str) -> int:
+        """A new generation for a download. Rows of any other unfinished one are dropped: they
+        can only be left over from a process that died while parsing."""
+        name = f"oval:{codename}"
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT generation FROM source_feeds WHERE name = ?", (name,)
+            ).fetchone()
+            current = row["generation"] if row else 0
+            conn.execute(
+                "DELETE FROM oval_cve_packages WHERE codename = ? AND generation != ?",
+                (codename, current),
+            )
+        return current + 1
+
+    def add_oval_rows(self, codename: str, generation: int, rows: list[tuple]) -> None:
+        """``rows``: (cve, package, status, fixed_version, note, priority)."""
+        with self.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO oval_cve_packages (codename, generation, cve, package, "
+                "status, fixed_version, note, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [(codename, generation, *row) for row in rows],
+            )
+
+    def activate_oval_generation(
+        self, codename: str, generation: int, fetched_at: str, entries: int
+    ) -> None:
+        """Make a fully parsed download the current copy of this release, in one transaction."""
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO source_feeds "
+                "(name, fetched_at, generation, entries, complete, next_offset) "
+                "VALUES (?, ?, ?, ?, 1, 0)",
+                (f"oval:{codename}", fetched_at, generation, entries),
+            )
+            conn.execute(
+                "DELETE FROM oval_cve_packages WHERE codename = ? AND generation != ?",
+                (codename, generation),
+            )
+
+    def discard_oval_generation(self, codename: str, generation: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM oval_cve_packages WHERE codename = ? AND generation = ?",
+                (codename, generation),
+            )
+
+    def oval_rows(self, cve: str, codename: str, feed_name: str) -> list[sqlite3.Row]:
+        """The current copy's statements on one CVE for one release."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM oval_cve_packages WHERE cve = ? AND codename = ? AND generation = "
+                "(SELECT generation FROM source_feeds WHERE name = ?) ORDER BY package",
+                (cve, codename, feed_name),
+            ).fetchall()
+
+    def oval_packages(self, cve: str) -> list[str]:
+        """Packages the current copy of any release lists for one CVE."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT o.package FROM oval_cve_packages o "
+                "JOIN source_feeds f ON f.name = 'oval:' || o.codename "
+                "AND f.generation = o.generation WHERE o.cve = ? ORDER BY o.package",
+                (cve,),
+            ).fetchall()
+        return [r["package"] for r in rows]
+
+    def store_usn_page(self, notices: list[dict]) -> None:
+        """Add or replace notices (``usn_notices.parse_notice``) with their CVEs and packages."""
+        with self.connect() as conn:
+            for notice in notices:
+                conn.execute("DELETE FROM usn_notices WHERE usn_id = ?", (notice["id"],))
+                conn.execute(
+                    "INSERT INTO usn_notices (usn_id, title, published) VALUES (?, ?, ?)",
+                    (notice["id"], notice["title"], notice["published"]),
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO usn_cves (usn_id, cve) VALUES (?, ?)",
+                    [(notice["id"], cve) for cve in notice["cves"]],
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO usn_packages (usn_id, codename, package, version) "
+                    "VALUES (?, ?, ?, ?)",
+                    [(notice["id"], *package) for package in notice["packages"]],
+                )
+
+    def count_usn_notices(self) -> int:
+        with self.connect() as conn:
+            return conn.execute("SELECT COUNT(*) FROM usn_notices").fetchone()[0]
+
+    def usn_candidates(self, cve: str, codename: str) -> list[sqlite3.Row]:
+        """Every USN of one CVE, and whether it names packages for this release."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT n.usn_id, n.title, n.published, EXISTS (SELECT 1 FROM usn_packages p "
+                "WHERE p.usn_id = n.usn_id AND p.codename = ?) AS for_release "
+                "FROM usn_cves c JOIN usn_notices n ON n.usn_id = c.usn_id WHERE c.cve = ?",
+                (codename, cve),
+            ).fetchall()
+
+    def usn_packages(self, cve: str, codename: str) -> list[tuple[str, str]]:
+        """(source package, version) the USNs of one CVE name for one release."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT p.package, p.version FROM usn_packages p "
+                "JOIN usn_cves c ON c.usn_id = p.usn_id WHERE c.cve = ? AND p.codename = ?",
+                (cve, codename),
+            ).fetchall()
+        return [(r["package"], r["version"]) for r in rows]
+
+    def usn_packages_any_release(self, cve: str) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT p.package FROM usn_packages p "
+                "JOIN usn_cves c ON c.usn_id = p.usn_id WHERE c.cve = ? ORDER BY p.package",
+                (cve,),
+            ).fetchall()
+        return [r["package"] for r in rows]
+
+    def replace_kev(self, rows: list[tuple[str, str | None]], fetched_at: str) -> None:
+        """Replace the KEV catalogue in one transaction."""
+        with self.connect() as conn:
+            conn.execute("DELETE FROM kev_cves")
+            conn.executemany(
+                "INSERT OR REPLACE INTO kev_cves (cve, date_added) VALUES (?, ?)", rows
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO source_feeds (name, fetched_at, entries) "
+                "VALUES ('kev', ?, ?)",
+                (fetched_at, len(rows)),
+            )
+
+    def kev_listed(self, cves: list[str]) -> set[str]:
+        marks = ", ".join("?" * len(cves))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT cve FROM kev_cves WHERE cve IN ({marks})",  # noqa: S608 - placeholders
+                cves,
+            ).fetchall()
+        return {r["cve"] for r in rows}
+
+    def get_epss(self, cves: list[str]) -> dict[str, tuple[float | None, float | None, str]]:
+        """CVE -> (score, percentile, fetched_at) of the cached ones."""
+        marks = ", ".join("?" * len(cves))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM epss_scores WHERE cve IN ({marks})",  # noqa: S608 - placeholders
+                cves,
+            ).fetchall()
+        return {r["cve"]: (r["score"], r["percentile"], r["fetched_at"]) for r in rows}
+
+    def put_epss(self, rows: list[tuple[str, float | None, float | None, str]]) -> None:
+        with self.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO epss_scores (cve, score, percentile, fetched_at) "
+                "VALUES (?, ?, ?, ?)",
+                rows,
+            )
 
     # --- cache summaries (Settings -> Caches, cache badges) -----------------------------
 

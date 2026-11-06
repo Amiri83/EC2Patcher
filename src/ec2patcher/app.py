@@ -148,6 +148,12 @@ STATUS_CLASSES = {
 }
 
 
+def _form_count(value: str) -> int:
+    """A count from a form field; anything else counts as nothing confirmed."""
+    text = value.strip()
+    return int(text) if text.isdigit() and len(text) < 10 else 0
+
+
 def create_app(
     db_path: Path | None = None,
     shutdown_handler: Callable[[], None] | None = None,
@@ -1019,13 +1025,18 @@ def create_app(
         analysis_id: int,
         confirm: str = Form(""),
         skip_reboot: str = Form(""),
+        acknowledged_unresolved: str = Form(""),
     ):
         stored_server_report(run_id, analysis_id)
         if confirm != "yes":
             return redirect(f"/analysis/{run_id}/servers/{analysis_id}/approve")
         try:
             # An unchecked "Skip reboot" box is absent from the form: reboot if required.
-            execution_id = patcher.approve(analysis_id, skip_reboot=bool(skip_reboot))
+            execution_id = patcher.approve(
+                analysis_id,
+                skip_reboot=bool(skip_reboot),
+                acknowledged_unresolved=_form_count(acknowledged_unresolved),
+            )
         except patch_service.PatchNotAllowedError as exc:
             logger.warning("Patch approval refused for analysis %s: %s", analysis_id, exc)
             return server_report_page(
@@ -1092,12 +1103,18 @@ def create_app(
         confirm: str = Form(""),
         skip_reboot: str = Form(""),
         analysis_id: list[int] | None = Form(None),  # noqa: B008
+        acknowledged_unresolved: str = Form(""),
     ):
         patch_all_run(run_id)
         if confirm != "yes":
             return redirect(f"/analysis/{run_id}/patch-all")
         try:
-            queue_id = patcher.start_queue(run_id, analysis_id or [], bool(skip_reboot))
+            queue_id = patcher.start_queue(
+                run_id,
+                analysis_id or [],
+                bool(skip_reboot),
+                acknowledged_unresolved=_form_count(acknowledged_unresolved),
+            )
         except patch_service.PatchNotAllowedError as exc:
             logger.warning("Patch All refused for analysis run %s: %s", run_id, exc)
             return patch_all_page(
@@ -1342,6 +1359,7 @@ def create_app(
         removed = metadata.clear()
         removed = analyzer.nvd.clear() or removed
         removed = analyzer.advisories.clear() or removed
+        removed = analyzer.sources.clear() or removed
         return redirect("/settings", notice="cache_cleared" if removed else "cache_clean")
 
     @app.post("/settings/reset-database", response_class=HTMLResponse)

@@ -44,6 +44,7 @@ import subprocess
 import threading
 import time
 import weakref
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -210,15 +211,6 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
         reasons.append(
             "Analysis errors (required package mapping failed) for: " + ", ".join(errors) + "."
         )
-    unavailable = sorted(
-        {f.cve for f in analysis.findings if f.status == cve_resolver.METADATA_UNAVAILABLE}
-    )
-    if unavailable:
-        reasons.append(
-            f"{len(unavailable)} CVE(s) not checked / Canonical metadata unavailable: "
-            + ", ".join(unavailable)
-            + ". Run a new analysis once the metadata is reachable."
-        )
     rows = installable(analysis)
     if not analysis.plan:
         reasons.append("There are no package updates to install.")
@@ -260,14 +252,38 @@ def not_checked_cves(analysis: ServerAnalysis) -> list[str]:
     return sorted(cves)
 
 
+def unresolved_by_reason(analysis: ServerAnalysis) -> dict[str, int]:
+    """Unresolved CVEs per reason, each naming the source that failed; most frequent first."""
+    reasons: dict[str, str] = {}
+    for f in analysis.findings:
+        if f.status in NOT_CHECKED_STATUSES:
+            label = cve_resolver.STATUS_LABELS.get(f.status, f.status)
+            reasons.setdefault(f.cve, f.failure_reason or label)
+    for cve in not_checked_cves(analysis):
+        reasons.setdefault(cve, "not analyzed")
+    counts = Counter(reasons.values())
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
 def not_checked_warning(analysis: ServerAnalysis) -> str | None:
     """Keeps an empty or reduced package plan from reading as 'all clean'."""
     count = len(not_checked_cves(analysis))
     if not count:
         return None
+    by_reason = ", ".join(f"{why}: {n}" for why, n in unresolved_by_reason(analysis).items())
     return (
-        f"{count} CVE{'' if count == 1 else 's'} not checked (metadata/key status unavailable). "
+        f"Unresolved: {count} ({by_reason}). "
         "The package plan does not cover them; this report does not mean the server is clean."
+    )
+
+
+def unresolved_refusal(count: int, acknowledged: int) -> str | None:
+    """The plan may be patched with CVEs left unresolved, once that exact number is confirmed."""
+    if count == acknowledged:
+        return None
+    return (
+        f"This leaves {count} CVE{'' if count == 1 else 's'} unresolved: the patch does not cover "
+        f"{'it' if count == 1 else 'them'}. Confirm that on the confirmation page to go ahead."
     )
 
 
@@ -283,6 +299,7 @@ class Eligibility:
     download_bytes: int = 0
     unpatched_notes: list[str] = field(default_factory=list)
     not_checked_warning: str | None = None
+    unresolved_count: int = 0  # CVEs of not_checked_warning; patching needs them confirmed
     excluded_warning: str | None = None  # plan rows already at target (not installed)
     # "Patch All": the run's own (older) analysis this one replaces, if any.
     superseded: ServerAnalysis | None = None
@@ -420,6 +437,7 @@ class PatchService:
             if f.status in not_patchable
         ]
         result.not_checked_warning = not_checked_warning(analysis)
+        result.unresolved_count = len(not_checked_cves(analysis))
         reasons = result.reasons
         try:
             result.remote_path = staging.remote_dir(analysis.server_name)
@@ -475,19 +493,27 @@ class PatchService:
         )  # fmt: skip
         return execution_id
 
-    def approve(self, analysis_id: int, skip_reboot: bool = True) -> int:
+    def approve(
+        self, analysis_id: int, skip_reboot: bool = True, acknowledged_unresolved: int = 0
+    ) -> int:
         """Record APPROVED (after re-checking eligibility) and start the execution.
 
         ``skip_reboot`` defaults to True so only an explicit operator choice (the unchecked
         "Skip reboot" box in the web UI) lets EC2Patcher reboot a server.
+        ``acknowledged_unresolved``: how many unresolved CVEs the operator confirmed; it must be
+        the number this analysis has, so that the resolved plan is only patched knowingly.
         """
         analysis = self.db.get_server_analysis(analysis_id)
         if analysis is None:
             raise PatchNotAllowedError("This analysis no longer exists.")
+        refusal = unresolved_refusal(len(not_checked_cves(analysis)), acknowledged_unresolved)
         with self._lock:
             self._clear_stale()
             if self._running:
                 raise PatchNotAllowedError("Another patch execution is running.")
+            check = self.eligibility(analysis)
+            if check.allowed and refusal:
+                raise PatchNotAllowedError(refusal)
             execution_id = self._record_approval(analysis, skip_reboot)
             self._running, self._worker = True, None
         try:
@@ -1397,10 +1423,18 @@ class PatchService:
             preview.append((latest, check))
         return preview
 
-    def start_queue(self, run_id: int, confirmed_ids: list[int], skip_reboot: bool) -> int:
+    def start_queue(
+        self,
+        run_id: int,
+        confirmed_ids: list[int],
+        skip_reboot: bool,
+        acknowledged_unresolved: int = 0,
+    ) -> int:
         """Record a queue for the confirmed, still eligible servers of the run and start it.
 
         Every server of the run gets an item; the ones not patched are SKIPPED with reasons.
+        ``acknowledged_unresolved``: the unresolved CVEs the operator confirmed, over the servers
+        to patch; it must be the number they have (see :meth:`approve`).
         """
         run = self.db.get_analysis_run(run_id, details=True)
         if run is None:
@@ -1411,6 +1445,7 @@ class PatchService:
             if self._running:
                 raise PatchNotAllowedError("Another patch execution is running.")
             items = []
+            unresolved = 0
             for analysis, check in self.queue_preview(run):
                 status, detail = ps.ITEM_PENDING, None
                 ids = {analysis.id} | ({check.superseded.id} if check.superseded else set())
@@ -1425,6 +1460,8 @@ class PatchService:
                     detail = (
                         f"{detail} {check.excluded_warning}" if detail else check.excluded_warning
                     )
+                if status == ps.ITEM_PENDING:
+                    unresolved += check.unresolved_count
                 items.append(
                     {
                         "server_analysis_id": analysis.id,
@@ -1436,6 +1473,9 @@ class PatchService:
                 )
             if not any(item["status"] == ps.ITEM_PENDING for item in items):
                 raise PatchNotAllowedError("No eligible servers to patch.")
+            refusal = unresolved_refusal(unresolved, acknowledged_unresolved)
+            if refusal:
+                raise PatchNotAllowedError(refusal)
             queue_id = self.db.create_patch_queue(run_id, skip_reboot, items)
             self._running, self._worker = True, None
         logger.info(

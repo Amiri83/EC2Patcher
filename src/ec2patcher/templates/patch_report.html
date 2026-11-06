@@ -61,7 +61,7 @@
     <div class="table-scroll">
       <table class="table small">
         <thead>
-          <tr><th>Hostname</th><th>Server</th><th>Tags</th><th>CVE</th><th>USN</th><th>Package</th><th>Title</th><th>Ubuntu priority</th><th>Status</th><th>Version before</th><th>Version after</th><th>Imported at</th><th>Patched at</th><th>Run</th><th>Error</th></tr>
+          <tr><th>Hostname</th><th>Server</th><th>Tags</th><th>CVE</th><th>USN</th><th>Package</th><th>Title</th><th>Ubuntu priority</th><th>Status</th><th>Version before</th><th>Version after</th><th>Imported at</th><th>Patched at</th><th>Run</th><th>Error</th><th>Source</th><th>KEV</th><th>EPSS</th><th>Failure reason</th></tr>
         </thead>
         <tbody>
           {% for r in rows %}
@@ -81,6 +81,10 @@
               <td class="num">{% if r.patched_at %}{{ r.patched_at|timestamp }}{% endif %}</td>
               <td>{% if r.run_id %}<a href="/analysis/{{ r.run_id }}">#{{ r.run_id }}</a>{% endif %}</td>
               <td>{{ r.error or "" }}</td>
+              <td>{{ r.source or "" }}</td>
+              <td>{% if r.kev is not none %}{{ "yes" if r.kev else "no" }}{% endif %}</td>
+              <td class="num">{% if r.epss is not none %}{{ r.epss }}{% endif %}</td>
+              <td>{{ r.failure_reason or "" }}</td>
             </tr>
           {% endfor %}
         </tbody>

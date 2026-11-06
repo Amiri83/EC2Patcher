@@ -646,7 +646,7 @@ def sheet_rows(ws):
 def test_export_has_both_sheets_with_filter_and_frozen_header(client, report_rows):
     wb = workbook(client)
     assert wb.sheetnames == ["Details", "Summary"]
-    for ws, used in ((wb["Details"], "A1:O6"), (wb["Summary"], "A1:G3")):
+    for ws, used in ((wb["Details"], "A1:S6"), (wb["Summary"], "A1:G3")):
         assert ws.freeze_panes == "A2"
         assert ws.auto_filter.ref == used
         assert all(cell.font.bold for cell in ws[1])
@@ -657,6 +657,7 @@ def test_export_details_match_the_page_columns(client, report_rows):
     assert header == [
         "Hostname", "Server", "Tags", "CVE", "USN", "Package", "Title", "Ubuntu Priority",
         "Status", "Version Before", "Version After", "Imported At", "Patched At", "Run ID", "Error",
+        "Source", "KEV", "EPSS", "Failure Reason",
     ]  # fmt: skip
     assert len(rows) == 5
     row = dict(zip(header, next(r for r in rows if r[3] == C2 and r[1] == HOST), strict=True))
@@ -669,7 +670,7 @@ def test_export_honours_the_filters(client, report_rows):
     wb = workbook(client, status="failed")
     _, details = sheet_rows(wb["Details"])
     assert [(r[1], r[3]) for r in details] == [(HOST, C3)]
-    assert wb["Details"].auto_filter.ref == "A1:O2"
+    assert wb["Details"].auto_filter.ref == "A1:S2"
     header, summary = sheet_rows(wb["Summary"])
     assert summary == [[HOST, 1, 0, 0, 1, 0, 0]]
     assert header[:2] == ["Server", "Total"]
@@ -683,7 +684,7 @@ def test_export_summary_counts(client, report_rows):
 
 def test_export_with_no_rows_still_opens(client):
     wb = workbook(client)
-    assert sheet_rows(wb["Details"])[1] == [] and wb["Details"].auto_filter.ref == "A1:O1"
+    assert sheet_rows(wb["Details"])[1] == [] and wb["Details"].auto_filter.ref == "A1:S1"
     assert wb["Summary"].freeze_panes == "A2"
 
 
@@ -728,7 +729,7 @@ def version_of(db_path):
 
 def test_fresh_database_has_the_table(db_path):
     db = Database(db_path)
-    assert version_of(db_path) == SCHEMA_VERSION == 18
+    assert version_of(db_path) == SCHEMA_VERSION == 19
     db.create_server("keep", "10.0.0.1", "/k.pem")
     seed(db, "keep", C1)
     assert [r.cve for r in db.list_patch_report()] == [C1]

@@ -1,10 +1,14 @@
 """Per-CVE Canonical Security API lookups for supported Ubuntu releases.
 
+This is the resolver's last resort (cve_sources): OVAL, the USN notices and the changelogs are
+asked first, and a run skips it altogether when its probe found it blocked (``block_for_run``).
+
 Resilience: each request is retried (``MAX_ATTEMPTS`` in total, exponential backoff) on
 network errors, timeouts, HTTP 429 and 5xx. Only ``BREAKER_THRESHOLD`` *consecutive* failed
-lookups trip the per-run circuit breaker, so one transient timeout never skips the rest of a
-run. Outbound requests are paced (``PACE_SECONDS`` apart; the first request of a run and
-memo / cache hits never wait).
+lookups open its circuit breaker, so one transient timeout never skips the rest of a run; once
+the breaker's backoff has passed one request tries again (half-open). The breaker covers this
+source only (source_breaker). Outbound requests are paced (``PACE_SECONDS`` apart; the first
+request of a run and memo / cache hits never wait).
 
 Every fetched CVE document (or Canonical's confirmed 404) is cached in the application
 database (table ``cve_metadata_cache``): entries younger than the TTL are used without a
@@ -32,17 +36,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from ec2patcher import config
 from ec2patcher.database import Database
 from ec2patcher.models import FROM_CACHE, FROM_LIVE, LOOKUP_FAILED, CacheStats, record_source
 from ec2patcher.services.server_state import SUPPORTED_RELEASES
+from ec2patcher.services.source_breaker import CLOSED, HALF_OPEN, SourceBreaker
 
 logger = logging.getLogger(__name__)
 
 API_URL = "https://ubuntu.com/security/cves/{cve}.json"
 SOURCE_LABEL = "Canonical Security API (online per-CVE lookup)"
-REQUEST_TIMEOUT_SECONDS = 20
+REQUEST_TIMEOUT_SECONDS = 5
 MAX_ATTEMPTS = 3  # per request, for network errors / timeouts / HTTP 429 / 5xx
 BACKOFF_SECONDS = 1.0  # waits 1 s, then 2 s between attempts
 PACE_SECONDS = 1.0  # minimum gap between outbound requests to ubuntu.com
@@ -131,6 +137,7 @@ class CveRecord:
     entries: list[VexEntry] = field(default_factory=list)
     # Set only when ubuntu.com could not be reached and an expired cache entry was used.
     cache_age: timedelta | None = None
+    origin: str = "cve-json"  # the source these statements came from (cve_sources)
 
     @property
     def cache_note(self) -> str | None:
@@ -143,6 +150,28 @@ class CveRecord:
 
     def sources(self) -> set[str]:
         return {entry.source for entry in self.entries}
+
+
+def status_entry(
+    source: str, version: str | None, codename: str, canonical_status: str, priority: str | None
+) -> VexEntry:
+    """One release statement from Canonical's status word, as ``parse_cve_document`` builds it,
+    for the sources that report the same statuses. A package reported fixed without a version
+    cannot be compared with anything, so it counts as still being evaluated."""
+    status = STATUSES.get(canonical_status, "under_investigation")
+    if status == "fixed" and not version:
+        status = "under_investigation"
+    note = canonical_status
+    if priority:
+        note += f"; Ubuntu Security Team classified this CVE as of {priority} priority."
+    return VexEntry(
+        source=source,
+        version=version or "",
+        distro=codename,
+        status=status,
+        justification=canonical_status,
+        note=note,
+    )
 
 
 def parse_cve_document(doc: dict, cve: str) -> CveRecord:
@@ -245,12 +274,12 @@ class MetadataUnreachable(OSError):
 
 
 class SecurityMetadata:
-    """Online lookups with a process-local memo, a SQLite cache and a per-run circuit breaker.
+    """Online lookups with a process-local memo, a SQLite cache and a circuit breaker.
 
     After ``breaker_threshold`` consecutive failed lookups (each already retried), further
-    lookups skip HTTP - falling back to the cache where possible - until :meth:`start_run`
-    (next analysis run / retry) or :meth:`clear` resets the breaker. Any successful request
-    resets the consecutive-failure count."""
+    lookups skip HTTP - falling back to the cache where possible - until the breaker's backoff
+    has passed (one trial lookup, half-open), or :meth:`start_run` (next analysis run / retry)
+    or :meth:`clear` resets the breaker. Any successful request resets the failure count."""
 
     def __init__(
         self,
@@ -297,8 +326,13 @@ class SecurityMetadata:
         self._lock = threading.Lock()
         self._pace_lock = threading.Lock()
         self._last_request: float | None = None  # monotonic time of the last outbound request
-        self._unreachable: str | None = None
-        self._consecutive_failures = 0
+        self._breaker = SourceBreaker(
+            "cve-json",
+            urlsplit(url).hostname or "ubuntu.com",
+            self.breaker_threshold,
+            monotonic=lambda: self.monotonic(),
+        )
+        self._blocked: str | None = None  # this run's probe found the source blocked
         self._outcomes: dict[str, str] = {}
         self._sources: dict[str, str] = {}  # CVE -> cache / live / failed, this run
         self._force_refresh: frozenset[str] | None = frozenset()  # None = every CVE
@@ -313,9 +347,9 @@ class SecurityMetadata:
         forced: frozenset[str] | None = frozenset()
         if force_refresh:
             forced = None if cves is None else frozenset(c.strip().upper() for c in cves)
+        self._breaker.reset()
         with self._lock:
-            self._unreachable = None
-            self._consecutive_failures = 0
+            self._blocked = None
             self._outcomes = {}
             self._sources = {}
             self._force_refresh = forced
@@ -323,9 +357,31 @@ class SecurityMetadata:
         with self._pace_lock:
             self._last_request = None
 
+    def block_for_run(self, reason: str) -> None:
+        """This run's probe found the source blocked: only the memo and the cache are used until
+        the next :meth:`start_run`, instead of a request per CVE."""
+        with self._lock:
+            self._blocked = reason
+
+    def note_resolved(self, cve: str) -> None:
+        """Another source answered: for this run's tally the CVE's lookup did not fail."""
+        with self._lock:
+            self._outcomes.setdefault(cve, OK)
+
     @property
     def breaker_open(self) -> bool:
-        return self._unreachable is not None
+        return self._breaker.state != CLOSED
+
+    def _skip_reason(self) -> str | None:
+        """Why this lookup makes no request; None if it may. May use up the half-open trial."""
+        if self._blocked is not None:
+            return f"skipped, blocked for this run: {self._blocked}"
+        if self._breaker.allow():
+            return None
+        return (
+            f"skipped after {self.breaker_threshold} consecutive network errors: "
+            f"{self._breaker.reason}"
+        )
 
     def run_outcomes(self) -> dict[str, str]:
         """CVE -> ok / cached / failed for every lookup since :meth:`start_run`."""
@@ -364,7 +420,6 @@ class SecurityMetadata:
                 if network:
                     self._record(cve, OK, FROM_CACHE)
                 return memo[0]
-            skipped = self._unreachable
         cached = None if forced else self._read_cache(cve)
         if cached is not None:
             record, fetched = cached
@@ -383,10 +438,9 @@ class SecurityMetadata:
             raise MetadataUnreachable("not looked up again (only failed lookups are retried)")
 
         error: Exception
+        skipped = self._skip_reason()
         if skipped is not None:
-            error = MetadataUnreachable(
-                f"skipped after {self.breaker_threshold} consecutive network errors: {skipped}"
-            )
+            error = MetadataUnreachable(skipped)
         else:
             try:
                 record = self._fetch(cve)
@@ -415,7 +469,8 @@ class SecurityMetadata:
     def _fetch(self, cve: str) -> CveRecord | None:
         """One lookup with retries. Only network-level failures count toward the breaker."""
         url = API_URL.format(cve=cve)
-        for attempt in range(1, self.attempts + 1):
+        attempts = 1 if self._breaker.state == HALF_OPEN else self.attempts  # a single trial
+        for attempt in range(1, attempts + 1):
             self._throttle()
             try:
                 doc = self.fetcher(url)
@@ -433,7 +488,7 @@ class SecurityMetadata:
                 record = parse_cve_document(doc, cve)  # ValueError: not a network failure
                 self._write_cache(cve, doc)
                 return record
-            if not retryable or attempt == self.attempts:
+            if not retryable or attempt == attempts:
                 break
             delay = self.backoff * 2 ** (attempt - 1)
             logger.info("Canonical lookup of %s failed (%s); retrying in %g s", cve, error, delay)
@@ -459,18 +514,10 @@ class SecurityMetadata:
         return self._force_refresh is None or cve in self._force_refresh
 
     def _network_ok(self) -> None:
-        with self._lock:
-            self._consecutive_failures = 0
+        self._breaker.success()
 
     def _network_failed(self, exc: Exception) -> None:
-        with self._lock:
-            self._consecutive_failures += 1
-            if self._consecutive_failures >= self.breaker_threshold and self._unreachable is None:
-                self._unreachable = str(exc) or type(exc).__name__
-                logger.warning(
-                    "Canonical unreachable after %d consecutive failures; skipping further "
-                    "lookups this run: %s", self._consecutive_failures, self._unreachable,
-                )  # fmt: skip
+        self._breaker.failure(str(exc) or type(exc).__name__)
 
     def _record(self, cve: str, outcome: str, source: str) -> None:
         # Caller holds the lock. A CVE that failed for any server this run stays failed.
@@ -529,12 +576,13 @@ class SecurityMetadata:
 
     def clear(self) -> bool:
         """Forget the memo, the breaker and the cache table."""
+        had_entries = self.breaker_open
+        self._breaker.reset()
         with self._lock:
-            had_entries = bool(self._memo) or self._unreachable is not None
+            had_entries = had_entries or bool(self._memo) or self._blocked is not None
             self._memo.clear()
             self._refreshed.clear()
-            self._unreachable = None
-            self._consecutive_failures = 0
+            self._blocked = None
         try:
             had_entries = self._cache().clear_cve_metadata() > 0 or had_entries
         except Exception as exc:  # noqa: BLE001

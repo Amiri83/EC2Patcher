@@ -14,7 +14,10 @@ via argument-list subprocesses. Lint/format: ruff (line length 100).
 - `src/ec2patcher/app.py` – all routes; `main.py` – CLI; `config.py` – paths/env vars
 - `src/ec2patcher/database.py` – schema, `_MIGRATIONS`, `SCHEMA_VERSION`, all queries
 - `src/ec2patcher/services/` – `analysis_service` (runs), `cve_resolver` (statuses/plan),
-  `security_metadata` (Canonical), `nvd` (CVSS), `local_apt`/`apt_planner` (workstation APT),
+  `cve_sources` (resolver chain, source probes), `oval_feed`, `usn_notices`, `changelog_source`,
+  `security_metadata` (per-CVE JSON, last resort), `source_breaker` (per-source breakers),
+  `source_http` (their HTTP), `enrichment` (KEV, EPSS),
+  `nvd` (CVSS), `local_apt`/`apt_planner` (workstation APT),
   `patch_service`/`patch_remote`/`downloader`/`staging` (patching), `ssh_service`,
   `ssm_service` (SSH over SSM: ProxyCommand, preflight, instance IDs, status),
   `ssm_plugin` (app-managed session-manager-plugin: detection, PATH, install),

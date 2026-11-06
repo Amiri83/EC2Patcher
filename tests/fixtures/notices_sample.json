@@ -1,0 +1,30 @@
+{
+  "notices": [
+    {
+      "id": "USN-0003-1",
+      "title": "example-package vulnerability, newest but for another release",
+      "published": "2000-03-01T00:00:00",
+      "cves_ids": ["CVE-2000-0003"],
+      "release_packages": {
+        "jammy": [
+          {"name": "curl", "version": "7.81.0-1ubuntu1.99", "is_source": true}
+        ]
+      }
+    },
+    {
+      "id": "USN-0002-1",
+      "title": "curl vulnerability",
+      "published": "2000-02-01T00:00:00",
+      "cves_ids": ["CVE-2000-0003", "CVE-2000-0004"],
+      "release_packages": {
+        "noble": [
+          {"name": "curl", "version": "8.5.0-2ubuntu10.99", "is_source": true},
+          {"name": "libcurl4t64", "version": "8.5.0-2ubuntu10.99", "is_source": false}
+        ]
+      }
+    }
+  ],
+  "offset": 0,
+  "limit": 20,
+  "total_results": 2
+}

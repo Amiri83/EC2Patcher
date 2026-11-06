@@ -78,7 +78,7 @@ def fleet_findings(plan):
     return [
         cr.Finding(cves[0], src, cr.PATCH_AVAILABLE, "old", before, target, binaries=[package])
         for package, _, before, target, src, _, _, cves, _ in plan
-    ]
+    ] + [cr.Finding("CVE-2026-63076", "zlib", cr.NOT_AFFECTED, "the reported CVE")]
 
 
 def use_plan(h, plan):

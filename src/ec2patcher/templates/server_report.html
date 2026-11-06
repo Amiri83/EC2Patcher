@@ -22,9 +22,9 @@
     <div class="table-scroll">
     <table class="table findings-table">
       {% if analysis.os_id == "amzn" %}
-      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Source RPM</th><th>Installed Version</th><th>Amazon Fixed Version (Advisory)</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th></tr></thead>
+      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Source RPM</th><th>Installed Version</th><th>Amazon Fixed Version (Advisory)</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th><th>Source</th><th>KEV</th><th>EPSS</th></tr></thead>
       {% else %}
-      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Canonical Fixed Version</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th></tr></thead>
+      <thead><tr><th>CVE</th><th>Severity</th><th>CVSS</th><th>Ubuntu Source Package</th><th>Installed Version</th><th>Canonical Fixed Version</th><th>Repository Candidate</th><th>Remediation Result</th><th>Installed Binary Package(s)</th><th>Source</th><th>KEV</th><th>EPSS</th></tr></thead>
       {% endif %}
       <tbody>
       {% for g in groups %}
@@ -51,6 +51,9 @@
                 {% for b in g.binary_packages %}<code>{{ b }}</code> {% else %}<span class="muted">-</span>{% endfor %}
               {% endif %}
             </td>
+            <td class="finding-source">{{ g.resolution_sources|join(", ") or "-" }}{% for reason in g.failure_reasons %}<div class="muted small">{{ reason }}</div>{% endfor %}</td>
+            <td>{{ g.kev_label or "-" }}</td>
+            <td class="num">{% if g.epss is not none %}{{ g.epss }}{% else %}-{% endif %}</td>
           </tr>
       {% endfor %}
       </tbody>

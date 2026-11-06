@@ -293,22 +293,26 @@ def test_analysis_error_finding_blocks(h):
     assert not check.allowed and any("package mapping failed" in r for r in check.reasons)
 
 
-def test_metadata_unavailable_finding_blocks(h):
+def test_unresolved_cve_needs_a_confirm_but_does_not_block_the_plan(h):
     findings = [
         *plan_findings(),
-        cr.Finding("CVE-2026-7", None, cr.METADATA_UNAVAILABLE, "Canonical unreachable"),
-    ]
+        cr.Finding(
+            "CVE-2026-7", None, cr.METADATA_UNAVAILABLE, "Canonical unreachable",
+            failure_reason="cve-json: HTTP 504",
+        ),
+    ]  # fmt: skip
     analysis = h.analysis(finding_list=findings)
     check = h.service.eligibility(analysis)
-    assert not check.allowed
-    assert any(
-        "1 CVE(s) not checked / Canonical metadata unavailable: CVE-2026-7" in r
-        for r in check.reasons
-    ), check.reasons
-    assert check.not_checked_warning.startswith("1 CVE not checked")
-    with pytest.raises(PatchNotAllowedError, match="metadata unavailable"):
+    assert check.allowed, check.reasons
+    assert check.unresolved_count == 1
+    assert check.not_checked_warning.startswith("Unresolved: 1 (cve-json: HTTP 504: 1)")
+    with pytest.raises(PatchNotAllowedError, match="leaves 1 CVE unresolved"):
         h.service.approve(analysis.id)
+    with pytest.raises(PatchNotAllowedError, match="unresolved"):
+        h.service.approve(analysis.id, acknowledged_unresolved=2)  # not the number on the page
     assert h.fake.calls == [] and h.fetcher.calls == []
+    ex = h.db.get_execution(h.service.approve(analysis.id, acknowledged_unresolved=1))
+    assert ex.state == ps.SUCCESS
 
 
 def plan_findings():
@@ -329,6 +333,7 @@ def test_legitimate_statuses_do_not_block(h):
     check = h.service.eligibility(h.analysis(finding_list=findings))
     assert check.allowed, check.reasons
     assert any("CVE-2026-6" in n for n in check.unpatched_notes)
+    assert check.unresolved_count == 1  # CVE-2026-3: patching it needs an explicit confirm
 
 
 # --- revalidation ------------------------------------------------------------------------

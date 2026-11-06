@@ -384,12 +384,13 @@ def test_metadata_unavailable_report_is_not_clean(web, pem_file, tmp_path, db_pa
         analysis = make_analysis(db, db.get_server_by_name(SERVER), plan=[], finding_list=[finding])
         url = f"/analysis/{analysis.run_id}/servers/{analysis.id}"
         page = c.get(url).text
-        assert "1 CVE not checked (metadata/key status unavailable)" in page
+        assert "Unresolved: 1 (" in page
+        assert "key status" not in page
         assert "this report does not mean the server is clean" in page
         assert "No package updates are planned for this server for the CVEs that were checked" in (
             page
         )
-        assert "1 CVE(s) not checked / Canonical metadata unavailable: CVE-2026-63076" in page
+        assert "There are no package updates to install." in page
         assert f'href="{url}/approve"' not in page
         assert c.post(f"{url}/approve", data={"confirm": "yes"}).status_code == 409
 
