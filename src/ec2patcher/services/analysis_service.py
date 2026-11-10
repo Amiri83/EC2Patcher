@@ -46,6 +46,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import (
     amazon_updateinfo,
+    apt_repos,
     cache_settings,
     cve_resolver,
     cve_sources,
@@ -116,10 +117,13 @@ class AnalysisService:
         self.credentials = credentials or secret_store.SecretStore(db)  # encrypted passwords
         self.step_timeout = step_timeout  # None: the value saved in Settings
         self.metadata = metadata
-        self.sources = sources or cve_sources.SourceResolver(db, metadata)
+        self.repos = apt_repos.provider(db)  # Settings -> APT Repositories, read per run
+        self.sources = sources or cve_sources.SourceResolver(db, metadata, repos=self.repos)
         self.nvd = nvd_client or nvd.NvdClient(db)
         self.apt = apt or local_apt.LocalApt(
-            config.get_apt_state_dir(config.get_data_dir()), config.get_apt_max_age()
+            config.get_apt_state_dir(config.get_data_dir()),
+            config.get_apt_max_age(),
+            repos=self.repos,
         )
         self.advisories = advisories or amazon_updateinfo.UpdateInfoSource(db)
         self.runner = runner
@@ -715,6 +719,7 @@ class AnalysisService:
             lookups.finish(self._lookup_summary())
             current.append(steps.begin(run_events.COMPUTE_FIXES, "Computing the fix versions"))
 
+        repos = self.repos()
         context = os_adapters.AnalysisContext(
             metadata=self.metadata,
             packages=steps.guarded(self.apt, run_events.COMPUTE_FIXES),
@@ -723,6 +728,9 @@ class AnalysisService:
             lookup=self._reported_lookup(analysis, facts, steps, lookups, progress, lookup),
             advisories=steps.guarded(self.advisories, run_events.LOOKUPS),
             lookups_done=lookups_done,
+            allow_unconfirmed_candidates=repos.allow_unconfirmed_candidates,
+            allow_pending_candidates=repos.allow_pending_candidates,
+            related_sources=self._related_sources(analysis, facts),
         )
         try:
             if adapter.os_id == os_adapters.DEFAULT.os_id:
@@ -774,6 +782,21 @@ class AnalysisService:
             return record
 
         return reported
+
+    def _related_sources(self, analysis, facts) -> Callable[[str], list[str]]:
+        """CVE -> installed source packages it is linked to, for the opt-in fallback."""
+        related = getattr(self.sources, "related_sources", None)
+        if related is None:
+            return lambda cve: []
+        hints: dict[str, tuple[str, ...]] | None = None
+
+        def sources(cve: str) -> list[str]:
+            nonlocal hints
+            if hints is None:  # only read when the fallback asks
+                hints = self._package_hints(analysis)
+            return related(cve, facts, hints.get(cve, ()))
+
+        return sources
 
     def _package_hints(self, analysis) -> dict[str, tuple[str, ...]]:
         """CVE -> the packages a pasted security list names for it, for the changelog search."""
@@ -892,6 +915,7 @@ class RemediationGroup:
     failure_reasons: list[str] = field(default_factory=list)
     kev: bool | None = None  # any CVE of the group is listed; None: not known
     epss: float | None = None  # the highest score of the group
+    mirrors: list[str] = field(default_factory=list)  # the APT mirror(s) its lookups used
 
     @property
     def kev_label(self) -> str:
@@ -966,6 +990,9 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
                 failure_reasons=sorted({f.failure_reason or "" for f in rows} - {""}),
                 kev=any(known_kev) if known_kev else None,
                 epss=max(scores) if scores else None,
+                mirrors=sorted(
+                    {m for f in rows for m in (getattr(f, "mirror", None) or "").split("; ") if m}
+                ),
             )
         )
     return result
@@ -981,6 +1008,8 @@ BUCKETS = (
         "Action required",
         (
             cve_resolver.PATCH_AVAILABLE,
+            cve_resolver.FIX_AVAILABLE_PENDING_PUBLICATION,
+            cve_resolver.CANDIDATE_WITHOUT_METADATA,
             cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS,
             cve_resolver.PRO_OR_ESM_REQUIRED,
         ),

@@ -51,7 +51,7 @@
                 {% for b in g.binary_packages %}<code>{{ b }}</code> {% else %}<span class="muted">-</span>{% endfor %}
               {% endif %}
             </td>
-            <td class="finding-source">{{ g.resolution_sources|join(", ") or "-" }}{% for reason in g.failure_reasons %}<div class="muted small">{{ reason }}</div>{% endfor %}</td>
+            <td class="finding-source">{{ g.resolution_sources|join(", ") or "-" }}{% for reason in g.failure_reasons %}<div class="muted small">{{ reason }}</div>{% endfor %}{% for mirror in g.mirrors %}<div class="muted small finding-mirror">{{ mirror }}</div>{% endfor %}</td>
             <td>{{ g.kev_label or "-" }}</td>
             <td class="num">{% if g.epss is not none %}{{ g.epss }}{% else %}-{% endif %}</td>
           </tr>

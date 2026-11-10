@@ -11,7 +11,9 @@ directory per Ubuntu release and architecture:
                                   including APT::Update hooks - is never read or run
         etc/sources.list          Ubuntu archive pockets <codename>, <codename>-updates and
                                   <codename>-security only (never -proposed / -backports),
-                                  restricted to [arch=<arch>] and the Ubuntu archive keyring
+                                  restricted to [arch=<arch>] and the Ubuntu archive keyring;
+                                  mirrors and keyring from Settings -> APT Repositories
+                                  (apt_repos), Canonical's when nothing is configured
         etc/sources.list.d/       empty: the workstation's own sources are never read
         etc/preferences.d/        empty: no workstation pinning
         etc/trusted.gpg.d/        empty
@@ -76,13 +78,20 @@ def pockets(codename: str) -> list[str]:
     return [codename, f"{codename}-updates", f"{codename}-security"]
 
 
-def sources_list(codename: str, architecture: str, keyring: str = KEYRING) -> str:
-    """One-line sources for the release pocket, -updates and -security of one architecture."""
-    options = f"[arch={architecture} signed-by={keyring}]"
+def default_mirrors(architecture: str) -> list[str]:
+    """Canonical's mirror of each pocket (release, -updates, -security) of one architecture."""
     if architecture in ARCHIVE_ARCHITECTURES:
-        mirrors = [ARCHIVE_MIRROR, ARCHIVE_MIRROR, SECURITY_MIRROR]
-    else:
-        mirrors = [PORTS_MIRROR] * 3
+        return [ARCHIVE_MIRROR, ARCHIVE_MIRROR, SECURITY_MIRROR]
+    return [PORTS_MIRROR] * 3
+
+
+def sources_list(
+    codename: str, architecture: str, keyring: str = KEYRING, mirrors: list[str] | None = None
+) -> str:
+    """One-line sources for the release pocket, -updates and -security of one architecture.
+    ``mirrors``: the mirror of each pocket (Settings -> APT Repositories); default Canonical's."""
+    options = f"[arch={architecture} signed-by={keyring}]"
+    mirrors = default_mirrors(architecture) if mirrors is None else mirrors
     components = " ".join(COMPONENTS)
     return "".join(
         f"deb {options} {mirror} {suite} {components}\n"
@@ -114,6 +123,7 @@ class AptState:
     architecture: str
     root: Path
     updated_at: datetime
+    mirrors: tuple[str, ...] = ()  # the mirror of each pocket the lists came from
 
     @property
     def label(self) -> str:
@@ -128,12 +138,16 @@ class LocalApt:
         runner: Runner | None = None,
         clock: Callable[[], datetime] = _now,
         keyring: str = KEYRING,
+        repos: Callable[[], object] | None = None,
     ):
+        """``repos``: returns the APT repository settings (apt_repos.AptRepos: ``mirrors()``
+        and ``keyring``), read once per prepared state; None = Canonical's mirrors."""
         self.root = Path(root).expanduser().absolute()  # apt resolves relative Dir:: against /
         self.max_age = max_age
         self.runner = runner or default_runner
         self.clock = clock
         self.keyring = keyring
+        self.repos = repos
         self._lock = threading.Lock()
         self._prepared: dict[tuple[str, str], AptState | AptResolutionError] = {}
 
@@ -206,7 +220,8 @@ class LocalApt:
             f'Dir::Etc::main "{root / "etc" / "apt.conf.main"}";\n'
             f'Dir::Etc::parts "{root / "etc" / "apt.conf.d"}";\n'
         )
-        sources = sources_list(codename, architecture, self.keyring)
+        mirrors, keyring = self._sources(codename, architecture)
+        sources = sources_list(codename, architecture, keyring, mirrors)
         sources_file = root / "etc" / "sources.list"
         if not sources_file.exists() or sources_file.read_text() != sources:
             sources_file.write_text(sources)
@@ -215,12 +230,20 @@ class LocalApt:
         updated_at = self._stamp(root, codename, digest)
         now = self.clock()
         if updated_at is not None and self.max_age and now - updated_at <= self.max_age:
-            return AptState(codename, architecture, root, updated_at)
+            return AptState(codename, architecture, root, updated_at, tuple(mirrors))
 
         self._update(root, codename, architecture)
         stamp = {"updated_at": now.isoformat(), "sources": digest}
         (root / "state" / STAMP_NAME).write_text(json.dumps(stamp))
-        return AptState(codename, architecture, root, now)
+        return AptState(codename, architecture, root, now, tuple(mirrors))
+
+    def _sources(self, codename: str, architecture: str) -> tuple[list[str], str]:
+        """(mirror per pocket, keyring) from the settings; Canonical's without any."""
+        settings = self.repos() if self.repos is not None else None
+        if settings is None:
+            return default_mirrors(architecture), self.keyring
+        keyring = settings.keyring if settings.keyring != KEYRING else self.keyring
+        return list(settings.mirrors(codename, architecture)), keyring
 
     def _stamp(self, root: Path, codename: str, digest: str) -> datetime | None:
         """Time of the last successful update of these exact sources, if the lists exist."""

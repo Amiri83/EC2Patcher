@@ -12,6 +12,7 @@ from ec2patcher.services import (
     amazon_updateinfo,
     local_apt,
     nvd,
+    oval_feed,
     security_metadata,
     source_http,
     ssm_plugin,
@@ -38,6 +39,7 @@ def no_retry_backoff(monkeypatch):
     ``pace`` to test the delays)."""
     monkeypatch.setattr(security_metadata, "BACKOFF_SECONDS", 0)
     monkeypatch.setattr(security_metadata, "PACE_SECONDS", 0)
+    monkeypatch.setattr(oval_feed, "RETRY_BACKOFF_SECONDS", 0)
 
 
 @pytest.fixture(autouse=True)

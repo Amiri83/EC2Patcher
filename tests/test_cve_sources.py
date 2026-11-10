@@ -1166,7 +1166,7 @@ def tables(db_path):
 def test_fresh_database_reaches_v19_with_the_new_schema(db_path):
     Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 19
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 20
     conn.close()
     assert NEW_TABLES <= tables(db_path)
     finding_columns = columns(db_path, "cve_findings")

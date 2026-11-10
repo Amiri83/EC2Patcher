@@ -176,8 +176,47 @@
     <dt>Cache</dt><dd>table <code>cve_metadata_cache</code> in <code>{{ metadata_status.cache_db }}</code></dd>
     <dt>Cache TTL</dt><dd>{{ "%g"|format(metadata_status.cache_ttl_hours) }} hours ({{ "%g"|format(metadata_status.investigating_ttl_hours) }} hour{{ "" if metadata_status.investigating_ttl_hours == 1 else "s" }} while a release is under investigation) &mdash; <a href="#caches">change</a></dd>
     <dt>Requests</dt><dd>{{ "%g"|format(metadata_status.timeout_seconds) }} s timeout, {{ "%g"|format(metadata_status.pace_seconds) }} s apart, up to {{ metadata_status.attempts }} attempts with backoff; lookups pause for the rest of the run after {{ metadata_status.breaker_threshold }} consecutive failures</dd>
-    <dt>Proxy</dt><dd>HTTPS_PROXY / NO_PROXY from the environment</dd>
+    <dt>Proxy</dt><dd>HTTPS_PROXY / HTTP_PROXY / NO_PROXY from the environment (also for .deb downloads)</dd>
   </dl>
+</div>
+<div class="card form-card" id="apt-repos">
+  <h2>APT Repositories</h2>
+  <p class="muted">Mirrors of the Ubuntu archive this workstation reads for APT candidates and the .deb plan, e.g. an internal proxy mirror (Nexus) when Canonical's hosts are blocked. An empty field keeps the Ubuntu default shown in it. URLs must be <code>http://</code> or <code>https://</code>, without credentials, query string, spaces or quotes; <code>${codename}</code> (e.g. <code>noble</code>) is the only placeholder. Servers never use these mirrors: they only install the approved .deb files.{% if not apt_saved %} The Ubuntu defaults are in use.{% endif %}</p>
+  <form method="post" action="/settings/apt-repos" id="apt-repos-form" data-preview-url="/settings/apt-repos/preview">
+    {% for key in ("archive_mirror", "security_mirror", "ports_mirror", "keyring") %}
+    <div class="field{% if apt_errors.get(key) %} has-error{% endif %}">
+      <label for="apt_{{ key }}">{{ apt_labels[key] }}</label>
+      <input type="text" id="apt_{{ key }}" name="{{ key }}" value="{{ apt_form.get(key) or '' }}" placeholder="{{ apt_defaults[key] }}" autocomplete="off" spellcheck="false" data-apt-field>
+      {% if apt_errors.get(key) %}<div class="field-error">{{ apt_errors[key] }}</div>{% endif %}
+    </div>
+    {% endfor %}
+    <div class="hint">Example: <code>https://nexus.example.internal/repository/ubuntu-archive</code> or <code>https://nexus.example.internal/repository/ubuntu-${codename}</code>. Archive and security serve amd64 and i386, ports every other architecture. A different keyring is only needed if the mirror re-signs the archive.</div>
+    <label class="check-label"><input type="checkbox" name="mirror_changelog" value="1" data-apt-field{% if apt_form.get("mirror_changelog") %} checked{% endif %}> Use mirrors for changelog</label>
+    <div class="hint">The changelog fallback of the CVE resolver (and its probe) reads Packages indexes and .debs from the security / ports mirror instead of security.ubuntu.com.</div>
+    <h3>Opt-in fallbacks</h3>
+    <label class="check-label"><input type="checkbox" name="allow_unconfirmed_candidates" value="1"{% if apt_form.get("allow_unconfirmed_candidates") %} checked{% endif %}> Allow unconfirmed candidates</label>
+    <div class="hint">A CVE without Canonical metadata that is linked to installed source packages (pasted list, OVAL of other releases, USNs) is checked against the mirror's candidates; a newer candidate is planned as <em>{{ status_labels["CANDIDATE_WITHOUT_METADATA"] }}</em>.</div>
+    <label class="check-label"><input type="checkbox" name="allow_pending_candidates" value="1"{% if apt_form.get("allow_pending_candidates") %} checked{% endif %}> Allow fixes pending publication</label>
+    <div class="hint">A CVE Canonical lists as pending publication with a version is planned as <em>{{ status_labels["FIX_AVAILABLE_PENDING_PUBLICATION"] }}</em> when the mirror's candidate reaches that version. Kernels are never planned this way. Both fallbacks are off by default, and patching such a plan always needs an explicit confirmation.</div>
+    <div class="field">
+      <label for="apt_release">Preview and test for</label>
+      <select id="apt_release" name="apt_release" data-apt-field>{% for c in apt_releases %}<option value="{{ c }}"{% if c == apt_release %} selected{% endif %}>{{ c }}</option>{% endfor %}</select>
+      <select id="apt_arch" name="apt_arch" aria-label="Architecture" data-apt-field>{% for a in apt_architectures %}<option value="{{ a }}"{% if a == apt_arch %} selected{% endif %}>{{ a }}</option>{% endfor %}</select>
+    </div>
+    <label class="muted small" for="apt-preview">sources.list preview</label>
+    <pre id="apt-preview" class="apt-preview">{{ apt_preview }}</pre>
+    {% if apt_checks %}
+    <table class="table small apt-checks">
+      <thead><tr><th>Pocket</th><th>InRelease</th><th>Result</th></tr></thead>
+      <tbody>{% for c in apt_checks %}<tr><td>{{ c.suite }}</td><td><code>{{ c.url }}</code></td><td>{% if c.ok %}<span class="badge badge-success">{{ c.detail }}</span>{% else %}<span class="badge badge-danger">{{ c.detail }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
+    </table>
+    {% endif %}
+    <div class="form-actions">
+      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
+      <button type="submit" name="action" value="test" class="btn btn-secondary" title="Fetch dists/&lt;pocket&gt;/InRelease of every pocket from the values above (nothing is saved)">Test</button>
+      <button type="submit" name="action" value="reset" class="btn btn-secondary" formnovalidate>Reset to defaults</button>
+    </div>
+  </form>
 </div>
 <div class="card">
   <h2>APT Resolution</h2>

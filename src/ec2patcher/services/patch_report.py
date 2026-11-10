@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 MAX_ERROR_CHARS = 2000
 NO_LONGER_AFFECTED = frozenset({cve_resolver.NOT_AFFECTED, cve_resolver.PACKAGE_NOT_INSTALLED})
 FIX_IN_PLACE = NO_LONGER_AFFECTED | {cve_resolver.ALREADY_FIXED}
+# Findings a verified patch counts as fixed (both have a version the install is checked against).
+PATCHED_BY_PLAN = frozenset(
+    {cve_resolver.PATCH_AVAILABLE, cve_resolver.FIX_AVAILABLE_PENDING_PUBLICATION}
+)
 LOOKUP_PROBLEMS = frozenset({cve_resolver.ANALYSIS_ERROR, cve_resolver.METADATA_UNAVAILABLE})
 _DONE_REBOOTS = frozenset({ps.REBOOT_DONE, ps.REBOOT_NOT_REQUIRED})
 
@@ -149,6 +153,7 @@ def _apply_findings(row: PatchReportRow, findings: list, analysis: ServerAnalysi
     row.package = row.package or _join(f.source_package for f in findings)
     row.source = _join(f.resolution_source for f in findings)
     row.failure_reason = _short(_join(f.failure_reason for f in findings))
+    row.mirror = _short(_join(getattr(f, "mirror", None) for f in findings))
     known_kev = [f.kev for f in findings if f.kev is not None]
     row.kev = any(known_kev) if known_kev else row.kev
     row.epss = max((f.epss for f in findings if f.epss is not None), default=row.epss)
@@ -187,7 +192,7 @@ def record_execution(db: Database, execution_id: int) -> None:
     analysis = db.get_server_analysis(execution.server_analysis_id)
     findings = [
         f for f in (analysis.findings if analysis else [])
-        if f.status == cve_resolver.PATCH_AVAILABLE
+        if f.status in PATCHED_BY_PLAN
     ]  # fmt: skip
     results: dict[str, list] = {}
     for result in execution.cves:

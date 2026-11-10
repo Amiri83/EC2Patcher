@@ -33,6 +33,16 @@ METADATA_UNAVAILABLE = "METADATA_UNAVAILABLE"
 ANALYSIS_ERROR = "ANALYSIS_ERROR"
 # Amazon Linux: no security advisory (ALAS) references the CVE for the server's release.
 NO_ADVISORY = "NO_ADVISORY"
+# Opt-in fallbacks (Settings -> APT Repositories), never set by default. Both are planned like a
+# patch but never approved without the operator's explicit confirmation (patch_service).
+# No Canonical metadata could be had, but the mirror offers a newer candidate for an installed
+# source package the CVE is linked to (allow_unconfirmed_candidates).
+CANDIDATE_WITHOUT_METADATA = "CANDIDATE_WITHOUT_METADATA"
+# Canonical says the fix is pending publication with a version the mirror's candidate already
+# reaches (allow_pending_candidates).
+FIX_AVAILABLE_PENDING_PUBLICATION = "FIX_AVAILABLE_PENDING_PUBLICATION"
+UNCONFIRMED_STATUSES = frozenset({CANDIDATE_WITHOUT_METADATA, FIX_AVAILABLE_PENDING_PUBLICATION})
+PLANNED_STATUSES = frozenset({PATCH_AVAILABLE}) | UNCONFIRMED_STATUSES
 # Detail of an Amazon Linux FIX_NOT_IN_CONFIGURED_REPOS finding (kept in report groups).
 NEWER_RELEASEVER_REQUIRED = "The fix needs a newer releasever"
 
@@ -49,6 +59,8 @@ STATUS_LABELS = {
     METADATA_UNAVAILABLE: "Canonical metadata unavailable",
     ANALYSIS_ERROR: "Analysis error",
     NO_ADVISORY: "No Amazon Linux advisory",
+    CANDIDATE_WITHOUT_METADATA: "Newer candidate, no Canonical metadata (needs confirmation)",
+    FIX_AVAILABLE_PENDING_PUBLICATION: "Fix available, pending publication (needs confirmation)",
 }
 
 # Older stored snapshots remain readable under the current vocabulary. An old
@@ -72,6 +84,8 @@ def current_status(status: str) -> str:
 STATUS_PRIORITY = [
     ANALYSIS_ERROR,
     PATCH_AVAILABLE,
+    FIX_AVAILABLE_PENDING_PUBLICATION,
+    CANDIDATE_WITHOUT_METADATA,
     FIX_NOT_IN_CONFIGURED_REPOS,
     PRO_OR_ESM_REQUIRED,
     METADATA_UNAVAILABLE,
@@ -121,6 +135,8 @@ class Finding:
     # KEV / EPSS enrichment (analysis_service): priority only, never affects the status either.
     kev: bool | None = None
     epss: float | None = None
+    # The APT mirror(s) its lookups used: "changelog: <url>", "apt: <url> <suite>" ("; ").
+    mirror: str | None = None
 
     @property
     def status_label(self) -> str:
@@ -201,6 +217,11 @@ def _is_ignored(entry: VexEntry) -> bool:
         or "pending" in note
         or "will not fix" in note
     )
+
+
+def _pending_version(entry: VexEntry) -> bool:
+    """Canonical says a fix is pending publication and names its version."""
+    return entry.justification == "pending" and debversion.is_valid_version(entry.version or "")
 
 
 def _unfixed_status(entry: VexEntry) -> tuple[str, str]:
@@ -292,6 +313,9 @@ def resolve_source(
                 if entry
                 else (UNKNOWN, "Canonical has no usable statement for this source package.")
             )
+            if entry is not None and _pending_version(entry):
+                # Kept for the report and the opt-in candidate check (apply_unconfirmed).
+                finding.fixed_version, finding.pocket = entry.version, entry.distro
     except debversion.InvalidVersionError as exc:
         finding.status, finding.detail = ANALYSIS_ERROR, str(exc)
         return finding
@@ -505,6 +529,7 @@ def apply_candidates(
                     if f.apt_candidate
                     else f"{name}: {cand.candidate}"
                 )
+                add_mirrors(f, candidate_mirrors(cand))
             if cand is None or not cand.candidate:
                 problems.append(f"{name}: no installation candidate in the Ubuntu archive")
                 continue
@@ -555,6 +580,178 @@ def apply_candidates(
         f.status = PATCH_AVAILABLE
         requests.update(ok)
     return sorted(requests.items())
+
+
+def candidate_mirrors(cand: Candidate) -> list[str]:
+    """Each repository line offering the candidate, as "apt: <mirror> <suite>"."""
+    result = []
+    for origin in cand.origins:
+        parts = origin.split()
+        if parts and parts[0].startswith(("http://", "https://")):
+            suite = parts[1].split("/", 1)[0] if len(parts) > 1 else ""
+            result.append(f"apt: {parts[0]} {suite}".rstrip())
+    return result
+
+
+def add_mirrors(finding: Finding, mirrors: list[str]) -> None:
+    known = finding.mirror.split("; ") if finding.mirror else []
+    finding.mirror = "; ".join(dict.fromkeys([*known, *mirrors])) or None
+
+
+# --- opt-in fallbacks (Settings -> APT Repositories), off by default ------------------------
+
+
+def expand_unconfirmed(
+    findings: list[Finding], facts: ServerFacts, related: Callable[[str], list[str]]
+) -> list[Finding]:
+    """Give each METADATA_UNAVAILABLE finding without a source package one finding per installed
+    source package the CVE is linked to (``related``: the pasted list, OVAL of other releases,
+    the USNs), so their candidates can be checked. They stay METADATA_UNAVAILABLE until then."""
+    by_source = facts.by_source()
+    result: list[Finding] = []
+    for f in findings:
+        sources = []
+        if f.status == METADATA_UNAVAILABLE and f.source is None:
+            sources = [s for s in dict.fromkeys(related(f.cve)) if by_source.get(s)]
+        if not sources:
+            result.append(f)
+            continue
+        for source in sources:
+            installed = by_source[source]
+            try:
+                version = _min_version([p.source_version for p in installed])
+            except debversion.InvalidVersionError:
+                version = None
+            result.append(
+                Finding(
+                    cve=f.cve,
+                    source=source,
+                    status=METADATA_UNAVAILABLE,
+                    detail=f.detail,
+                    installed_version=version,
+                    binaries=sorted(p.name for p in installed),
+                    is_kernel=is_kernel_source(installed),
+                    failure_reason=f.failure_reason,
+                    mirror=f.mirror,
+                )
+            )
+    return result
+
+
+def needs_unconfirmed_check(f: Finding, allow_unconfirmed: bool, allow_pending: bool) -> bool:
+    """A finding the opt-in fallbacks check against the mirror's candidates. Kernels never are:
+    their upgrade path (meta packages, ABI) is only decided by Canonical's fixed version."""
+    if f.is_kernel or not f.source or not f.binaries:
+        return False
+    if allow_unconfirmed and f.status == METADATA_UNAVAILABLE:
+        return True
+    return allow_pending and f.status == PENDING_OR_DEFERRED and bool(f.fixed_version)
+
+
+def unconfirmed_query_packages(
+    findings: list[Finding], allow_unconfirmed: bool, allow_pending: bool
+) -> list[str]:
+    names: set[str] = set()
+    for f in findings:
+        if needs_unconfirmed_check(f, allow_unconfirmed, allow_pending):
+            names.update(f.binaries)
+    return sorted(names)
+
+
+def _newer(candidate: str, current: str | None) -> bool:
+    if not current:
+        return True
+    try:
+        return debversion.compare_versions(candidate, current) > 0
+    except debversion.InvalidVersionError:
+        return False
+
+
+def apply_unconfirmed(
+    findings: list[Finding],
+    candidates: dict[str, Candidate],
+    facts: ServerFacts,
+    allow_unconfirmed: bool,
+    allow_pending: bool,
+) -> list[tuple[str, str]]:
+    """The opt-in candidate checks; update statuses and return the (package, version) upgrade
+    requests. Nothing here is ever approved without the operator's explicit confirmation.
+
+    - METADATA_UNAVAILABLE (``allow_unconfirmed``): a candidate newer than the installed
+      binary -> CANDIDATE_WITHOUT_METADATA. Whether it fixes the CVE is not confirmed.
+    - Pending publication with a version (``allow_pending``): every binary's candidate at or
+      above that version -> FIX_AVAILABLE_PENDING_PUBLICATION."""
+    requests: dict[str, str] = {}
+    installed = facts.by_name()
+    for f in findings:
+        if not needs_unconfirmed_check(f, allow_unconfirmed, allow_pending):
+            continue
+        pending = f.status == PENDING_OR_DEFERRED
+        newer: dict[str, str] = {}
+        problems: list[str] = []
+        for name in f.binaries:
+            cand = candidates.get(name)
+            if cand is None or not cand.candidate:
+                problems.append(f"{name}: no installation candidate in the configured mirrors")
+                continue
+            entry = f"{name}: {cand.candidate}"
+            f.apt_candidate = f"{f.apt_candidate}; {entry}" if f.apt_candidate else entry
+            add_mirrors(f, candidate_mirrors(cand))
+            pkg = installed.get(name) or installed.get(name.split(":", 1)[0])
+            current = pkg.version if pkg else cand.installed
+            if pending:
+                compare_to = cand.source_version or cand.candidate
+                try:
+                    good = debversion.compare_versions(compare_to, f.fixed_version) >= 0
+                except debversion.InvalidVersionError:
+                    good = False
+                if not good:
+                    problems.append(
+                        f"{name}: APT candidate {cand.candidate} is older than the pending "
+                        f"version {f.fixed_version}"
+                    )
+                    continue
+            if _newer(cand.candidate, current):
+                newer[name] = cand.candidate
+        if pending:
+            _pending_outcome(f, newer, problems, requests)
+        else:
+            _unconfirmed_outcome(f, newer, requests)
+    return sorted(requests.items())
+
+
+def _unconfirmed_outcome(f: Finding, newer: dict[str, str], requests: dict[str, str]) -> None:
+    if not newer:
+        f.detail = f"{f.detail} The configured mirrors offer no newer version of {f.source}."
+        return
+    offered = ", ".join(f"{name} {version}" for name, version in sorted(newer.items()))
+    f.status = CANDIDATE_WITHOUT_METADATA
+    f.detail = (
+        f"No Canonical metadata could be had for this CVE, but the configured mirrors offer a "
+        f"newer version of {f.source} ({offered}). Whether it fixes the CVE is not confirmed: "
+        "patching it needs an explicit confirmation."
+    )
+    requests.update(newer)
+
+
+def _pending_outcome(
+    f: Finding, newer: dict[str, str], problems: list[str], requests: dict[str, str]
+) -> None:
+    if problems:
+        f.detail = f"{f.detail} Pending version {f.fixed_version}: {'; '.join(problems)}."
+        return
+    if not newer:
+        f.detail = (
+            f"{f.detail} The installed binary package(s) are already at or above the APT "
+            f"candidate, which reaches the pending version {f.fixed_version}."
+        )
+        return
+    f.status = FIX_AVAILABLE_PENDING_PUBLICATION
+    f.detail = (
+        f"Canonical lists the fix as pending publication ({f.fixed_version}); the configured "
+        "mirrors already offer it. Patching it needs an explicit confirmation."
+    )
+    requests.update(newer)
 
 
 # --- package plan ---------------------------------------------------------------------
@@ -614,7 +811,7 @@ def build_plan(
     cves_by_source: dict[str, set[str]] = {}
     kernel_cves: set[str] = set()
     for f in findings:
-        if f.status == PATCH_AVAILABLE and f.source:
+        if f.status in PLANNED_STATUSES and f.source:
             cves_by_source.setdefault(f.source, set()).add(f.cve)
             if f.is_kernel:
                 kernel_cves.add(f.cve)
@@ -733,5 +930,9 @@ def resolve_all(
         if note:  # ubuntu.com was unreachable: say which verdicts rest on older data
             for finding in resolved:
                 finding.detail = f"{finding.detail} ({note})" if finding.detail else note
+        mirror = getattr(record, "mirror", None)
+        if mirror:  # the changelog fallback read this mirror
+            for finding in resolved:
+                add_mirrors(finding, [mirror])
         findings.extend(resolved)
     return findings

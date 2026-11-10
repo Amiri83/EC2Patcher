@@ -28,6 +28,7 @@ from ec2patcher.formatting import format_size, format_timestamp
 from ec2patcher.models import AUTH_METHODS, AUTH_PASSWORD, AUTH_PEM, DEFAULT_SSH_USER
 from ec2patcher.services import (
     analysis_service,
+    apt_repos,
     aws_config,
     cache_settings,
     cve_resolver,
@@ -50,6 +51,7 @@ from ec2patcher.services import (
 from ec2patcher.services import patch_state as ps
 from ec2patcher.services.secret_store import SecretError
 from ec2patcher.services.security_metadata import SecurityMetadata
+from ec2patcher.services.server_state import SUPPORTED_RELEASES
 from ec2patcher.services.severity import SEVERITIES, SEVERITY_CLASSES
 from ec2patcher.validation import (
     check_nvd_api_key,
@@ -111,6 +113,11 @@ NOTICES = {
     "cache_ttl_reset": "Cache TTLs reset to default. No entries were deleted.",
     "step_timeout_saved": "Step timeout saved. It applies from the next step of a run.",
     "step_timeout_reset": "Step timeout reset to default.",
+    "apt_repos_saved": (
+        "APT repositories saved. The private APT lists are refreshed from them at the next "
+        "analysis."
+    ),
+    "apt_repos_reset": "APT repositories reset to the Ubuntu defaults.",
     "connection_saved": (
         "Connection defaults saved. Servers with their own connection type keep it."
     ),
@@ -135,6 +142,8 @@ def _default_shutdown() -> None:
 STATUS_CLASSES = {
     cve_resolver.PATCH_AVAILABLE: "badge-danger",
     cve_resolver.ANALYSIS_ERROR: "badge-danger",
+    cve_resolver.FIX_AVAILABLE_PENDING_PUBLICATION: "badge-warning",
+    cve_resolver.CANDIDATE_WITHOUT_METADATA: "badge-warning",
     cve_resolver.FIX_NOT_IN_CONFIGURED_REPOS: "badge-warning",
     cve_resolver.PRO_OR_ESM_REQUIRED: "badge-warning",
     cve_resolver.NO_FIX_PUBLISHED: "badge-warning",
@@ -205,7 +214,9 @@ def create_app(
         breaker_threshold=config.get_canonical_breaker_threshold(),
     )
     apt = apt or local_apt.LocalApt(
-        get_apt_state_dir(db.path.parent, apt_state_dir), get_apt_max_age(apt_max_age_hours)
+        get_apt_state_dir(db.path.parent, apt_state_dir),
+        get_apt_max_age(apt_max_age_hours),
+        repos=apt_repos.provider(db),
     )
     analyzer = analysis_service.AnalysisService(
         db,
@@ -1032,6 +1043,7 @@ def create_app(
         confirm: str = Form(""),
         skip_reboot: str = Form(""),
         acknowledged_unresolved: str = Form(""),
+        acknowledged_unconfirmed: str = Form(""),
     ):
         stored_server_report(run_id, analysis_id)
         if confirm != "yes":
@@ -1042,6 +1054,7 @@ def create_app(
                 analysis_id,
                 skip_reboot=bool(skip_reboot),
                 acknowledged_unresolved=_form_count(acknowledged_unresolved),
+                acknowledged_unconfirmed=_form_count(acknowledged_unconfirmed),
             )
         except patch_service.PatchNotAllowedError as exc:
             logger.warning("Patch approval refused for analysis %s: %s", analysis_id, exc)
@@ -1158,6 +1171,7 @@ def create_app(
         skip_reboot: str = Form(""),
         analysis_id: list[int] | None = Form(None),  # noqa: B008
         acknowledged_unresolved: str = Form(""),
+        acknowledged_unconfirmed: str = Form(""),
     ):
         patch_all_run(run_id)
         if confirm != "yes":
@@ -1168,6 +1182,7 @@ def create_app(
                 analysis_id or [],
                 bool(skip_reboot),
                 acknowledged_unresolved=_form_count(acknowledged_unresolved),
+                acknowledged_unconfirmed=_form_count(acknowledged_unconfirmed),
             )
         except patch_service.PatchNotAllowedError as exc:
             logger.warning("Patch All refused for analysis run %s: %s", run_id, exc)
@@ -1227,6 +1242,10 @@ def create_app(
             preview = staging.resolve_local(template, preview_name)
         except staging.StagingError as exc:
             preview_error = str(exc)
+        repos = apt_repos.load(db)
+        release, arch = ctx.pop("apt_release", None), ctx.pop("apt_arch", None)
+        apt_release, apt_arch = apt_repos.choice(release, arch)
+        apt_shown = ctx.pop("apt_preview_repos", None) or repos
         return render(
             request, "settings.html", "settings", status_code=status_code, db_path=db.path,
             staging_template=template, saved_template=patcher.staging_template(), preview=preview,
@@ -1252,6 +1271,13 @@ def create_app(
             step_timeout_default=cache_settings.DEFAULT_STEP_TIMEOUT_SECONDS,
             step_timeout_min=cache_settings.MIN_STEP_TIMEOUT_SECONDS,
             step_timeout_max=cache_settings.MAX_STEP_TIMEOUT_SECONDS,
+            apt_form=ctx.pop("apt_form", None) or apt_repos.form_values(repos),
+            apt_errors=ctx.pop("apt_errors", {}), apt_checks=ctx.pop("apt_checks", None),
+            apt_saved=not repos.is_default, apt_defaults=apt_repos.DEFAULT,
+            apt_labels=apt_repos.LABELS, apt_release=apt_release, apt_arch=apt_arch,
+            apt_releases=sorted(SUPPORTED_RELEASES.values()),
+            apt_architectures=apt_repos.ARCHITECTURES,
+            apt_preview=apt_repos.preview(apt_shown, apt_release, apt_arch),
             **ctx,
         )  # fmt: skip
 
@@ -1372,8 +1398,58 @@ def create_app(
         if request.query_params.get("ssm_check"):  # the Check now link, also without JavaScript
             status = ssm_service.check_status(db, ssh_runner or subprocess.run)
         return settings_page(
-            request, notice=notice_from_query(request), preview_name=preview_name, ssm_status=status
-        )
+            request, notice=notice_from_query(request), preview_name=preview_name,
+            ssm_status=status, apt_release=request.query_params.get("apt_release"),
+            apt_arch=request.query_params.get("apt_arch"),
+        )  # fmt: skip
+
+    def apt_repos_form(form) -> tuple[dict[str, str], str, str]:
+        """The APT Repositories form fields, and the release / architecture of its preview."""
+        fields = (*apt_repos.TEXT_FIELDS, *apt_repos.FLAG_FIELDS)
+        values = {key: str(form.get(key) or "")[: apt_repos.MAX_PATH_CHARS + 1] for key in fields}
+        release, arch = apt_repos.choice(form.get("apt_release"), form.get("apt_arch"))
+        return values, release, arch
+
+    @app.post("/settings/apt-repos", response_class=HTMLResponse)
+    async def save_apt_repos(request: Request):
+        form = await request.form()
+        action = str(form.get("action") or "save")
+        if action == "reset":
+            apt_repos.reset(db)
+            logger.info("APT repositories reset to the Ubuntu defaults")
+            return redirect("/settings", notice="apt_repos_reset")
+        values, release, arch = apt_repos_form(form)
+        repos, errors = apt_repos.validate_form(values)
+        if errors:  # a refused URL holding credentials is not shown again
+            shown = {k: "" if k in errors and "@" in v else v for k, v in values.items()}
+            return settings_page(
+                request, status_code=422, apt_form=shown, apt_errors=errors,
+                apt_release=release, apt_arch=arch,
+            )  # fmt: skip
+        if action == "test":  # the values as typed, saved or not; nothing is stored
+            checks = apt_repos.check_pockets(repos, release, arch)
+            return settings_page(
+                request, apt_form=values, apt_checks=checks, apt_preview_repos=repos,
+                apt_release=release, apt_arch=arch,
+            )  # fmt: skip
+        apt_repos.save(db, repos)
+        logger.info(
+            "APT repositories saved: archive=%s security=%s ports=%s keyring=%s "
+            "changelog_mirror=%s unconfirmed=%s pending=%s",
+            repos.archive_mirror, repos.security_mirror, repos.ports_mirror, repos.keyring,
+            repos.mirror_changelog, repos.allow_unconfirmed_candidates,
+            repos.allow_pending_candidates,
+        )  # fmt: skip
+        return redirect("/settings", notice="apt_repos_saved")
+
+    @app.get("/settings/apt-repos/preview")
+    def preview_apt_repos(request: Request):
+        """The sources.list the typed values give (the live preview); nothing is stored."""
+        values, release, arch = apt_repos_form(request.query_params)
+        repos, errors = apt_repos.validate_form(values)
+        if errors:
+            return JSONResponse({"preview": None, "errors": errors}, status_code=422)
+        return JSONResponse({"preview": apt_repos.preview(repos, release, arch), "errors": {}})
 
     @app.post("/settings/cache-ttl", response_class=HTMLResponse)
     async def save_cache_ttl(request: Request):

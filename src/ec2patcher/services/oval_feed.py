@@ -14,6 +14,8 @@ import dataclasses
 import logging
 import re
 import tempfile
+import time
+import urllib.error
 import xml.etree.ElementTree as ET  # noqa: S405 - trusted HTTPS source; no DTDs/entities used
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -33,6 +35,10 @@ SOURCE = "oval"
 URL = "https://security-metadata.canonical.com/oval/com.ubuntu.{codename}.cve.oval.xml.bz2"
 TTL = timedelta(hours=24)
 DOWNLOAD_TIMEOUT_SECONDS = 30.0  # per socket operation
+DOWNLOAD_RETRIES = 2  # after a network failure, before the stored copy is kept
+RETRY_BACKOFF_SECONDS = 2.0  # waits 2 s, then 4 s
+# HTTP answers that say the request may succeed if repeated; any other status is definite.
+RETRYABLE_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 MAX_XML_BYTES = 8 * 1024 * 1024 * 1024
 BATCH_ROWS = 2000
@@ -68,7 +74,7 @@ class OvalEntry:
     cve: str
     package: str  # source package
     status: str  # Canonical's: released, not-affected, needed, needs-triage, pending, ...
-    fixed_version: str | None = None
+    fixed_version: str | None = None  # released: the fix; pending: the version to be published
     note: str | None = None
     priority: str | None = None
 
@@ -125,7 +131,8 @@ def _definition_entries(definition: ET.Element) -> list[tuple[OvalEntry, str | N
         if statement is None:
             continue
         package, status, note = statement
-        version = note if status == "released" and _is_version(note) else None
+        # A fix pending publication keeps its version too (cve_resolver: opt-in candidate check).
+        version = note if status in ("released", "pending") and _is_version(note) else None
         entry = OvalEntry(
             cve=cve.upper(),
             package=package,
@@ -194,6 +201,12 @@ class _Capped:
         return data
 
 
+def _retryable(exc: OSError) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in RETRYABLE_HTTP_CODES
+    return True  # timeouts, refused / reset connections, DNS failures, truncated transfers
+
+
 def _no_check() -> None:
     return None
 
@@ -210,8 +223,10 @@ class OvalFeed:
         fetcher: Callable[[str, BinaryIO, int, float], None] | None = None,
         now: Callable[[], datetime] = _now,
         max_age: timedelta = TTL,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.db, self.fetcher, self.now, self.max_age = db, fetcher, now, max_age
+        self.sleep = sleep
         self.breakers = breakers or BreakerBoard()
         self.downloads = 0
 
@@ -246,7 +261,7 @@ class OvalFeed:
         with tempfile.TemporaryFile() as download:
             self.downloads += 1
             try:
-                fetch(url, download, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_SECONDS)
+                self._download(fetch, url, download, check)
             except (OSError, ValueError) as exc:
                 reason = source_http.describe_error(exc)
                 breaker.failure(reason)
@@ -260,6 +275,28 @@ class OvalFeed:
                 return self._keep(codename, age, f"corrupt download discarded: {exc}")
         logger.info("oval_feed codename=%s stored=%d", codename, count)
         return FeedState(True, f"{codename}: downloaded, {count} entries")
+
+    def _download(self, fetch, url: str, out: BinaryIO, check: Callable[[], None]) -> None:
+        """Fetch the feed into ``out``; a network failure is retried ``DOWNLOAD_RETRIES`` times,
+        waiting ``RETRY_BACKOFF_SECONDS`` and then twice as long. Bad content (ValueError) and
+        a definite HTTP answer (404, 403, ...) are not retried."""
+        retries = DOWNLOAD_RETRIES
+        for attempt in range(retries + 1):
+            out.seek(0)
+            out.truncate()
+            try:
+                fetch(url, out, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_SECONDS)
+                return
+            except OSError as exc:
+                if attempt == retries or not _retryable(exc):
+                    raise
+                delay = RETRY_BACKOFF_SECONDS * 2**attempt
+                logger.info(
+                    "oval_feed url=%s attempt=%d failed (%s); retrying in %g s",
+                    url, attempt + 1, source_http.describe_error(exc), delay,
+                )  # fmt: skip
+            check()
+            self.sleep(delay)
 
     def _keep(self, codename: str, age: timedelta | None, reason: str) -> FeedState:
         logger.warning("oval_feed codename=%s kept_previous=%s reason=%s", codename, age, reason)

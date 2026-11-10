@@ -46,16 +46,24 @@ KEV = enrichment.KEV
 EPSS = enrichment.EPSS
 
 _PROBE_RELEASE = "noble"  # any supported release: only the host and path are being tested
+_PROBE_ARCHITECTURE = "amd64"
 _PROBE_CVE = "CVE-2000-0001"  # unknown CVEs answer 404, which still shows the path works
-PROBE_TARGETS = (
-    (OVAL, oval_feed.URL.format(codename=_PROBE_RELEASE)),
-    (NOTICES, f"{usn_notices.URL}?limit=1&offset=0"),
-    (CHANGELOG, f"{SECURITY_MIRROR}/dists/{_PROBE_RELEASE}-security/Release"),
-    (CVE_JSON, API_URL.format(cve=_PROBE_CVE)),
-    (NVD, f"{nvd.API_URL}?cveId={_PROBE_CVE}"),
-    (KEV, enrichment.KEV_URL),
-    (EPSS, f"{enrichment.EPSS_URL}?cve={_PROBE_CVE}"),
-)
+
+
+def probe_targets(changelog_mirror: str = SECURITY_MIRROR) -> tuple[tuple[str, str], ...]:
+    """(source, URL) of every probe; the changelog one asks the mirror the changelog reads."""
+    return (
+        (OVAL, oval_feed.URL.format(codename=_PROBE_RELEASE)),
+        (NOTICES, f"{usn_notices.URL}?limit=1&offset=0"),
+        (CHANGELOG, f"{changelog_mirror}/dists/{_PROBE_RELEASE}-security/Release"),
+        (CVE_JSON, API_URL.format(cve=_PROBE_CVE)),
+        (NVD, f"{nvd.API_URL}?cveId={_PROBE_CVE}"),
+        (KEV, enrichment.KEV_URL),
+        (EPSS, f"{enrichment.EPSS_URL}?cve={_PROBE_CVE}"),
+    )
+
+
+PROBE_TARGETS = probe_targets()
 PROBE_GRACE_SECONDS = 2.0
 MAX_CHANGELOG_PACKAGES_PER_CVE = 5
 MAX_REASON_CHARS = 300
@@ -96,8 +104,13 @@ def _no_note(message: str, level: str = "info") -> None:
     return None
 
 
-def probe_all(prober: Callable[[str, float], str | None], timeout: float) -> list[ProbeResult]:
+def probe_all(
+    prober: Callable[[str, float], str | None],
+    timeout: float,
+    targets: tuple[tuple[str, str], ...] | None = None,
+) -> list[ProbeResult]:
     """Probe every source in parallel; one that does not answer in time counts as blocked."""
+    targets = PROBE_TARGETS if targets is None else targets
 
     def one(url: str) -> tuple[str | None, int]:
         started = monotonic()
@@ -107,11 +120,11 @@ def probe_all(prober: Callable[[str, float], str | None], timeout: float) -> lis
             reason = source_http.describe_error(exc)
         return reason, int((monotonic() - started) * 1000)
 
-    executor = ThreadPoolExecutor(max_workers=len(PROBE_TARGETS), thread_name_prefix="source-probe")
-    futures = [executor.submit(one, url) for _, url in PROBE_TARGETS]
+    executor = ThreadPoolExecutor(max_workers=len(targets), thread_name_prefix="source-probe")
+    futures = [executor.submit(one, url) for _, url in targets]
     wait(futures, timeout=timeout + PROBE_GRACE_SECONDS)
     results = []
-    for (source, url), future in zip(PROBE_TARGETS, futures, strict=True):
+    for (source, url), future in zip(targets, futures, strict=True):
         endpoint = urlsplit(url).hostname or ""
         if future.done():
             reason, duration = future.result()
@@ -138,12 +151,14 @@ class SourceResolver:
         prober: Callable[[str, float], str | None] | None = None,
         breakers: BreakerBoard | None = None,
         probe_timeout: float = source_http.PROBE_TIMEOUT_SECONDS,
+        repos: Callable[[], object] | None = None,
     ):
+        """``repos``: the APT repository settings (apt_repos) of the changelog source."""
         self.db, self.metadata = db, metadata
         self.breakers = breakers or BreakerBoard()
         self.oval = oval or oval_feed.OvalFeed(db, self.breakers)
         self.notices = notices or usn_notices.UsnNotices(db, self.breakers)
-        self.changelog = changelog or changelog_source.ChangelogSource(self.breakers)
+        self.changelog = changelog or changelog_source.ChangelogSource(self.breakers, repos=repos)
         self.priority = priority or enrichment.Enrichment(db, self.breakers)
         self.prober, self.probe_timeout = prober, probe_timeout
         self.probes: dict[str, ProbeResult] = {}
@@ -159,12 +174,19 @@ class SourceResolver:
         self.breakers.reset()
         self.changelog.start_run()
         self.priority.start_run()
-        results = probe_all(self.prober or source_http.probe, self.probe_timeout)
+        mirror = self._changelog_mirror(_PROBE_RELEASE, _PROBE_ARCHITECTURE) or SECURITY_MIRROR
+        targets = probe_targets(mirror)
+        results = probe_all(self.prober or source_http.probe, self.probe_timeout, targets)
         self.probes = {r.source: r for r in results}
         reason = self.blocked(CVE_JSON)
         if reason:
             self.metadata.block_for_run(reason)
         return results
+
+    def _changelog_mirror(self, codename: str, architecture: str) -> str | None:
+        """The mirror the changelog source reads (None for a source that does not say)."""
+        mirror = getattr(self.changelog, "mirror", None)
+        return mirror(codename, architecture) if callable(mirror) else None
 
     def blocked(self, source: str) -> str | None:
         """Why ``source`` is skipped this run; None if it was reachable or not probed."""
@@ -268,10 +290,11 @@ class SourceResolver:
             raise SourceFailure(f"blocked ({blocked})")
         return None
 
-    def _candidate_sources(self, cve: str, facts, hints: Iterable[str]) -> list[str]:
+    def related_sources(self, cve: str, facts, hints: Iterable[str] = ()) -> list[str]:
         """Installed source packages that may hold the fix, from what is known of the CVE: the
         pasted list, other releases in OVAL, the USNs. A CVE nobody links to a package is not
-        searched for: that would mean fetching a changelog per installed package."""
+        searched for: that would mean fetching a changelog per installed package. Also used by
+        the opt-in fallback for CVEs without metadata (cve_resolver.expand_unconfirmed)."""
         names = {*hints, *self.notices.packages_for(cve), *self.oval.packages_for(cve)}
         by_source = facts.by_source()
         by_binary = {p.base_name: p.source for p in facts.packages}
@@ -283,7 +306,7 @@ class SourceResolver:
         blocked = self.blocked(CHANGELOG)
         if blocked:
             raise SourceFailure(f"blocked ({blocked})")
-        sources = self._candidate_sources(cve, facts, hints)
+        sources = self.related_sources(cve, facts, hints)
         if not sources:
             return None
         fixes, errors = self.changelog.find(cve, facts.codename, facts.architecture, sources)
@@ -291,7 +314,9 @@ class SourceResolver:
             if errors:
                 raise SourceFailure(errors[0])
             return None
+        mirror = self._changelog_mirror(facts.codename, facts.architecture)
         record = CveRecord(cve=cve, origin=CHANGELOG)
+        record.mirror = f"changelog: {mirror}" if mirror else None
         for source, version in sorted(fixes.items()):
             record.entries.append(status_entry(source, version, facts.codename, "released", None))
         return record

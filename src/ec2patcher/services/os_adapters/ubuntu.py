@@ -74,11 +74,16 @@ class UbuntuAdapter(OsAdapter):
             warnings.append("Some Canonical metadata lookups failed; those CVEs remain unresolved.")
         elif any(f.status == cve_resolver.UNKNOWN for f in findings):
             warnings.append("Some CVEs have no usable Canonical statement for this Ubuntu release.")
+        unconfirmed, pending = ctx.allow_unconfirmed_candidates, ctx.allow_pending_candidates
+        if unconfirmed:
+            findings = cve_resolver.expand_unconfirmed(findings, facts, ctx.related_sources)
         ctx.lookups_done(findings)
         candidates: dict[str, apt_planner.Candidate] = {}
         requests: list[tuple[str, str]] = []
         state: local_apt.AptState | None = None
         query = cve_resolver.candidate_query_packages(findings, facts)
+        extra = cve_resolver.unconfirmed_query_packages(findings, unconfirmed, pending)
+        query = sorted({*query, *extra})
         if query:
             ctx.progress(
                 f"Resolving APT candidates locally ({facts.codename}/{facts.architecture})"
@@ -99,6 +104,16 @@ class UbuntuAdapter(OsAdapter):
                         f.failure_reason = "apt: candidate check failed"
             else:
                 requests = cve_resolver.apply_candidates(findings, candidates, facts)
+                if extra:
+                    more = cve_resolver.apply_unconfirmed(
+                        findings, candidates, facts, unconfirmed, pending
+                    )
+                    requests = sorted({**dict(more), **dict(requests)}.items())
+                    if more:
+                        warnings.append(
+                            "The plan includes upgrades Canonical has not confirmed as fixes "
+                            "(opt-in fallback); patching needs an explicit confirmation."
+                        )
 
         plan: list[cve_resolver.PlanEntry] = []
         apt_arguments: list[str] = []
@@ -129,7 +144,7 @@ class UbuntuAdapter(OsAdapter):
         installed = facts.by_name()
         cves_by_source: dict[str, set[str]] = {}
         for f in findings:
-            if f.status == cve_resolver.PATCH_AVAILABLE and f.source:
+            if f.status in cve_resolver.PLANNED_STATUSES and f.source:
                 cves_by_source.setdefault(f.source, set()).add(f.cve)
         entries = []
         for name, version in requests:

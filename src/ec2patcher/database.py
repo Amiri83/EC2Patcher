@@ -30,7 +30,7 @@ from ec2patcher.models import (
 )
 from ec2patcher.services import patch_state
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Raw Canonical CVE JSON per CVE; document NULL = Canonical confirmed 404 (unknown CVE).
 # Failed lookups are never stored. Part of v7; IF NOT EXISTS so it is also (re)created in
@@ -480,6 +480,12 @@ _MIGRATIONS = {
         ALTER TABLE patch_report ADD COLUMN kev INTEGER;
         ALTER TABLE patch_report ADD COLUMN epss REAL;
     """,
+    # APT mirrors (Settings -> APT Repositories): per finding and report row, the mirror(s) its
+    # lookups used (changelog fallback, APT candidates). NULL: none, or analyzed before v20.
+    20: """
+        ALTER TABLE cve_findings ADD COLUMN mirror TEXT;
+        ALTER TABLE patch_report ADD COLUMN mirror TEXT;
+    """,
 }
 
 
@@ -627,6 +633,7 @@ def _row_to_finding(row: sqlite3.Row) -> CveFindingRow:
         failure_reason=row["failure_reason"],
         kev=_bool_or_none(row["kev"]),
         epss=row["epss"],
+        mirror=row["mirror"],
     )
 
 
@@ -772,7 +779,7 @@ _TRANSPORT_COLUMNS = ("connection_type", "instance_id_override", "aws_profile", 
 _REPORT_FIELDS = (
     "server_name", "cve", "hostname", "usn", "package", "title", "priority", "status",
     "version_before", "version_after", "imported_at", "patched_at", "run_id", "error", "source",
-    "failure_reason", "kev", "epss",
+    "failure_reason", "kev", "epss", "mirror",
 )  # fmt: skip
 
 
@@ -1243,9 +1250,9 @@ class Database:
                     "priority, apt_candidate, canonical_status, cvss_severity, cvss_score, "
                     "cvss_version, cvss_vector, cvss_source, cvss_source_type, "
                     "nvd_last_modified, nvd_status, nvd_note, resolution_source, failure_reason, "
-                    "kev, epss) "
+                    "kev, epss, mirror) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?)",
                     (
                         analysis_id, f.cve, f.source, f.installed_version, f.fixed_version,
                         f.status, f.detail, json.dumps(f.binaries), f.pocket, f.priority,
@@ -1256,6 +1263,7 @@ class Database:
                             if c else (None,) * 9
                         ),
                         f.resolution_source, f.failure_reason, f.kev, f.epss,
+                        getattr(f, "mirror", None),
                     ),
                 )  # fmt: skip
             for p in plan:
