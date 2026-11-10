@@ -100,6 +100,7 @@ class CveFindingRow:
     failure_reason: str | None = None
     kev: bool | None = None
     epss: float | None = None
+    mirror: str | None = None  # the APT mirror(s) its lookups used; None before v20
 
     @property
     def severity(self) -> str:
@@ -321,6 +322,7 @@ class PatchReportRow:
     failure_reason: str | None = None  # why it is unresolved, with the source that failed
     kev: bool | None = None  # in CISA's KEV catalogue; None: not known
     epss: float | None = None
+    mirror: str | None = None  # the APT mirror(s) the analysis lookups used
 
 
 @dataclass

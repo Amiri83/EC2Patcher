@@ -633,7 +633,7 @@ def test_defaults_match_the_module_constants():
 def test_fresh_database_is_v15_with_run_cache_stats(db_path):
     db = Database(db_path)
     with sqlite3.connect(db_path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 19
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 20
     conn.close()
     assert columns(db_path, "analysis_runs")["cache_stats"] == ("TEXT", 1, "'{}'")
     db.save_report("r.json", {"a": []}, "VALID")
@@ -660,7 +660,7 @@ def test_v14_database_upgrades_to_v15_keeping_data(db_path):
 
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 19
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 20
     check.close()
     run = db.get_latest_analysis_run()
     assert run.report_filename == "old.json" and run.metadata_lookups == {"CVE-1": "ok"}
@@ -675,7 +675,7 @@ def test_full_upgrade_path_from_v1_reaches_v15(db_path):
     _legacy_db(db_path, 1).close()
     db = Database(db_path)
     with sqlite3.connect(db_path) as check:
-        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 19
+        assert check.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 20
     check.close()
     assert "cache_stats" in columns(db_path, "analysis_runs")
     assert db.get_server_by_name("keep") is not None

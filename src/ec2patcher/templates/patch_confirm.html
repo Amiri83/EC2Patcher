@@ -17,6 +17,7 @@
   </dl>
   {% if patch.excluded_warning %}<div class="alert alert-warning excluded-warning">{{ patch.excluded_warning }}</div>{% endif %}
   {% if patch.not_checked_warning %}<div class="alert alert-warning not-checked-warning">{{ patch.not_checked_warning }}</div>{% endif %}
+  {% if patch.unconfirmed_count %}<div class="alert alert-warning unconfirmed-warning"><strong>Not confirmed by Canonical:</strong> this plan upgrades packages for {{ patch.unconfirmed_count }} CVE{{ "" if patch.unconfirmed_count == 1 else "s" }} through an opt-in fallback (Settings &rarr; APT Repositories): {{ patch.unconfirmed_notes|join("; ") }}.</div>{% endif %}
   <div class="table-scroll">
   <table class="table small">
     <thead><tr><th>Binary Package</th><th>Current</th><th>Target</th><th>.deb</th></tr></thead>
@@ -34,6 +35,7 @@
   <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/approve" class="form-actions">
     <input type="hidden" name="confirm" value="yes">
     {% if patch.unresolved_count %}<label class="check-label unresolved-ack"><input type="checkbox" name="acknowledged_unresolved" value="{{ patch.unresolved_count }}" required> Patch anyway: {{ patch.unresolved_count }} CVE{{ "" if patch.unresolved_count == 1 else "s" }} remain{{ "s" if patch.unresolved_count == 1 else "" }} unresolved and {{ "is" if patch.unresolved_count == 1 else "are" }} not covered by this plan</label>{% endif %}
+    {% if patch.unconfirmed_count %}<label class="check-label unconfirmed-ack"><input type="checkbox" name="acknowledged_unconfirmed" value="{{ patch.unconfirmed_count }}" required> Patch anyway: the upgrades for {{ patch.unconfirmed_count }} CVE{{ "" if patch.unconfirmed_count == 1 else "s" }} {{ "is" if patch.unconfirmed_count == 1 else "are" }} not confirmed as fixes by Canonical</label>{% endif %}
     <label class="check-label"><input type="checkbox" name="skip_reboot" value="1"> Skip reboot</label>
     <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}" class="btn btn-secondary">Cancel</a>
     <button type="submit" class="btn btn-danger" data-once>Approve &amp; Start Patching</button>

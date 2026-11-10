@@ -172,7 +172,7 @@ def test_test_key_button_checks_the_key_in_use(db_path, monkeypatch):
 def test_test_key_without_a_key_sends_nothing(db_path):
     client, fake = nvd_client(db_path, OK_REPLY)
     with web(db_path, client) as c:
-        assert 'value="test"' not in c.get("/settings").text
+        assert ">Test key</button>" not in c.get("/settings").text
         r = c.post("/settings/nvd-key", data={"action": "test"})
         assert "There is no NVD API key to test." in r.text
         assert "NVD API key: not set" in badge(r.text)

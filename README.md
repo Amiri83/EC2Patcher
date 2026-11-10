@@ -306,9 +306,9 @@ Needs no configuration. Each Ubuntu CVE is resolved by the first source that ans
 
 | # | Source (as shown in reports) | What it is |
 | --- | --- | --- |
-| 1 | `oval` | Canonical's OVAL feed (`security-metadata.canonical.com/oval/com.ubuntu.<codename>.cve.oval.xml.bz2`), one file per release found on the run's servers, stored in SQLite, refreshed after 24 h. A corrupt or truncated download is discarded and the previous copy stays in use. CVEs are then answered locally, without a request per CVE. |
+| 1 | `oval` | Canonical's OVAL feed (`security-metadata.canonical.com/oval/com.ubuntu.<codename>.cve.oval.xml.bz2`), one file per release found on the run's servers, stored in SQLite, refreshed after 24 h. A network failure is retried twice (after 2 s, then 4 s); a corrupt or truncated download is discarded and the previous copy stays in use. CVEs are then answered locally, without a request per CVE. The version of a fix *pending publication* is kept too. |
 | 2 | `notices` | USNs from `ubuntu.com/security/notices.json`: paged, stored, refreshed after 24 h. The first download may span several runs (each gives it up to 2 minutes). Also supplies the USN and title of the report: a CVE in several USNs keeps them all, and the report shows the one for the server's release, then the latest, then the highest number. |
-| 3 | `changelog` | `changelog.Debian.gz` of the package's candidate `.deb` on `security.ubuntu.com` (`ports.ubuntu.com` for arm64). The oldest entry mentioning the CVE is the fix version. Bounded per run, one read per package, and only for packages already linked to the CVE (pasted list, other releases, USNs). |
+| 3 | `changelog` | `changelog.Debian.gz` of the package's candidate `.deb` on `security.ubuntu.com` (`ports.ubuntu.com` for arm64), or on the configured security / ports mirror with **Use mirrors for changelog** ([APT mirrors](#corporate-networks-apt-mirrors-and-proxies)). The oldest entry mentioning the CVE is the fix version. Bounded per run, one read per package, and only for packages already linked to the CVE (pasted list, other releases, USNs). |
 | 4 | `cve-json` | The per-CVE `ubuntu.com/security/cves/<CVE>.json`, as a last resort, with a 5 s timeout. |
 
 When a run starts, every source (and NVD, KEV, EPSS) is probed in parallel with one small request.
@@ -328,7 +328,46 @@ most 20 s per server; a failure only leaves the value empty.
 
 **Columns**: `Source`, `KEV` (yes/no) and `EPSS` (the score) are on the findings of the server report
 and the patch report; those two and the `.xlsx` sheets (`CVE Findings`, `Details`) also give the
-`Failure Reason` of unresolved CVEs.
+`Failure Reason` of unresolved CVEs and the `Mirror` each lookup used (`apt: <mirror> <pocket>` for
+the APT candidate, `changelog: <mirror>` for the changelog fallback).
+
+#### Corporate networks: APT mirrors and proxies
+
+Where Canonical's hosts are blocked and only an internal APT proxy mirror (e.g. Nexus) is
+reachable, **Settings → APT Repositories** sets:
+
+- **Archive / Security / Ports mirror URL**: the mirror of the release + `-updates` pockets, of
+  `-security` (both for amd64 / i386) and of every pocket of other architectures. `${codename}` is
+  the only placeholder (e.g. `https://nexus.example.internal/repository/ubuntu-${codename}`).
+  URLs must be `http://` or `https://`, without credentials, query string, spaces or quotes; an
+  empty field keeps the Ubuntu default. **Keyring path**: only if the mirror re-signs the archive.
+- **Use mirrors for changelog**: the changelog fallback of the resolver (and its probe) reads the
+  security / ports mirror instead of `security.ubuntu.com`.
+- A live **sources.list preview** per release and architecture, **Test** (fetches
+  `dists/<pocket>/InRelease` of every pocket from the typed values, nothing saved) and **Reset to
+  defaults**.
+
+The private APT lists are refreshed from the new mirrors at the next analysis. With nothing
+configured every URL, path and command is exactly as without this setting. Servers never use
+these mirrors: they only install the approved `.deb` files from the staging directory.
+
+**Opt-in fallbacks** (same card, both off by default):
+
+- **Allow unconfirmed candidates**: a CVE without Canonical metadata (`METADATA_UNAVAILABLE`) that
+  is linked to installed source packages (pasted list, OVAL of other releases, USNs) is checked
+  against the mirror's candidates; a newer candidate becomes **CANDIDATE_WITHOUT_METADATA** and is
+  planned.
+- **Allow fixes pending publication**: a CVE Canonical lists as *pending* with a version becomes
+  **FIX_AVAILABLE_PENDING_PUBLICATION** when the mirror's candidate is at or above that version.
+  Kernels keep their own logic and are never planned this way.
+
+Such a plan is never approved automatically: the confirmation page (and Patch All) requires an
+explicit checkbox with the number of unconfirmed CVEs, and the service refuses the approval
+without it.
+
+**Proxies**: the requests of the resolver's sources (OVAL, USNs, changelog, KEV, EPSS), the
+Test button and the `.deb` downloads of a patch use `HTTPS_PROXY` / `HTTP_PROXY` from the
+environment at the time of the request, and no proxy for hosts in `NO_PROXY`.
 
 **Re-analyze and Retry**
 
@@ -355,8 +394,8 @@ executed, and each approved analysis only once. The pipeline stops at the first 
    packages/versions, with no removal or downgrade.
 5. **Install** `sudo -n apt-get install -y <explicit .deb paths>` with no remote APT sources,
    `--no-remove`, `DEBIAN_FRONTEND=noninteractive`, `NEEDRESTART_MODE=l`.
-6. **Verify** installed versions, `dpkg --audit`, each CVE against Canonical's fixed version,
-   and `/run/reboot-required`.
+6. **Verify** installed versions, `dpkg --audit`, each CVE against Canonical's fixed version
+   (or the confirmed pending version), and `/run/reboot-required`.
 7. **Clean up** local and remote staging.
 8. **Reboot**, only after a verified patch, only if `/run/reboot-required` exists and **Skip
    reboot** is unchecked: `sudo -n reboot`, wait up to 10 minutes for a new boot id, record
@@ -446,6 +485,8 @@ failed server.
 - **Logging**: the **Log directory** (default: the per-user log directory from platformdirs, or
   `$EC2PATCHER_LOG_DIR`) and the current log file path. The directory is created if needed and
   must be writable, or it is not saved. Logs rotate at 5 MB, keeping 5 old files.
+- **APT Repositories**: mirrors, keyring, changelog via mirrors and the opt-in fallbacks (see
+  [Corporate networks](#corporate-networks-apt-mirrors-and-proxies)); stored in the settings table.
 - **Security Data**: Canonical request settings (timeout, pacing, retries, proxy).
 - **Reset Database**: type `RESET` to remove all stored data (refused while an analysis or
   patch is running).
@@ -518,7 +559,9 @@ them to another machine.
   `ports.ubuntu.com` for arm64), `security-metadata.canonical.com`, `ubuntu.com`,
   `cdn.amazonlinux.com` (Amazon Linux servers), and optionally `services.nvd.nist.gov`, `www.cisa.gov`
   and `api.first.org` (without them severity, KEV and EPSS stay empty). A blocked source is skipped,
-  see [CVE resolver](#cve-resolver). `HTTPS_PROXY` / `NO_PROXY` are honoured.
+  see [CVE resolver](#cve-resolver). `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` are honoured. An
+  internal APT mirror can replace the Ubuntu archive hosts, see
+  [Corporate networks](#corporate-networks-apt-mirrors-and-proxies).
 
 ## Install
 

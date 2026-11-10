@@ -1,10 +1,11 @@
 """Fallback: search the changelog.Debian.gz of a package's candidate .deb for the CVE.
 
 For a CVE OVAL and the USNs do not answer. The Packages index of the release's pockets on
-security.ubuntu.com gives the candidate .deb of the source package; the smallest binary is
-fetched (size and SHA256 checked against the index) and only its changelog is read, never
-installed or unpacked to disk. If the CVE is mentioned, the changelog entry that first mentions
-it is the fix version.
+security.ubuntu.com (or, with "use mirrors for changelog" in Settings -> APT Repositories, the
+configured security / ports mirror) gives the candidate .deb of the source package; the smallest
+binary is fetched (size and SHA256 checked against the index) and only its changelog is read,
+never installed or unpacked to disk. If the CVE is mentioned, the changelog entry that first
+mentions it is the fix version.
 
 Bounded: indexes are read once per run, a package's changelog once per run however many CVEs ask,
 and requests and packages have a per-run budget. It runs in the analysis worker, never in a web
@@ -27,7 +28,7 @@ from typing import BinaryIO
 from urllib.parse import urlsplit
 
 from ec2patcher.services import debversion, source_http
-from ec2patcher.services.local_apt import PORTS_MIRROR, SECURITY_MIRROR
+from ec2patcher.services.local_apt import ARCHIVE_ARCHITECTURES, PORTS_MIRROR, SECURITY_MIRROR
 from ec2patcher.services.source_breaker import BreakerBoard
 
 logger = logging.getLogger(__name__)
@@ -161,15 +162,27 @@ class ChangelogSource:
         breakers: BreakerBoard | None = None,
         fetcher: Callable[[str, BinaryIO, int, float], None] | None = None,
         runner: Callable = subprocess.run,
+        repos: Callable[[], object] | None = None,
     ):
+        """``repos``: returns the APT repository settings (apt_repos.AptRepos), read once per
+        run; its ``changelog_mirror`` decides where indexes and .debs come from."""
         self.breakers = breakers or BreakerBoard()
-        self.fetcher, self.runner = fetcher, runner
+        self.fetcher, self.runner, self.repos = fetcher, runner, repos
         self.start_run()
 
     def start_run(self) -> None:
         self._indexes: dict[tuple[str, str, str, str], dict[str, list[DebRef]]] = {}
         self._packages: dict[tuple[str, str, str], dict[str, str] | ChangelogError] = {}
+        self._settings: object | None = None
         self.requests = 0
+
+    def mirror(self, codename: str, architecture: str) -> str:
+        """The mirror this run reads for a release and architecture."""
+        if self.repos is not None:
+            if self._settings is None:
+                self._settings = self.repos()
+            return self._settings.changelog_mirror(codename, architecture)
+        return SECURITY_MIRROR if architecture in ARCHIVE_ARCHITECTURES else PORTS_MIRROR
 
     def find(
         self, cve: str, codename: str, architecture: str, sources: Iterable[str]
@@ -198,10 +211,6 @@ class ChangelogSource:
                 logger.info("changelog_source package=%s error=%s", source, exc)
                 self._packages[key] = exc
         return self._packages[key]
-
-    @staticmethod
-    def _mirror(architecture: str) -> str:
-        return SECURITY_MIRROR if architecture in ("amd64", "i386") else PORTS_MIRROR
 
     def _fetch(self, url: str, out: BinaryIO, max_bytes: int) -> None:
         """One request, under this run's budget and the endpoint's breaker."""
@@ -232,7 +241,7 @@ class ChangelogSource:
         if key in self._indexes:
             return self._indexes[key]
         url = (
-            f"{self._mirror(architecture)}/dists/{codename}-{pocket}/{component}/"
+            f"{self.mirror(codename, architecture)}/dists/{codename}-{pocket}/{component}/"
             f"binary-{architecture}/Packages.gz"
         )
         with tempfile.TemporaryFile() as download:
@@ -275,13 +284,13 @@ class ChangelogSource:
         if not _PACKAGE_RE.match(source):
             raise ChangelogError("unexpected package name")
         for ref in self._candidates(codename, architecture, source):
-            text = self._changelog_of(ref, architecture)
+            text = self._changelog_of(ref, codename, architecture)
             if text is not None:
                 return fix_versions(text)
         raise ChangelogError("the candidate .deb holds no changelog")
 
-    def _changelog_of(self, ref: DebRef, architecture: str) -> str | None:
-        url = f"{self._mirror(architecture)}/{ref.filename}"
+    def _changelog_of(self, ref: DebRef, codename: str, architecture: str) -> str | None:
+        url = f"{self.mirror(codename, architecture)}/{ref.filename}"
         with tempfile.NamedTemporaryFile(suffix=".deb") as deb:
             try:
                 self._fetch(url, deb, ref.size)

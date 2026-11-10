@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from typing import BinaryIO
 
-from ec2patcher.services.downloader import check_uri
+from ec2patcher.services.downloader import check_uri, open_url
 
 USER_AGENT = "ec2patcher"
 JSON_TIMEOUT_SECONDS = 15.0
@@ -29,8 +29,7 @@ def _open(url: str, timeout: float, headers: dict[str, str] | None = None):
     if problem:
         raise ValueError(problem)
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})  # noqa: S310
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler())
-    return opener.open(request, timeout=timeout)
+    return open_url(request, timeout)
 
 
 def describe_error(exc: BaseException) -> str:

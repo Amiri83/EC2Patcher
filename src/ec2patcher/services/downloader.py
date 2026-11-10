@@ -3,6 +3,9 @@
 Only the stored URI is fetched (no local APT, no "latest" lookup). Data is streamed into
 ``<name>.deb.part``; the file is renamed to ``<name>.deb`` only after the size and SHA256
 match the approved plan. A failed download leaves the ``.part`` file for troubleshooting.
+
+Requests use the proxy the environment sets at that moment (HTTPS_PROXY / HTTP_PROXY, skipped
+for hosts in NO_PROXY), see ``proxies_for``.
 """
 
 import hashlib
@@ -43,11 +46,36 @@ def check_uri(uri: str | None) -> str | None:
     return None
 
 
+def proxies_for(url: str) -> dict[str, str]:
+    """The proxy for ``url`` from the current environment: HTTPS_PROXY / HTTP_PROXY (or their
+    lowercase forms) by scheme, none when NO_PROXY matches the host. Read on every request:
+    ``urllib.request.urlopen`` keeps the proxies of its first call for the whole process."""
+    proxies = urllib.request.getproxies_environment()
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    try:
+        port = parts.port
+    except ValueError:  # an invalid port: the request itself fails with a clear error
+        port = None
+    if port is not None:
+        host = f"{host}:{port}"
+    if not host or urllib.request.proxy_bypass_environment(host, proxies):
+        return {}
+    proxy = proxies.get(parts.scheme)
+    return {parts.scheme: proxy} if proxy else {}
+
+
+def open_url(request: urllib.request.Request, timeout: float):
+    """Open ``request`` through the proxy the environment sets for its URL (if any)."""
+    handler = urllib.request.ProxyHandler(proxies_for(request.full_url))
+    return urllib.request.build_opener(handler).open(request, timeout=timeout)
+
+
 def urllib_fetcher(url: str, out: BinaryIO, max_bytes: int, timeout: float) -> None:
     if check_uri(url):
         raise DownloadError(check_uri(url))
     request = urllib.request.Request(url, headers={"User-Agent": f"EC2Patcher/{__version__}"})  # noqa: S310
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - http(s) only
+    with open_url(request, timeout) as response:  # http(s) only: check_uri above
         total = 0
         while True:
             chunk = response.read(CHUNK_SIZE)

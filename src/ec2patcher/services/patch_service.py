@@ -252,6 +252,8 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
             reasons.append(f"{filename}: plan is inconsistent (conflicting URI/checksum/size).")
     covered = {cve for p in analysis.plan for cve in p.cves}  # at-target rows cover theirs
     for f in analysis.findings:
+        if f.status in cve_resolver.UNCONFIRMED_STATUSES and f.cve not in covered:
+            reasons.append(f"{f.cve}: planned upgrade has no exact package plan.")
         if f.status != cve_resolver.PATCH_AVAILABLE:
             continue
         if not f.fixed_version:
@@ -261,6 +263,10 @@ def check_plan(analysis: ServerAnalysis) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
+# Findings whose fixed version the post-install check verifies.
+VERIFIED_STATUSES = frozenset(
+    {cve_resolver.PATCH_AVAILABLE, cve_resolver.FIX_AVAILABLE_PENDING_PUBLICATION}
+)
 NOT_CHECKED_STATUSES = frozenset(
     {cve_resolver.UNKNOWN, cve_resolver.METADATA_UNAVAILABLE, cve_resolver.ANALYSIS_ERROR}
 )
@@ -309,6 +315,25 @@ def unresolved_refusal(count: int, acknowledged: int) -> str | None:
     )
 
 
+def unconfirmed_cves(analysis: ServerAnalysis) -> list[str]:
+    """CVEs the plan covers only through an opt-in fallback: Canonical has not confirmed the
+    fix (no metadata, or still pending publication). Never patched without a confirmation."""
+    return sorted(
+        {f.cve for f in analysis.findings if f.status in cve_resolver.UNCONFIRMED_STATUSES}
+    )
+
+
+def unconfirmed_refusal(count: int, acknowledged: int) -> str | None:
+    """The plan may hold unconfirmed upgrades only once that exact number is confirmed."""
+    if count == acknowledged:
+        return None
+    return (
+        f"The plan upgrades packages for {count} CVE{'' if count == 1 else 's'} that Canonical "
+        "has not confirmed as fixed (opt-in fallback). Confirm that on the confirmation page "
+        "to go ahead."
+    )
+
+
 @dataclass
 class Eligibility:
     allowed: bool
@@ -322,6 +347,8 @@ class Eligibility:
     unpatched_notes: list[str] = field(default_factory=list)
     not_checked_warning: str | None = None
     unresolved_count: int = 0  # CVEs of not_checked_warning; patching needs them confirmed
+    unconfirmed_count: int = 0  # CVEs of unconfirmed_cves; patching needs them confirmed too
+    unconfirmed_notes: list[str] = field(default_factory=list)
     excluded_warning: str | None = None  # plan rows already at target (not installed)
     # "Patch All": the run's own (older) analysis this one replaces, if any.
     superseded: ServerAnalysis | None = None
@@ -464,6 +491,12 @@ class PatchService:
         ]
         result.not_checked_warning = not_checked_warning(analysis)
         result.unresolved_count = len(not_checked_cves(analysis))
+        result.unconfirmed_count = len(unconfirmed_cves(analysis))
+        result.unconfirmed_notes = [
+            f"{f.cve} ({f.source_package or '-'}): {cve_resolver.STATUS_LABELS[f.status]}"
+            for f in analysis.findings
+            if f.status in cve_resolver.UNCONFIRMED_STATUSES
+        ]
         reasons = result.reasons
         try:
             result.remote_path = staging.remote_dir(analysis.server_name)
@@ -578,7 +611,11 @@ class PatchService:
         return execution_id
 
     def approve(
-        self, analysis_id: int, skip_reboot: bool = True, acknowledged_unresolved: int = 0
+        self,
+        analysis_id: int,
+        skip_reboot: bool = True,
+        acknowledged_unresolved: int = 0,
+        acknowledged_unconfirmed: int = 0,
     ) -> int:
         """Record APPROVED (after re-checking eligibility) and start the execution.
 
@@ -586,11 +623,17 @@ class PatchService:
         "Skip reboot" box in the web UI) lets EC2Patcher reboot a server.
         ``acknowledged_unresolved``: how many unresolved CVEs the operator confirmed; it must be
         the number this analysis has, so that the resolved plan is only patched knowingly.
+        ``acknowledged_unconfirmed``: likewise for the CVEs planned by an opt-in fallback
+        without Canonical's confirmation (cve_resolver.UNCONFIRMED_STATUSES): never approved
+        without that explicit confirmation.
         """
         analysis = self.db.get_server_analysis(analysis_id)
         if analysis is None:
             raise PatchNotAllowedError("This analysis no longer exists.")
         refusal = unresolved_refusal(len(not_checked_cves(analysis)), acknowledged_unresolved)
+        if refusal is None:
+            unconfirmed = len(unconfirmed_cves(analysis))
+            refusal = unconfirmed_refusal(unconfirmed, acknowledged_unconfirmed)
         with self._lock:
             self._clear_stale()
             if self._running:
@@ -1307,12 +1350,14 @@ class PatchService:
         return problems
 
     def _check_cves(self, ctx: _Context, post: patch_remote.PostInstallState) -> list[dict]:
-        """For every PATCH_AVAILABLE finding: resulting source version >= Canonical fixed."""
+        """For every PATCH_AVAILABLE finding: resulting source version >= Canonical fixed (also
+        the pending version of a confirmed FIX_AVAILABLE_PENDING_PUBLICATION). A confirmed
+        CANDIDATE_WITHOUT_METADATA has no fixed version to verify against."""
         rows = []
         seen = set()
         plan_cves = {(p.binary_package, p.architecture): p.cves for p in ctx.analysis.plan}
         for f in ctx.analysis.findings:
-            if f.status != cve_resolver.PATCH_AVAILABLE or (f.cve, f.source_package) in seen:
+            if f.status not in VERIFIED_STATUSES or (f.cve, f.source_package) in seen:
                 continue
             seen.add((f.cve, f.source_package))
             states = [post.packages.get(key) for key, cves in plan_cves.items() if f.cve in cves]
@@ -1514,12 +1559,14 @@ class PatchService:
         confirmed_ids: list[int],
         skip_reboot: bool,
         acknowledged_unresolved: int = 0,
+        acknowledged_unconfirmed: int = 0,
     ) -> int:
         """Record a queue for the confirmed, still eligible servers of the run and start it.
 
         Every server of the run gets an item; the ones not patched are SKIPPED with reasons.
-        ``acknowledged_unresolved``: the unresolved CVEs the operator confirmed, over the servers
-        to patch; it must be the number they have (see :meth:`approve`).
+        ``acknowledged_unresolved`` / ``acknowledged_unconfirmed``: the unresolved CVEs and the
+        CVEs planned without Canonical's confirmation that the operator confirmed, over the
+        servers to patch; each must be the number they have (see :meth:`approve`).
         """
         run = self.db.get_analysis_run(run_id, details=True)
         if run is None:
@@ -1530,7 +1577,7 @@ class PatchService:
             if self._running:
                 raise PatchNotAllowedError("Another patch execution is running.")
             items = []
-            unresolved = 0
+            unresolved = unconfirmed = 0
             for analysis, check in self.queue_preview(run):
                 status, detail = ps.ITEM_PENDING, None
                 ids = {analysis.id} | ({check.superseded.id} if check.superseded else set())
@@ -1547,6 +1594,7 @@ class PatchService:
                     )
                 if status == ps.ITEM_PENDING:
                     unresolved += check.unresolved_count
+                    unconfirmed += check.unconfirmed_count
                 items.append(
                     {
                         "server_analysis_id": analysis.id,
@@ -1559,6 +1607,8 @@ class PatchService:
             if not any(item["status"] == ps.ITEM_PENDING for item in items):
                 raise PatchNotAllowedError("No eligible servers to patch.")
             refusal = unresolved_refusal(unresolved, acknowledged_unresolved)
+            if refusal is None:
+                refusal = unconfirmed_refusal(unconfirmed, acknowledged_unconfirmed)
             if refusal:
                 raise PatchNotAllowedError(refusal)
             queue_id = self.db.create_patch_queue(run_id, skip_reboot, items)

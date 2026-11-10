@@ -133,6 +133,40 @@
       .catch(function () { ssmStatus.textContent = "The status could not be loaded. Use Check now."; });
   }
 
+  // Settings -> APT Repositories: live sources.list preview of the typed values (validated by
+  // the server; nothing is saved). Without JavaScript the preview shows the saved settings.
+  var aptForm = document.querySelector("form[data-preview-url]");
+  if (aptForm) {
+    var aptPreview = aptForm.querySelector("#apt-preview");
+    var aptTimer = null;
+    var refreshAptPreview = function () {
+      var params = new URLSearchParams();
+      aptForm.querySelectorAll("[data-apt-field]").forEach(function (field) {
+        if (field.type === "checkbox") {
+          if (field.checked) { params.append(field.name, field.value); }
+        } else {
+          params.append(field.name, field.value);
+        }
+      });
+      fetch(aptForm.getAttribute("data-preview-url") + "?" + params.toString())
+        .then(function (response) { return response.json(); })
+        .then(function (data) {
+          if (data.preview !== null) {
+            aptPreview.textContent = data.preview;
+          } else {
+            aptPreview.textContent = Object.values(data.errors || {}).join("\n");
+          }
+        })
+        .catch(function () { aptPreview.textContent = "The preview could not be loaded."; });
+    };
+    aptForm.querySelectorAll("[data-apt-field]").forEach(function (field) {
+      field.addEventListener(field.tagName === "SELECT" || field.type === "checkbox" ? "change" : "input", function () {
+        window.clearTimeout(aptTimer);
+        aptTimer = window.setTimeout(refreshAptPreview, 300);
+      });
+    });
+  }
+
   // Live progress of a run (templates/_run_progress.html). Everything from the server is written
   // with textContent: messages can hold text from remote servers.
   var drawer = document.querySelector("[data-run-progress]");

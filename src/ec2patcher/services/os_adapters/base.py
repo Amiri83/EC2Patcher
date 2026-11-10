@@ -30,6 +30,12 @@ class AnalysisContext:
     advisories: object = None  # Amazon Linux advisories (amazon_updateinfo.UpdateInfoSource)
     # Told the findings once the lookups are done and before the fix versions are computed.
     lookups_done: Callable[[list], None] = lambda findings: None
+    # Opt-in fallbacks (Settings -> APT Repositories, both off by default): check the mirror's
+    # candidates for CVEs without metadata / with a fix pending publication.
+    allow_unconfirmed_candidates: bool = False
+    allow_pending_candidates: bool = False
+    # CVE -> installed source packages it is linked to (cve_sources.related_sources).
+    related_sources: Callable[[str], list[str]] = lambda cve: []
 
 
 @dataclass

@@ -17,7 +17,9 @@ via argument-list subprocesses. Lint/format: ruff (line length 100).
   `cve_sources` (resolver chain, source probes), `oval_feed`, `usn_notices`, `changelog_source`,
   `security_metadata` (per-CVE JSON, last resort), `source_breaker` (per-source breakers),
   `source_http` (their HTTP), `enrichment` (KEV, EPSS),
-  `nvd` (CVSS), `local_apt`/`apt_planner` (workstation APT),
+  `nvd` (CVSS), `local_apt`/`apt_planner` (workstation APT), `apt_repos` (Settings → APT
+  Repositories: mirror URLs with `${codename}`, keyring, changelog via mirrors, opt-in fallbacks;
+  validation, sources.list preview, InRelease test),
   `patch_service`/`patch_remote`/`downloader`/`staging` (patching), `ssh_service`,
   `ssm_service` (SSH over SSM: ProxyCommand, preflight, instance IDs, status),
   `ssm_plugin` (app-managed session-manager-plugin: detection, PATH, install),
@@ -58,6 +60,13 @@ them); keep it that way.
   remote APT sources during install, never rollback or automatic retry of an install.
 - No `shell=True`; validate anything that reaches a command line.
 - Reboot only after a verified patch, only if `/run/reboot-required`, never if Skip reboot.
+- APT mirrors: with nothing configured, URLs/paths/commands must stay byte-identical to Canonical's
+  defaults (tested). Mirror URLs are validated (http/https, no credentials/query/whitespace/quotes,
+  only `${codename}`) on save and on load. Outbound HTTP builds its opener per request
+  (`downloader.open_url`) so `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` are always current.
+- Opt-in fallbacks (`allow_unconfirmed_candidates`, `allow_pending_candidates`) default off; their
+  statuses (`cve_resolver.UNCONFIRMED_STATUSES`) are never approved without the explicit
+  `acknowledged_unconfirmed` count (single patch and Patch All). Kernels are never planned by them.
 
 ## Secrets
 

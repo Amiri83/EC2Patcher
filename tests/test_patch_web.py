@@ -162,9 +162,7 @@ def test_urllib_fetcher_limits_size(monkeypatch):
         def __exit__(self, *args):
             return False
 
-    monkeypatch.setattr(
-        downloader.urllib.request, "urlopen", lambda req, timeout: Response(b"x" * 20)
-    )
+    monkeypatch.setattr(downloader, "open_url", lambda req, timeout: Response(b"x" * 20))
     out = io.BytesIO()
     with pytest.raises(downloader.DownloadError, match="more than the expected 10"):
         downloader.urllib_fetcher("http://archive/x.deb", out, 10, 5)

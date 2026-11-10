@@ -50,6 +50,7 @@ CVE_COLUMNS = [
     ("KEV", 6),
     ("EPSS", 8),
     ("Failure Reason", 50),
+    ("Mirror", 50),
 ]
 PLAN_COLUMNS = [
     ("Binary Package", 30),
@@ -90,6 +91,7 @@ PATCH_REPORT_COLUMNS = [
     ("KEV", 6),
     ("EPSS", 8),
     ("Failure Reason", 50),
+    ("Mirror", 50),
 ]
 
 
@@ -275,7 +277,7 @@ def _cve_rows(analysis: ServerAnalysis) -> list[list]:
         findings = by_cve.get(cve)
         if not findings:
             not_analyzed = [cve, UNKNOWN, *[""] * 11, NOT_ANALYZED_LABEL, "", "", ""]
-            rows.append([*not_analyzed, "", "", None, "not analyzed"])
+            rows.append([*not_analyzed, "", "", None, "not analyzed", ""])
             continue
         for f in findings:
             lookup = nvd.STATUS_LABELS.get(f.nvd_status, f.nvd_status) if f.nvd_status else ""
@@ -304,6 +306,7 @@ def _cve_rows(analysis: ServerAnalysis) -> list[list]:
                     _kev(f.kev),
                     f.epss,
                     f.failure_reason or "",
+                    f.mirror or "",
                 ]
             )
     return rows
@@ -355,6 +358,7 @@ def build_patch_report_workbook(rows: list[PatchReportRow], summaries: list) -> 
                 r.package or "", r.title or "", r.priority or "", r.status, r.version_before or "",
                 r.version_after or "", _when(r.imported_at), _when(r.patched_at), r.run_id,
                 r.error or "", r.source or "", _kev(r.kev), r.epss, r.failure_reason or "",
+                r.mirror or "",
             ]
             for r in rows
         ],

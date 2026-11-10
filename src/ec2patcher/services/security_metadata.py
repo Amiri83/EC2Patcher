@@ -138,6 +138,7 @@ class CveRecord:
     # Set only when ubuntu.com could not be reached and an expired cache entry was used.
     cache_age: timedelta | None = None
     origin: str = "cve-json"  # the source these statements came from (cve_sources)
+    mirror: str | None = None  # the APT mirror that answered (changelog lookups only)
 
     @property
     def cache_note(self) -> str | None:
