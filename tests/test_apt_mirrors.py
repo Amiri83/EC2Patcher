@@ -349,7 +349,7 @@ def test_save_validates_redirects_and_is_used_by_the_preview(client, db_path):
         MIRROR, SECURITY, local_apt.PORTS_MIRROR,
     )  # fmt: skip
     assert repos.mirror_changelog and not repos.allow_unconfirmed_candidates
-    page = client.get("/settings").text
+    page = client.get(saved.headers["location"]).text
     assert "APT repositories saved." in page and f"{MIRROR} noble-updates" in page
     assert f'value="{MIRROR}"' in page and "The Ubuntu defaults are in use." not in page
 
