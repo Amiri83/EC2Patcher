@@ -13,6 +13,7 @@ this the resolver's second source.
 import logging
 import re
 import time
+import urllib.error
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ PAGE_SIZE = 20
 TTL = timedelta(hours=24)
 RUN_BUDGET_SECONDS = 120.0
 PACE_SECONDS = 0.2
+CACHE_BUSTER = "nocache"  # query parameter of the one retry after an HTTP 5xx
 _NOTICE_ID_RE = re.compile(r"^[A-Z]{2,5}-\d+(?:-\d+)?$")
 _CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
 
@@ -137,7 +139,7 @@ class UsnNotices:
             if not breaker.allow():
                 return self._stop(feed, offset, f"backing off ({breaker.reason})")
             try:
-                page = fetch(f"{URL}?limit={PAGE_SIZE}&offset={offset}")
+                page = self._fetch_page(fetch, f"{URL}?limit={PAGE_SIZE}&offset={offset}")
                 notices = page["notices"]
                 if not isinstance(notices, list):
                     raise ValueError("no notices list")
@@ -172,6 +174,21 @@ class UsnNotices:
         )
         logger.info("usn_notices pages=%d stored=%d", pages, count)
         return f"{pages} pages read, {count} notices stored"
+
+    def _fetch_page(self, fetch: Callable[[str], dict], url: str) -> dict:
+        """One page. An HTTP 5xx is often a cached error page: asked once more, with a query
+        parameter no cache has seen. Any other failure, or a second one, is raised."""
+        try:
+            return fetch(url)
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            logger.info(
+                "usn_notices url=%s %s; retrying once past the caches",
+                url, source_http.describe_error(exc),
+            )  # fmt: skip
+        self.sleep(self.pace)
+        return fetch(f"{url}&{CACHE_BUSTER}={int(time.time())}")
 
     def _stop(self, feed: dict | None, offset: int, reason: str) -> str:
         self.db.put_source_feed(

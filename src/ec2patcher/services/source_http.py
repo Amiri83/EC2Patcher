@@ -15,7 +15,8 @@ from ec2patcher.services.downloader import check_uri, open_url
 
 USER_AGENT = "ec2patcher"
 JSON_TIMEOUT_SECONDS = 15.0
-PROBE_TIMEOUT_SECONDS = 5.0
+PROBE_TIMEOUT_SECONDS = 5.0  # first probe of a source at the start of a run
+PROBE_RETRY_TIMEOUT_SECONDS = 15.0  # the one retry of a probe that timed out
 MAX_JSON_BYTES = 32 * 1024 * 1024
 TRANSFER_DEADLINE_SECONDS = 600.0  # one streamed file, whatever its socket timeouts allow
 PROBE_READ_BYTES = 1024

@@ -7,6 +7,19 @@ is answered locally, without a request per CVE.
 
 Rows are written in batches under a new generation that only becomes current once the whole
 file parsed: a truncated or corrupt download is discarded and the previous copy stays in use.
+
+Criterion comments come in several wordings (all accepted, see ``_classify``)::
+
+    openssl package in noble was vulnerable but has been fixed (note: '3.0.13-0ubuntu3.6').
+    openssl source package in noble, was vulnerable but has been fixed (note: '...').
+    example-package source package in esm-apps/noble, is affected and has been fixed (...).
+    'linux-aws' kernel in noble is affected and has been fixed (note: '6.8.0-1015.16').
+
+``Is kernel 'linux-aws' running?`` only says when a kernel definition applies and is skipped.
+An Ubuntu Pro pocket (``esm-apps/``, ``esm-infra/``) is kept in the stored note as
+``pocket:<name>``; a statement for the release itself wins over one for its Pro pocket. If fewer
+than half of the vulnerability definitions hold a recognised statement the wording has changed:
+the download is discarded as "OVAL format not recognised (parser out of date)".
 """
 
 import bz2
@@ -25,7 +38,12 @@ from urllib.parse import urlsplit
 
 from ec2patcher.database import Database
 from ec2patcher.services import debversion, source_http
-from ec2patcher.services.security_metadata import CveRecord, format_age, status_entry
+from ec2patcher.services.security_metadata import (
+    PRO_PREFIXES,
+    CveRecord,
+    format_age,
+    status_entry,
+)
 from ec2patcher.services.server_state import SUPPORTED_RELEASES
 from ec2patcher.services.source_breaker import BreakerBoard
 
@@ -44,29 +62,58 @@ MAX_XML_BYTES = 8 * 1024 * 1024 * 1024
 BATCH_ROWS = 2000
 MAX_NOTE_CHARS = 200
 
+MIN_PARSED_SHARE = 0.5  # of the vulnerability definitions; below it the wording is unknown
+FORMAT_UNRECOGNISED = "OVAL format not recognised (parser out of date)"
+
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
-_COMMENT_RE = re.compile(
-    r"^(?:\(CVE-[\d-]+\)\s*)?(?P<package>[a-z0-9][a-z0-9+.-]*)(?P<rest>\s+package\b.*|:\s.*)$",
+_PACKAGE = r"[a-z0-9][a-z0-9+.-]*"
+_RELEASE = r"(?:(?P<pocket>esm-[a-z-]+)/)?(?P<codename>[a-z]+)\b"
+# "<pkg> source package in [esm-apps/]<codename>, <status>" (the current feed)
+_SOURCE_PACKAGE_RE = re.compile(
+    rf"^(?:\(CVE-[\d-]+\)\s*)?(?P<package>{_PACKAGE})\s+source\s+package\s+in\s+{_RELEASE}"
+    r",?\s*(?P<rest>.*)$",
     re.DOTALL,
 )
+# "'<kernel source>' kernel in [esm-infra/]<codename> <status>"
+_KERNEL_RE = re.compile(
+    rf"^['\"](?P<package>{_PACKAGE})['\"]\s+kernel\s+in\s+{_RELEASE},?\s*(?P<rest>.*)$",
+    re.DOTALL,
+)
+# The older wording: "<pkg> package in <codename> <status>", "<pkg>: <status>"
+_COMMENT_RE = re.compile(
+    rf"^(?:\(CVE-[\d-]+\)\s*)?(?P<package>{_PACKAGE})(?P<rest>\s+package\b.*|:\s.*)$",
+    re.DOTALL,
+)
+_APPLICABILITY_RE = re.compile(r"^is\s+kernel\b.*\brunning\b", re.IGNORECASE)
 _NOTE_RE = re.compile(r"\(note: '(?P<note>.*)'\)\.?\s*$", re.DOTALL)
 _TITLE_PRIORITY_RE = re.compile(r" - (\w+)\.?\s*$")
-# The wording of Canonical's criterion comments, first match wins. None: no statement.
+POCKET_PREFIX = "pocket:"
+# The wording of Canonical's criterion comments, first match wins (the note is not searched).
+# None: a recognised comment that makes no statement. "has been fixed" must come before the
+# generic phrases: "is affected and has been fixed" is a fix, not "affected".
 _STATUS_PHRASES = (
     ("does not exist", None),
     ("decision has been made to ignore", "ignored"),
     ("is not affected", "not-affected"),
+    ("was vulnerable but has been fixed", "released"),
+    ("is affected and has been fixed", "released"),
     ("has been fixed", "released"),
     ("pending publication", "pending"),
     ("defer", "deferred"),
+    ("might be affected and may need fixing", "needs-triage"),
     ("may need fixing", "needs-triage"),
     ("needs fixing", "needed"),
     ("affected", "needed"),
 )
+_UNKNOWN_PHRASE = object()
 
 
 class OvalParseError(ValueError):
     """The feed is not usable: nothing in it could be stored."""
+
+
+class OvalFormatError(OvalParseError):
+    """The feed downloaded fine but its wording is not understood: the parser is out of date."""
 
 
 @dataclass(frozen=True)
@@ -77,6 +124,9 @@ class OvalEntry:
     fixed_version: str | None = None  # released: the fix; pending: the version to be published
     note: str | None = None
     priority: str | None = None
+
+
+_Pairs = list[tuple[OvalEntry, str | None]]  # (entry, test reference) of one definition
 
 
 @dataclass(frozen=True)
@@ -90,21 +140,55 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _classify(comment: str) -> tuple[str, str | None, str | None] | None:
-    """(package, status, note) of one criterion comment; None if it makes no statement."""
-    match = _COMMENT_RE.match(" ".join(comment.split()))
+@dataclass(frozen=True)
+class _Statement:
+    package: str
+    status: str | None  # None: recognised, but no statement (the package does not exist)
+    note: str | None
+    pocket: str | None  # esm-apps / esm-infra; None: the release itself
+
+
+def _classify(comment: str) -> _Statement | None:
+    """The package statement of one criterion comment; None if the comment is not one (an
+    applicability check such as "Is kernel 'linux-aws' running?") or its wording is unknown."""
+    text = " ".join(comment.split())
+    if not text or _APPLICABILITY_RE.match(text):
+        return None
+    match = _SOURCE_PACKAGE_RE.match(text) or _KERNEL_RE.match(text) or _COMMENT_RE.match(text)
     if not match:
         return None
-    rest = match.group("rest").lower()
-    status = next((s for phrase, s in _STATUS_PHRASES if phrase in rest), None)
-    if status is None:
+    groups = match.groupdict()
+    rest = match.group("rest")
+    note = _NOTE_RE.search(rest)
+    wording = (rest[: note.start()] if note else rest).lower()
+    status = next((s for phrase, s in _STATUS_PHRASES if phrase in wording), _UNKNOWN_PHRASE)
+    if status is _UNKNOWN_PHRASE:
         return None
-    note = _NOTE_RE.search(match.group("rest"))
-    return match.group("package"), status, note.group("note").strip() if note else None
+    return _Statement(
+        package=match.group("package"),
+        status=status,
+        note=note.group("note").strip() if note else None,
+        pocket=groups.get("pocket"),
+    )
 
 
-def _definition_entries(definition: ET.Element) -> list[tuple[OvalEntry, str | None]]:
-    """The (entry, test reference) pairs of one CVE definition."""
+def _stored_note(note: str | None, pocket: str | None) -> str | None:
+    """The note column: Canonical's note, prefixed with the Pro pocket of the statement."""
+    if pocket:
+        note = f"{POCKET_PREFIX}{pocket}; {note}" if note else f"{POCKET_PREFIX}{pocket}"
+    return note[:MAX_NOTE_CHARS] if note else None
+
+
+def stored_pocket(note: str | None) -> str | None:
+    """The Pro pocket recorded by :func:`_stored_note`; None for the release itself."""
+    if not note or not note.startswith(POCKET_PREFIX):
+        return None
+    return note[len(POCKET_PREFIX) :].split(";", 1)[0].strip() or None
+
+
+def _definition_entries(definition: ET.Element) -> tuple[_Pairs, bool]:
+    """The (entry, test reference) pairs of one CVE definition, and whether any criterion in it
+    was a recognised package statement (for the format check of :func:`parse_oval`)."""
     cve = priority = title = None
     criteria = []
     for node in definition.iter():
@@ -120,29 +204,33 @@ def _definition_entries(definition: ET.Element) -> list[tuple[OvalEntry, str | N
     if not (cve and CVE_RE.fullmatch(cve)):
         found = CVE_RE.search(title or "")
         cve = found.group(0) if found else None
+    statements = [(_classify(comment), test_ref) for comment, test_ref in criteria]
+    recognised = any(statement is not None for statement, _ in statements)
     if not cve:
-        return []
+        return [], recognised
     if priority is None:
         found = _TITLE_PRIORITY_RE.search(title or "")
         priority = found.group(1) if found else None
-    entries: dict[str, tuple[OvalEntry, str | None]] = {}
-    for comment, test_ref in criteria:
-        statement = _classify(comment)
-        if statement is None:
+    entries: dict[str, tuple[OvalEntry, str | None, str | None]] = {}
+    for statement, test_ref in statements:
+        if statement is None or statement.status is None:
             continue
-        package, status, note = statement
+        status, note = statement.status, statement.note
         # A fix pending publication keeps its version too (cve_resolver: opt-in candidate check).
         version = note if status in ("released", "pending") and _is_version(note) else None
         entry = OvalEntry(
             cve=cve.upper(),
-            package=package,
+            package=statement.package,
             status=status,
             fixed_version=version,
-            note=note[:MAX_NOTE_CHARS] if note else None,
+            note=_stored_note(note, statement.pocket),
             priority=priority,
         )
-        entries.setdefault(package, (entry, test_ref))
-    return list(entries.values())
+        current = entries.get(statement.package)
+        # First statement per package wins, except that the release beats its Pro pocket.
+        if current is None or (current[2] and not statement.pocket):
+            entries[statement.package] = (entry, test_ref, statement.pocket)
+    return [(entry, test_ref) for entry, test_ref, _ in entries.values()], recognised
 
 
 def _is_version(text: str | None) -> bool:
@@ -153,10 +241,13 @@ def parse_oval(stream) -> Iterator[OvalEntry]:
     """The CVE statements of an OVAL XML stream. Parsed elements are discarded as it goes.
 
     The fixed version normally comes with the criterion's comment; a fixed package without one
-    takes it from the ``dpkginfo_state`` its test points to, later in the file."""
+    takes it from the ``dpkginfo_state`` its test points to, later in the file. Raises
+    :class:`OvalFormatError` at the end if fewer than ``MIN_PARSED_SHARE`` of the vulnerability
+    definitions held a recognised statement (Canonical changed the wording)."""
     waiting: dict[str, list[OvalEntry]] = {}  # test id -> entries that need its version
     state_tests: dict[str, str] = {}  # state id -> test id
     stack: list[ET.Element] = []
+    definitions = parsed = 0
     for event, element in ET.iterparse(stream, events=("start", "end")):  # noqa: S314 - see import
         if event == "start":
             stack.append(element)
@@ -164,7 +255,10 @@ def parse_oval(stream) -> Iterator[OvalEntry]:
         stack.pop()
         name = _local(element.tag)
         if name == "definition" and element.get("class", "vulnerability") == "vulnerability":
-            for entry, test_ref in _definition_entries(element):
+            pairs, recognised = _definition_entries(element)
+            definitions += 1
+            parsed += recognised
+            for entry, test_ref in pairs:
                 if entry.status == "released" and not entry.fixed_version and test_ref:
                     waiting.setdefault(test_ref, []).append(entry)
                 else:
@@ -185,6 +279,10 @@ def parse_oval(stream) -> Iterator[OvalEntry]:
             stack[-1].clear()
     for entries in waiting.values():
         yield from entries  # fixed, but Canonical names no version
+    if definitions and parsed < definitions * MIN_PARSED_SHARE:
+        raise OvalFormatError(
+            f"{FORMAT_UNRECOGNISED}: {parsed} of {definitions} vulnerability definitions parsed"
+        )
 
 
 class _Capped:
@@ -270,6 +368,9 @@ class OvalFeed:
             download.seek(0)
             try:
                 count = self._store(codename, download, check)
+            except OvalFormatError as exc:  # the download is fine; the parser is not
+                logger.error("oval_feed codename=%s format_unrecognised=true %s", codename, exc)
+                return self._keep(codename, age, str(exc))
             except (OSError, EOFError, ET.ParseError, ValueError) as exc:
                 logger.warning("oval_feed codename=%s corrupt=true error=%s", codename, exc)
                 return self._keep(codename, age, f"corrupt download discarded: {exc}")
@@ -336,9 +437,13 @@ class OvalFeed:
             return None
         record = CveRecord(cve=cve, origin=SOURCE)
         for row in rows:
+            pocket = stored_pocket(row["note"])
+            if pocket and pocket not in PRO_PREFIXES:
+                pocket = "esm-apps"  # an unknown esm-* pocket is still Ubuntu Pro, never standard
+            distro = f"{pocket}/{codename}" if pocket else codename  # esm-apps/noble: Ubuntu Pro
             record.entries.append(
                 status_entry(
-                    row["package"], row["fixed_version"], codename, row["status"], row["priority"]
+                    row["package"], row["fixed_version"], distro, row["status"], row["priority"]
                 )
             )
         age = self._age(self.db.get_source_feed(self.feed_name(codename)))

@@ -124,6 +124,16 @@ class OsAdapter(ABC):
     def is_kernel_package(self, name: str) -> bool:
         """A package whose fix only takes effect after a reboot."""
 
+    def space_check_command(self, remote_dir: str, filenames: list[str]) -> str | None:
+        """Read-only free-space pre-flight of the staged packages; None: the OS has none."""
+        return None
+
+    def space_problems(
+        self, stdout: str, remote_dir: str, deb_sizes: dict[str, int]
+    ) -> list[str] | None:
+        """Why the install would not fit (empty: it fits); None if the output is unusable."""
+        return None
+
     @abstractmethod
     def simulate_command(self, remote_dir: str, filenames: list[str]) -> str: ...
 

@@ -40,6 +40,7 @@ from ec2patcher.models import (
     CACHE_AMAZON,
     CACHE_CANONICAL,
     CACHE_NVD,
+    AnalysisRun,
     CacheStats,
     ServerAnalysis,
     StoredReport,
@@ -274,9 +275,16 @@ class AnalysisService:
             self._finish_cancelled(run_id, servers, overall)
             return
         total = len(servers)
+        # Unresolved CVEs and skipped sources: the run must not read as if nothing was missed.
+        gaps = run_gaps(self.db.get_analysis_run(run_id, details=True))
         if failures:
             overall.end(
-                run_events.DONE, f"Run finished: {failures} of {total} server(s) failed.",
+                run_events.DONE, f"Run finished: {failures} of {total} server(s) failed{gaps}.",
+                run_events.WARNING,
+            )  # fmt: skip
+        elif gaps:
+            overall.end(
+                run_events.DONE, f"Run finished: {total} server(s) analyzed{gaps}.",
                 run_events.WARNING,
             )  # fmt: skip
         else:
@@ -1067,6 +1075,67 @@ def bucket_groups(groups: list[RemediationGroup]) -> list[FindingBucket]:
     for group in groups:
         buckets[bucket_for_status(group.status)].groups.append(group)
     return list(buckets.values())
+
+
+MAX_WARNING_CVES = 10  # CVEs listed per reason in a run warning; the rest are counted
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def unresolved_cves(analyses: list[ServerAnalysis]) -> dict[str, list[str]]:
+    """CVE -> the reasons (per source, from ``failure_reason``) why no source resolved it."""
+    reasons: dict[str, set[str]] = {}
+    for analysis in analyses:
+        for f in analysis.findings:
+            if cve_resolver.current_status(f.status) == cve_resolver.METADATA_UNAVAILABLE:
+                reasons.setdefault(f.cve, set()).add(f.failure_reason or "no reason recorded")
+    return {cve: sorted(found) for cve, found in sorted(reasons.items())}
+
+
+def run_warnings(run: AnalysisRun, analyses: list[ServerAnalysis] | None = None) -> list[str]:
+    """Run-level warnings for the run banner and the xlsx export: the CVEs no source could
+    resolve (of ``analyses``, default every server of the run) with each source's reason, and
+    the sources the run skipped or found slow / degraded."""
+    unresolved = unresolved_cves(run.servers if analyses is None else analyses)
+    warnings = []
+    if unresolved:
+        by_reason: dict[str, list[str]] = {}
+        for cve, reasons in unresolved.items():
+            for reason in reasons:
+                by_reason.setdefault(reason, []).append(cve)
+        parts = []
+        for reason, cves in sorted(by_reason.items(), key=lambda item: (-len(item[1]), item[0])):
+            listed = ", ".join(cves[:MAX_WARNING_CVES])
+            if len(cves) > MAX_WARNING_CVES:
+                listed += f" and {len(cves) - MAX_WARNING_CVES} more"
+            parts.append(f"{listed} ({reason})")
+        head = f"{_plural(len(unresolved), 'CVE')} unresolved: no security data source answered"
+        warnings.append(f"{head}. " + "; ".join(parts))
+    for probe in run.skipped_sources:
+        warnings.append(
+            f"Source {probe['source']} ({probe.get('endpoint') or '-'}) was skipped for this run: "
+            f"{probe.get('reason') or 'blocked'}."
+        )
+    for probe in run.impaired_sources:
+        warnings.append(
+            f"Source {probe['source']} ({probe.get('endpoint') or '-'}) was {probe['state']} "
+            f"({probe.get('reason') or '-'}) but still used."
+        )
+    return warnings
+
+
+def run_gaps(run: AnalysisRun) -> str:
+    """A suffix for the run's end message: unresolved CVEs and skipped sources ("" if none)."""
+    parts = []
+    unresolved = unresolved_cves(run.servers)
+    if unresolved:
+        parts.append(f"{_plural(len(unresolved), 'CVE')} unresolved")
+    skipped = [p["source"] for p in run.skipped_sources]
+    if skipped:
+        parts.append(f"{_plural(len(skipped), 'source')} skipped ({', '.join(skipped)})")
+    return "".join(f"; {part}" for part in parts)
 
 
 def investigate_cves(analysis: ServerAnalysis) -> set[str]:

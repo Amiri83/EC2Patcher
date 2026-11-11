@@ -1219,7 +1219,25 @@ class PatchService:
             for p in ctx.packages
         }
 
+    def _check_space(self, ctx: _Context) -> None:
+        """Read-only pre-flight: refuse before anything is installed if the packages would not
+        fit on /, /boot or /usr/src. An unusable answer only adds a note: it never blocks."""
+        command = ctx.adapter.space_check_command(ctx.remote_dir, ctx.filenames)
+        if command is None:
+            return
+        result = self._step_remote(ctx, command, SHORT_TIMEOUT_SECONDS)
+        sizes = {name: ctx.debs[name]["size"] for name in ctx.filenames}
+        problems = None
+        if result.ok:
+            problems = ctx.adapter.space_problems(result.stdout, ctx.remote_dir, sizes)
+        if problems is None:
+            logger.warning("Patch execution %s: free-space check unusable", ctx.execution.id)
+            ctx.notes.append("The free-space check gave no usable answer; it was skipped.")
+        elif problems:
+            raise PatchAbort("Not enough free space for the install: " + " ".join(problems))
+
     def _simulate(self, ctx: _Context) -> None:
+        self._check_space(ctx)
         self._check_sudo(ctx)
         command = ctx.adapter.simulate_command(ctx.remote_dir, ctx.filenames)
         result = self._step_remote(ctx, command, SIMULATE_TIMEOUT_SECONDS)

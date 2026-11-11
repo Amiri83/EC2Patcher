@@ -325,6 +325,23 @@ class PatchReportRow:
     mirror: str | None = None  # the APT mirror(s) the analysis lookups used
 
 
+# State of a security data source probed at the start of a run (cve_sources.probe_all). Slow
+# (timed out) and degraded (HTTP 5xx) sources are still used; only a blocked one is skipped.
+PROBE_REACHABLE = "reachable"
+PROBE_SLOW = "slow"
+PROBE_DEGRADED = "degraded"
+PROBE_BLOCKED = "blocked"
+PROBE_STATES = (PROBE_REACHABLE, PROBE_SLOW, PROBE_DEGRADED, PROBE_BLOCKED)
+
+
+def probe_state(probe: dict) -> str:
+    """The state of one stored probe; runs from before the states only stored ``reachable``."""
+    state = probe.get("state")
+    if state in PROBE_STATES:
+        return state
+    return PROBE_REACHABLE if probe.get("reachable") else PROBE_BLOCKED
+
+
 @dataclass
 class AnalysisRun:
     id: int
@@ -348,7 +365,8 @@ class AnalysisRun:
     metadata_lookups: dict[str, str] = field(default_factory=dict)
     # Per cache (nvd / canonical / amazon): {"cache": n, "live": n, "failed": n} lookups.
     cache_stats: dict[str, dict[str, int]] = field(default_factory=dict)
-    # One per source probed at the start: {source, endpoint, reachable, reason, duration_ms}.
+    # One per source probed at the start: {source, endpoint, reachable, state, reason,
+    # duration_ms}; runs from before the probe states have no "state".
     source_probes: list[dict] = field(default_factory=list)
 
     @property
@@ -366,6 +384,21 @@ class AnalysisRun:
     @property
     def failed_lookups(self) -> list[str]:
         return sorted(cve for cve, outcome in self.metadata_lookups.items() if outcome == "failed")
+
+    @property
+    def probes(self) -> list[dict]:
+        """The source probes, each with its ``state`` filled in."""
+        return [{**p, "state": probe_state(p)} for p in self.source_probes if isinstance(p, dict)]
+
+    @property
+    def skipped_sources(self) -> list[dict]:
+        """Probes of the sources this run skipped (blocked)."""
+        return [p for p in self.probes if p["state"] == PROBE_BLOCKED]
+
+    @property
+    def impaired_sources(self) -> list[dict]:
+        """Probes of the sources that were slow or degraded, but still used."""
+        return [p for p in self.probes if p["state"] in (PROBE_SLOW, PROBE_DEGRADED)]
 
 
 CACHE_NVD, CACHE_CANONICAL, CACHE_AMAZON = "nvd", "canonical", "amazon"

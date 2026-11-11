@@ -178,6 +178,9 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
             metadata += f" · checked {format_timestamp(run.metadata_checked_at)}"
     else:
         metadata = "not available"
+    skipped = [p["source"] for p in run.skipped_sources]
+    if skipped:
+        metadata += f" · {len(skipped)} source(s) skipped ({', '.join(skipped)})"
     rows += [
         ("Canonical Security Metadata", metadata),
         ("Canonical Metadata Source", run.metadata_source or "-"),
@@ -185,6 +188,12 @@ def _summary_rows(run: AnalysisRun, analysis: ServerAnalysis) -> list[tuple[str,
     ]
     if run.metadata_warning:
         rows.append(("Canonical Metadata Warning", run.metadata_warning))
+    sources = ", ".join(f"{p['source']}: {p['state']}" for p in run.probes)
+    if sources:
+        rows.append(("Security Data Sources", sources))
+    warnings = analysis_service.run_warnings(run, [analysis])
+    if warnings:
+        rows.append(("Run Warnings", "\n".join(warnings)))
 
     if analysis.apt_updated_at:
         apt = f"Workstation private lists updated {format_timestamp(analysis.apt_updated_at)}"

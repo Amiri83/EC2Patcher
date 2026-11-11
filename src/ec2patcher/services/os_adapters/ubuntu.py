@@ -236,6 +236,15 @@ class UbuntuAdapter(OsAdapter):
     def is_kernel_package(self, name: str) -> bool:
         return bool(cve_resolver.KERNEL_REBOOT_RE.match(name))
 
+    def space_check_command(self, remote_dir: str, filenames: list[str]) -> str | None:
+        return patch_remote.space_check_command(remote_dir, filenames)
+
+    def space_problems(
+        self, stdout: str, remote_dir: str, deb_sizes: dict[str, int]
+    ) -> list[str] | None:
+        check = patch_remote.parse_space(stdout, remote_dir)
+        return None if check is None else patch_remote.space_problems(check, deb_sizes)
+
     def simulate_command(self, remote_dir: str, filenames: list[str]) -> str:
         return patch_remote.simulate_command(remote_dir, filenames)
 

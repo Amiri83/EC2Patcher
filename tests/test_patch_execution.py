@@ -84,13 +84,14 @@ def test_successful_patch_end_to_end(h):
     assert ex.state == ps.SUCCESS and ex.decision == ps.APPROVED
     assert ex.error_title is None and ex.failure_stage is None
     ops = h.fake.ops
-    # Order: revalidate -> sudo -> downloads -> remote staging -> scp -> verify -> sudo ->
-    # simulate -> install -> verify state -> cleanup.
+    # Order: revalidate -> sudo -> downloads -> remote staging -> scp -> verify -> free space ->
+    # sudo -> simulate -> install -> verify state -> cleanup.
     assert ops[:2] == ["hostname", "sudo"]
     fetches = [i for i, op in enumerate(ops) if op == "fetch"]
     assert len(fetches) == 6 and max(fetches) < ops.index("stage")
     assert ops[ops.index("stage") :] == [
-        "stage", "mark", *["scp"] * 6, "stat", "sudo", "simulate", "install", "post", "cleanup",
+        "stage", "mark", *["scp"] * 6, "stat", "installed-size", "sudo", "simulate",
+        "install", "post", "cleanup",
     ]  # fmt: skip
     # Versions: before / target / after all recorded and verified.
     pkgs = by_name(ex)
@@ -585,6 +586,34 @@ def test_simulation_apt_errors_block(h, error):
     h.fake.sim_rc = 100
     h.fake.sim_extra = [error]
     assert_simulation_blocked(h, h.approve(), error)
+
+
+# --- free-space pre-flight ---------------------------------------------------------------
+
+
+def test_a_full_boot_partition_stops_before_the_simulation(h):
+    h.fake.mounts["/boot"] = "/boot"
+    h.fake.free_kb["/boot"] = 100 * 1024  # no room for a new kernel image and its initrd
+    ex = h.approve()
+    assert_simulation_blocked(h, ex, "Not enough free space for the install")
+    assert "/boot (filesystem /boot)" in ex.error_summary
+    assert "sudo apt-get autoremove --purge" in ex.error_summary
+    assert "simulate" not in h.fake.ops
+    check = next(c for op, c in h.fake.calls if op == "installed-size")
+    assert "sudo" not in check and "autoremove" not in check  # only read, never removes
+
+
+def test_a_full_root_filesystem_counts_every_package(h):
+    h.fake.free_kb["/"] = 50 * 1024
+    ex = h.approve()
+    assert_simulation_blocked(h, ex, "/, /boot, /usr/src (filesystem /)")
+
+
+def test_an_unusable_free_space_answer_does_not_block(h):
+    h.fake.space_output = "dpkg-deb: command not found\n"
+    ex = h.approve()
+    assert ex.state == ps.SUCCESS
+    assert any("free-space check gave no usable answer" in n for n in ex.notes)
 
 
 # --- install -----------------------------------------------------------------------------
