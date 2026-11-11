@@ -314,6 +314,21 @@ def test_reanalyze_keeps_previous_results_when_server_is_unreachable(setup, meta
     assert "Re-analysis at" in good.warnings[-1] and "refused" in good.warnings[-1]
 
 
+def test_reanalyze_logs_complete_only_on_success(setup, metadata, caplog):
+    run = run_analysis(setup, metadata, ScriptedSSH())
+    good = run.servers[0]
+    caplog.set_level("INFO", logger="ec2patcher.services.analysis_service")
+    service = AnalysisService(setup, metadata, runner=ScriptedSSH(), starter=sync)
+    assert service.reanalyze_server(run.id, good.id)
+    assert f"Re-analysis of {good.server_name} complete" in caplog.text
+
+    caplog.clear()
+    refused = ScriptedSSH(failures={GOOD_IP: (255, "ssh: connect to host port 22: refused")})
+    AnalysisService(setup, metadata, runner=refused, starter=sync).reanalyze_server(run.id, good.id)
+    assert f"Re-analysis of {good.server_name} complete" not in caplog.text
+    assert f"Re-analysis of {good.server_name} failed" in caplog.text
+
+
 def test_reanalyze_refused_while_running_or_for_foreign_server(setup, metadata):
     run = run_analysis(setup, metadata, ScriptedSSH())
     other = run_analysis(setup, metadata, ScriptedSSH())

@@ -161,7 +161,7 @@ class UbuntuAdapter(OsAdapter):
                     source=source,
                     status="unresolved",
                     reason=f"Unable to resolve package download plan: {error}",
-                    reboot_impact=impact or "No reboot expected",
+                    reboot_impact=impact or cve_resolver.no_reboot_label(name),
                     requests_reboot=impact is not None,
                     cves=sorted(cves_by_source.get(source, set())),
                 )

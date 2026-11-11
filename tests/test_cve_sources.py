@@ -849,7 +849,62 @@ def test_a_5xx_notices_page_fails_after_the_one_retry(db):
 
     source = usn_notices.UsnNotices(db, fetcher=fetch, now=Clock(), sleep=lambda s: None)
     assert "could not refresh (HTTP 503)" in source.refresh()
-    assert len(calls) == 2
+    # an outage, not one bad notice: the split gives up after MAX_SKIPS_PER_RUN, nothing moves on
+    assert len(calls) < 20
+    feed = db.get_source_feed("notices")
+    assert not feed["complete"] and feed["next_offset"] == 0
+    assert db.count_usn_notices() == 0
+
+
+def unservable(total, bad, calls=None):
+    """``paged`` whose API answers 503 for any page that includes an offset in ``bad``."""
+    inner = paged(total)
+
+    def fetch(url):
+        if calls is not None:
+            calls.append(url)
+        query = dict(part.split("=") for part in url.split("?")[1].split("&"))
+        offset, limit = int(query["offset"]), int(query["limit"])
+        if any(offset <= b < offset + limit for b in bad):
+            raise HTTPError(url, 503, "Service Unavailable", None, None)
+        return inner(url)
+
+    return fetch
+
+
+def test_a_notice_the_api_cannot_serve_is_isolated_and_skipped(db, caplog):
+    calls = []
+    source = usn_notices.UsnNotices(
+        db, fetcher=unservable(45, {25}, calls), now=Clock(), sleep=lambda s: None
+    )
+    caplog.set_level("WARNING", logger="ec2patcher.services.usn_notices")
+    message = source.refresh()
+    assert "44 notices stored" in message and "1 unservable skipped" in message
+    assert db.count_usn_notices() == 44
+    assert source.lookup("CVE-2000-0024", "noble") is not None
+    assert source.lookup("CVE-2000-0026", "noble") is not None
+    assert "skipped offset=25" in caplog.text
+    assert db.get_source_feed("notices")["complete"]
+    assert len(calls) < 20  # halves down to one notice, not one request per notice
+
+
+def test_a_bad_notice_on_the_last_short_page_still_finishes(db):
+    source = usn_notices.UsnNotices(
+        db, fetcher=unservable(23, {21}), now=Clock(), sleep=lambda s: None
+    )
+    source.refresh()
+    assert db.count_usn_notices() == 22
+    assert db.get_source_feed("notices")["complete"]
+
+
+def test_a_resumed_run_gets_past_the_page_that_always_failed(db):
+    db.put_source_feed("notices", fetched_at=None, complete=False, next_offset=40)
+    source = usn_notices.UsnNotices(
+        db, fetcher=unservable(65, {47}), now=Clock(), sleep=lambda s: None
+    )
+    source.refresh()
+    feed = db.get_source_feed("notices")
+    assert feed["complete"] and db.count_usn_notices() == 24  # 40..64 without 47
 
 
 def test_run_page_and_export_show_unresolved_cves_and_source_states(web, db_path, pem_file):

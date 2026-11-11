@@ -24,6 +24,7 @@ Requests go through urllib's ``ProxyHandler``, built per request, so ``HTTPS_PRO
 ``NO_PROXY`` from the environment are always honored.
 """
 
+import http.client
 import json
 import logging
 import re
@@ -41,6 +42,7 @@ from urllib.parse import urlsplit
 from ec2patcher import config
 from ec2patcher.database import Database
 from ec2patcher.models import FROM_CACHE, FROM_LIVE, LOOKUP_FAILED, CacheStats, record_source
+from ec2patcher.services import source_http
 from ec2patcher.services.server_state import SUPPORTED_RELEASES
 from ec2patcher.services.source_breaker import CLOSED, HALF_OPEN, SourceBreaker
 
@@ -260,11 +262,11 @@ def http_get(url: str, timeout: float | None = None) -> dict:
     request = urllib.request.Request(url, headers={"User-Agent": "ec2patcher"})  # noqa: S310
     opener = urllib.request.build_opener(urllib.request.ProxyHandler())
     timeout = REQUEST_TIMEOUT_SECONDS if timeout is None else timeout
-    with opener.open(request, timeout=timeout) as response:
-        raw = response.read(MAX_RESPONSE_BYTES + 1)
-    if len(raw) > MAX_RESPONSE_BYTES:
-        raise ValueError("Canonical CVE response is unexpectedly large")
-    return json.loads(raw)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return source_http.read_json(response, MAX_RESPONSE_BYTES)
+    except http.client.HTTPException as exc:
+        raise source_http.IncompleteResponse(f"incomplete response: {exc}") from exc
 
 
 Fetcher = Callable[[str], dict]
@@ -482,8 +484,11 @@ class SecurityMetadata:
                     return None
                 error: OSError = exc
                 retryable = exc.code == 429 or exc.code >= 500
-            except OSError as exc:  # URLError, timeouts, connection errors
+            except OSError as exc:  # URLError, timeouts, connection errors, cut-off bodies
                 error, retryable = exc, True
+            except json.JSONDecodeError as exc:  # a fetcher that parses itself: same as cut off
+                error = source_http.IncompleteResponse(f"unparseable response: {exc}")
+                retryable = True
             else:
                 self._network_ok()
                 record = parse_cve_document(doc, cve)  # ValueError: not a network failure

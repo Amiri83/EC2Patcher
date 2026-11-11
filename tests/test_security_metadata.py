@@ -15,7 +15,7 @@ from phase2_fixtures import facts_output, online_fetcher
 from ec2patcher import config
 from ec2patcher.database import Database
 from ec2patcher.services import cve_resolver as cr
-from ec2patcher.services import security_metadata
+from ec2patcher.services import security_metadata, source_http
 from ec2patcher.services.security_metadata import (
     MetadataUnreachable,
     SecurityMetadata,
@@ -825,3 +825,102 @@ def test_http_get_honors_no_proxy(local_http, monkeypatch):
         assert local_http.paths == ["/security/cves/CVE-2026-50001.json"]  # direct request
     finally:
         dead.close()
+
+
+# --- cut-off downloads ------------------------------------------------------------------
+
+
+class _Truncating(http.server.BaseHTTPRequestHandler):
+    """Announces the full body, sends only part of it, then closes the connection."""
+
+    def do_GET(self):  # noqa: N802 - http.server API
+        body = json.dumps(SUDO_DOC).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body[: len(body) // 2])
+        self.wfile.flush()
+        self.close_connection = True
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def truncating_http(monkeypatch):
+    for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Truncating)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}/security/cves/CVE-2026-50001.json"
+    server.shutdown()
+    server.server_close()
+
+
+def test_http_get_reports_a_cut_off_body_as_a_transfer_failure(truncating_http):
+    with pytest.raises(source_http.IncompleteResponse) as excinfo:
+        security_metadata.http_get(truncating_http)
+    assert isinstance(excinfo.value, OSError)  # retried like a timeout, never parsed
+
+
+class _Response:
+    def __init__(self, body: bytes, headers: dict):
+        self.body, self.headers = body, headers
+
+    def read(self, amount):
+        return self.body[:amount]
+
+
+def test_read_json_checks_content_length_and_parse():
+    body = json.dumps(SUDO_DOC).encode()
+    assert source_http.read_json(_Response(body, {"Content-Length": str(len(body))}), 10**6)
+    with pytest.raises(source_http.IncompleteResponse, match="incomplete response"):
+        source_http.read_json(_Response(body[:-40], {"Content-Length": str(len(body))}), 10**6)
+    with pytest.raises(source_http.IncompleteResponse, match="unparseable"):
+        source_http.read_json(_Response(body[:-40], {}), 10**6)  # no length: the parse catches it
+    # a compressed body's length is not the decoded length: only the parse decides
+    with pytest.raises(source_http.IncompleteResponse, match="unparseable"):
+        source_http.read_json(
+            _Response(body[:-40], {"Content-Length": "1", "Content-Encoding": "gzip"}), 10**6
+        )
+    with pytest.raises(ValueError, match="unexpectedly large"):
+        source_http.read_json(_Response(body, {}), 10)
+
+
+@pytest.mark.parametrize(
+    "cut_off",
+    [
+        source_http.IncompleteResponse("incomplete response: 1570000 of 1770000 bytes"),
+        json.JSONDecodeError("Expecting property name enclosed in double quotes", "{", 1),
+    ],
+)
+def test_cut_off_lookup_is_retried_and_resolves(cut_off):
+    calls, sleeps = [], []
+    replies = [cut_off]
+
+    def fetch(url):
+        calls.append(url)
+        if replies:
+            raise replies.pop(0)
+        return SUDO_DOC
+
+    meta = SecurityMetadata(fetcher=fetch, backoff=1.0, sleep=sleeps.append)
+    assert meta.lookup("CVE-2026-50001") is not None
+    assert len(calls) == 2 and sleeps == [1.0]
+    assert meta.run_outcomes() == {"CVE-2026-50001": "ok"}
+    assert not meta.breaker_open
+
+
+def test_cut_off_on_every_attempt_fails_after_the_retries():
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        raise source_http.IncompleteResponse("incomplete response: 10 of 20 bytes")
+
+    meta = SecurityMetadata(fetcher=fetch, sleep=lambda s: None)
+    with pytest.raises(source_http.IncompleteResponse):
+        meta.lookup("CVE-2026-50001")
+    assert len(calls) == meta.attempts

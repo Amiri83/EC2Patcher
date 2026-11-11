@@ -338,3 +338,33 @@ def test_reports_never_suggest_updating_apt_on_the_server():
     for html in (render_report(rows), render_run_page(rows)):
         assert "apt-get update" not in html and "sudo" not in html
         assert "NOT CURRENT" not in html and "stale-apt-hint" not in html
+
+
+def test_kernel_flavours_not_installed_fold_into_one_row_per_cve():
+    cve = "CVE-2026-00042"
+    relevant = [
+        finding(1, cve=cve, source_package="linux-aws", status=cr.ALREADY_FIXED),
+        finding(2, cve=cve, source_package="linux", status=cr.PATCH_AVAILABLE),
+    ]
+    flavours = [
+        finding(10 + i, cve=cve, source_package=f"linux-flavour{i:02d}",
+                fixed=f"6.8.0-{100 + i}.1", status=cr.PACKAGE_NOT_INSTALLED,
+                installed_version=None, binary_packages=[])
+        for i in range(49)
+    ]  # fmt: skip
+    groups = remediation_groups([*flavours[:20], *relevant, *flavours[20:]])
+    assert len(groups) == 3
+    folded = [g for g in groups if g.not_installed_sources]
+    assert len(folded) == 1
+    (group,) = folded
+    assert group.status == cr.PACKAGE_NOT_INSTALLED and group.cves == [cve]
+    assert len(group.not_installed_sources) == 49 and group.source is None
+    assert group.fixed_version is None  # each flavour has its own fix
+    buckets = {b.key: b for b in bucket_groups(groups)}
+    assert buckets[NO_ACTION].count == 2  # ALREADY_FIXED + one folded row, not 50
+
+
+def test_a_single_not_installed_row_is_not_folded():
+    rows = [finding(1, status=cr.PACKAGE_NOT_INSTALLED, installed_version=None)]
+    (group,) = remediation_groups(rows)
+    assert group.source == "sample-source" and group.not_installed_sources == []

@@ -510,6 +510,7 @@ class AnalysisService:
         elif not error:
             if self.db.get_server_analysis(analysis_id).status != UNSUPPORTED:
                 self.db.update_server_analysis(analysis_id, error=None)
+            logger.info("Re-analysis of %s complete", label)
         elif analysis.status == "complete" and not os_adapters.is_blocker(error):
             # the previous results are still stored (a dpkg blocker invalidates their plan)
             logger.warning("Re-analysis of %s failed: %s", label, error)
@@ -924,6 +925,9 @@ class RemediationGroup:
     kev: bool | None = None  # any CVE of the group is listed; None: not known
     epss: float | None = None  # the highest score of the group
     mirrors: list[str] = field(default_factory=list)  # the APT mirror(s) its lookups used
+    # One CVE's PACKAGE_NOT_INSTALLED rows (kernel flavours: azure, gcp, ...) folded into one
+    # group: the source packages, none of them installed. Empty for any other group.
+    not_installed_sources: list[str] = field(default_factory=list)
 
     @property
     def kev_label(self) -> str:
@@ -948,7 +952,14 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
     """
     grouped: dict[tuple[str, str, str], list] = {}
     ungrouped = []
+    not_installed: dict[str, list] = {}  # CVE -> its PACKAGE_NOT_INSTALLED rows
     for finding in findings:
+        if finding.status == cve_resolver.PACKAGE_NOT_INSTALLED:
+            not_installed.setdefault(finding.cve, []).append(finding)
+    folded = {cve for cve, rows in not_installed.items() if len(rows) > 1}
+    for finding in findings:
+        if finding.status == cve_resolver.PACKAGE_NOT_INSTALLED and finding.cve in folded:
+            continue
         if finding.source_package and finding.fixed_version:
             key = (finding.source_package, finding.fixed_version, finding.status)
             grouped.setdefault(key, []).append(finding)
@@ -956,8 +967,10 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
             ungrouped.append([finding])
 
     result = []
-    for rows in [*([grouped[key] for key in sorted(grouped)]), *ungrouped]:
+    folded_rows = [not_installed[cve] for cve in sorted(folded)]
+    for rows in [*([grouped[key] for key in sorted(grouped)]), *ungrouped, *folded_rows]:
         first = rows[0]
+        is_folded = any(rows is r for r in folded_rows)
         versions = [f.installed_version for f in rows if f.installed_version]
         candidates = []
         for f in rows:
@@ -976,7 +989,7 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
         scores = [f.epss for f in rows if f.epss is not None]
         result.append(
             RemediationGroup(
-                source=first.source_package,
+                source=None if is_folded else first.source_package,
                 cves=sorted({f.cve for f in rows}),
                 cve_count=len({f.cve for f in rows}),
                 severity=min((normalize_severity(f.severity) for f in rows), key=SEVERITIES.index),
@@ -984,7 +997,7 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
                 cvss_label=highest.cvss_label,
                 ubuntu_priority=next((f.priority for f in rows if f.priority), None),
                 installed_version=_oldest(versions) if versions else None,
-                fixed_version=first.fixed_version,
+                fixed_version=None if is_folded else first.fixed_version,
                 candidate_version=(
                     max(candidates, key=debversion.version_key) if candidates else None
                 ),
@@ -1000,6 +1013,11 @@ def remediation_groups(findings: list) -> list[RemediationGroup]:
                 epss=max(scores) if scores else None,
                 mirrors=sorted(
                     {m for f in rows for m in (getattr(f, "mirror", None) or "").split("; ") if m}
+                ),
+                not_installed_sources=(
+                    sorted({f.source_package for f in rows if f.source_package})
+                    if is_folded
+                    else []
                 ),
             )
         )
