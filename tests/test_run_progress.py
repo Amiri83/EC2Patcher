@@ -31,7 +31,7 @@ REPORT = {
     "ip-10-0-0-2": ["CVE-2000-0003"],
     "ip-10-0-0-3": ["CVE-2000-0004"],
 }
-TINY = 0.05  # seconds; only ever spent on a call that is hung on purpose
+TINY = 0.5  # seconds; spent on a call hung on purpose, but real steps must fit on slow CI
 
 
 def sync(fn):
@@ -493,12 +493,12 @@ def test_hung_ssh_step_times_out_and_the_run_moves_on(setup, metadata, released)
     )
     assert run.status == "completed_with_errors" and not run.is_running
     first, second, third = run.servers
-    assert first.status == "failed" and "timed out after 0.05 s" in first.error
+    assert first.status == "failed" and f"timed out after {TINY:g} s" in first.error
     assert second.status == "complete" and third.status == "complete"
     rows = events_of(setup, run.id, NAMES[0])
     failed = [r for r in rows if r["phase"] == run_events.OPEN_SSH and r["level"] == "error"]
     assert len(failed) == 1
-    assert "Open SSH/SCP" in failed[0]["message"] and "0.05 s" in failed[0]["message"]
+    assert "Open SSH/SCP" in failed[0]["message"] and f"{TINY:g} s" in failed[0]["message"]
     assert failed[0]["duration_ms"] is not None
     assert first_seen(rows)[-1] == run_events.FAILED
     assert first_seen(events_of(setup, run.id, NAMES[1]))[-1] == run_events.DONE
@@ -893,7 +893,7 @@ def test_timeout_before_the_install_fails_the_step_and_never_installs(queue, rel
     # Patch All keeps its rule: the queue stops at the first failed server.
     assert q.state == ps.QUEUE_STOPPED
     execution = queue.db.get_execution(q.items[0].execution_id)
-    assert execution.state == ps.FAILED and "timed out after 0.05 s" in execution.error_summary
+    assert execution.state == ps.FAILED and f"timed out after {TINY:g} s" in execution.error_summary
     assert "install" not in queue.fake("srv-a").ops
     rows = events_of(queue.db, q.id, "srv-a", kind=run_events.KIND_QUEUE)
     failed = [r for r in rows if r["level"] == "error"]
