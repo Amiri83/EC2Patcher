@@ -16,6 +16,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 
+from ec2patcher.formatting import format_size
 from ec2patcher.services import debversion
 from ec2patcher.services.apt_planner import PKG_NAME_RE, parse_simulation
 from ec2patcher.services.server_state import MARK, split_sections
@@ -199,6 +200,109 @@ def parse_verify_transfer(stdout: str, remote_dir: str) -> dict[str, RemoteFile]
         if m and m.group(2).startswith(prefix):
             files.setdefault(m.group(2)[len(prefix) :], RemoteFile()).sha256 = m.group(1)
     return files
+
+
+# --- free space -----------------------------------------------------------------------
+
+# Where the files of a package mostly land: a kernel image in /boot (plus the initrd that its
+# postinst generates there), headers in /usr/src, everything else (modules too) in /.
+SPACE_PATHS = ("/", "/boot", "/usr/src")
+KERNEL_IMAGE_RE = re.compile(r"^linux-image-")
+KERNEL_HEADERS_RE = re.compile(r"^linux-headers-")
+INITRD_ALLOWANCE_KB = 128 * 1024  # per new kernel image
+SPACE_MARGIN_KB = 64 * 1024  # per filesystem, at least ...
+SPACE_MARGIN_RATIO = 0.2  # ... or this share of what the packages need there
+UNKNOWN_SIZE_FACTOR = 4  # .deb without a readable Installed-Size: its size times this
+AUTOREMOVE_HINT = (
+    "Free space first, e.g. remove old kernels with 'sudo apt-get autoremove --purge' "
+    "(review the list it shows), then patch again."
+)
+
+
+def space_check_command(remote_dir: str, filenames: list[str]) -> str:
+    """Read-only, no sudo: the Installed-Size of every staged .deb and the free space of the
+    filesystems of /, /boot and /usr/src."""
+    paths = " ".join(_q(p) for p in _deb_paths(remote_dir, filenames))
+    mounts = " ".join(_q(p) for p in SPACE_PATHS)
+    return (
+        f"echo '{MARK}installed-size'; for f in {paths}; do "
+        'printf "%s\\t%s\\n" "$f" "$(dpkg-deb -f "$f" Installed-Size 2>/dev/null)"; done; '
+        f"echo '{MARK}df'; for p in {mounts}; do "
+        'printf "%s\\t%s\\n" "$p" "$(df -Pk -- "$p" 2>/dev/null | tail -n 1)"; done; '
+        f"echo '{MARK}end'"
+    )
+
+
+@dataclass
+class SpaceCheck:
+    installed_kb: dict[str, int]  # staged file name -> Installed-Size (KiB), when readable
+    filesystems: dict[str, tuple[str, int]]  # path -> (mount point, available KiB)
+
+
+def parse_space(stdout: str, remote_dir: str) -> SpaceCheck | None:
+    """None if the output is incomplete or names no filesystem of /."""
+    sections = split_sections(stdout)
+    if "end" not in sections:
+        return None
+    prefix = f"{remote_dir}/"
+    installed: dict[str, int] = {}
+    for line in sections.get("installed-size", []):
+        path, _, size = line.strip().partition("\t")
+        if path.startswith(prefix) and size.strip().isdigit():
+            installed[path[len(prefix) :]] = int(size.strip())
+    filesystems: dict[str, tuple[str, int]] = {}
+    for line in sections.get("df", []):
+        path, _, row = line.strip().partition("\t")
+        # Filesystem 1024-blocks Used Available Capacity Mounted-on (-P: always one line)
+        fields = row.split(None, 5)
+        if path in SPACE_PATHS and len(fields) == 6 and fields[3].isdigit():
+            filesystems[path] = (fields[5], int(fields[3]))
+    if "/" not in filesystems:
+        return None
+    return SpaceCheck(installed, filesystems)
+
+
+def _landing_path(filename: str) -> str:
+    package = filename.split("_", 1)[0]
+    if KERNEL_IMAGE_RE.match(package):
+        return "/boot"
+    return "/usr/src" if KERNEL_HEADERS_RE.match(package) else "/"
+
+
+def space_problems(check: SpaceCheck, deb_sizes: dict[str, int]) -> list[str]:
+    """Why the staged packages would not fit, per filesystem (empty: they fit).
+
+    ``deb_sizes``: staged file name -> .deb size in bytes (the estimate when Installed-Size
+    could not be read). /boot and /usr/src count towards / when they are on it."""
+    need: dict[str, int] = {}  # mount point -> KiB
+    paths: dict[str, list[str]] = {}  # mount point -> the checked paths on it
+    root = check.filesystems["/"][0]
+    for path in SPACE_PATHS:
+        mount = check.filesystems.get(path, (root, 0))[0]
+        paths.setdefault(mount, []).append(path)
+    for filename, size in deb_sizes.items():
+        kb = check.installed_kb.get(filename)
+        if kb is None:
+            kb = size * UNKNOWN_SIZE_FACTOR // 1024
+        path = _landing_path(filename)
+        if path == "/boot":
+            kb += INITRD_ALLOWANCE_KB
+        mount = check.filesystems.get(path, (root, 0))[0]
+        need[mount] = need.get(mount, 0) + kb
+    free = {mount: kb for mount, kb in check.filesystems.values()}
+    problems = []
+    for mount, kb in need.items():
+        required = kb + max(SPACE_MARGIN_KB, int(kb * SPACE_MARGIN_RATIO))
+        if free.get(mount, 0) < required:
+            problems.append(
+                f"{', '.join(paths[mount])} (filesystem {mount}): "
+                f"{format_size(free.get(mount, 0) * 1024)} free, about "
+                f"{format_size(required * 1024)} needed "
+                f"({format_size(kb * 1024)} for the packages plus a margin)."
+            )
+    if problems:
+        problems.append(AUTOREMOVE_HINT)
+    return problems
 
 
 # --- simulation and install ----------------------------------------------------------

@@ -27,7 +27,7 @@
       {% endif %}</dd>
     {% if run.source_probes %}
     <dt>Security data sources</dt>
-    <dd class="source-probes">{% for p in run.source_probes %}<span class="badge {{ 'badge-success' if p.reachable else 'badge-warning' }}"{% if p.reason %} title="{{ p.reason }}"{% endif %}>{{ p.source }}{% if not p.reachable %}: blocked{% endif %}</span> {% endfor %}</dd>
+    <dd class="source-probes">{% for p in run.probes %}<span class="badge {{ {'reachable': 'badge-success', 'blocked': 'badge-danger'}.get(p.state, 'badge-warning') }} probe-{{ p.state }}"{% if p.reason %} title="{{ p.reason }}"{% endif %}>{{ p.source }}{% if p.state == "blocked" %}: blocked{% elif p.state != "reachable" %}: {{ p.state }}, still used{% endif %}</span> {% endfor %}</dd>
     {% endif %}
     <dt>Cache lookups</dt>
     <dd>{% set r = run %}{% include "_cache_stats.html" %}</dd>
@@ -36,6 +36,7 @@
     <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>
   {% endif %}
   {% if run.metadata_warning %}<div class="alert alert-warning">{{ run.metadata_warning }}</div>{% endif %}
+  {% for w in run_warnings %}<div class="alert alert-warning run-warning">{{ w }}</div>{% endfor %}
   {% if run.error %}<div class="alert alert-error">{{ run.error }}</div>{% endif %}
   <p class="muted small">Read-only analysis. No packages were downloaded, copied or installed, and nothing was restarted.</p>
 </div>

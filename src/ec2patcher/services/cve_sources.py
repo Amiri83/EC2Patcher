@@ -1,15 +1,20 @@
 """The multi-source CVE resolver: OVAL -> USN notices -> changelog -> per-CVE JSON.
 
-At the start of a run every source is probed in parallel (one small request each); a blocked
-source is skipped for the run, with its reason recorded, instead of being retried per CVE. Data
-already stored from a blocked source is still used. The first source that answers resolves the
-CVE, recorded as ``CveRecord.origin``; when none does, the reason says which source failed.
+At the start of a run every source is probed in parallel (one small request each). A probe that
+times out is retried once with a longer timeout; a source that is still silent is only *slow*,
+and one that answers HTTP 5xx is *degraded*: both are still used, their own breakers stopping
+them if the real requests fail too. Only a clear refusal (DNS failure, connection refused, HTTP
+403 from a proxy, ...) *blocks* a source: it is skipped for the run, with its reason recorded,
+instead of being retried per CVE. Data already stored from a blocked source is still used.
+The first source that answers resolves the CVE, recorded as ``CveRecord.origin``; when none
+does, the reason says which source failed.
 Circuit breakers are per source and endpoint: no source ever disables another (source_breaker).
 
 NVD, KEV and EPSS are only probed here: they supply priority and never a status.
 """
 
 import logging
+import re
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -17,6 +22,7 @@ from time import monotonic
 from urllib.parse import urlsplit
 
 from ec2patcher.database import Database
+from ec2patcher.models import PROBE_BLOCKED, PROBE_DEGRADED, PROBE_REACHABLE, PROBE_SLOW
 from ec2patcher.services import (
     changelog_source,
     enrichment,
@@ -54,7 +60,8 @@ def probe_targets(changelog_mirror: str = SECURITY_MIRROR) -> tuple[tuple[str, s
     """(source, URL) of every probe; the changelog one asks the mirror the changelog reads."""
     return (
         (OVAL, oval_feed.URL.format(codename=_PROBE_RELEASE)),
-        (NOTICES, f"{usn_notices.URL}?limit=1&offset=0"),
+        # The URL shape of the first page refresh() reads: "?limit=1" got a cached 503.
+        (NOTICES, f"{usn_notices.URL}?limit={usn_notices.PAGE_SIZE}&offset=0"),
         (CHANGELOG, f"{changelog_mirror}/dists/{_PROBE_RELEASE}-security/Release"),
         (CVE_JSON, API_URL.format(cve=_PROBE_CVE)),
         (NVD, f"{nvd.API_URL}?cveId={_PROBE_CVE}"),
@@ -69,17 +76,48 @@ MAX_CHANGELOG_PACKAGES_PER_CVE = 5
 MAX_REASON_CHARS = 300
 
 
+_HTTP_5XX_RE = re.compile(r"^HTTP 5\d\d$")
+NO_ANSWER = "no answer within"
+
+
+def probe_state(reason: str | None) -> str:
+    """What a probe's answer (source_http.probe: None, or why it failed) says about the source.
+    A timeout is only slow and an HTTP 5xx only degraded; any other failure (DNS, connection
+    refused, HTTP 403, ...) is a clear refusal that blocks the source for the run."""
+    if reason is None:
+        return PROBE_REACHABLE
+    if "timed out" in reason.lower() or reason.startswith(NO_ANSWER):
+        return PROBE_SLOW
+    if _HTTP_5XX_RE.match(reason):
+        return PROBE_DEGRADED
+    return PROBE_BLOCKED
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     source: str
     endpoint: str
-    reachable: bool
+    reachable: bool  # answered normally
     reason: str | None = None
     duration_ms: int = 0
+    state: str = ""  # PROBE_*; "" = derived from ``reachable``
+
+    @property
+    def status(self) -> str:
+        return self.state or (PROBE_REACHABLE if self.reachable else PROBE_BLOCKED)
+
+    @property
+    def blocked(self) -> bool:
+        """Skipped for this run; a slow or degraded source is still used."""
+        return self.status == PROBE_BLOCKED
 
     @property
     def message(self) -> str:
-        state = "reachable" if self.reachable else f"blocked: {self.reason}, skipped for this run"
+        state = {
+            PROBE_REACHABLE: "reachable",
+            PROBE_SLOW: f"slow ({self.reason}), still used for this run",
+            PROBE_DEGRADED: f"degraded ({self.reason}), still used for this run",
+        }.get(self.status, f"blocked: {self.reason}, skipped for this run")
         return f"{self.source} ({self.endpoint}): {state}"
 
     def as_dict(self) -> dict:
@@ -87,6 +125,7 @@ class ProbeResult:
             "source": self.source,
             "endpoint": self.endpoint,
             "reachable": self.reachable,
+            "state": self.status,
             "reason": self.reason,
             "duration_ms": self.duration_ms,
         }
@@ -104,38 +143,72 @@ def _no_note(message: str, level: str = "info") -> None:
     return None
 
 
-def probe_all(
+def _probe_wave(
+    executor: ThreadPoolExecutor,
     prober: Callable[[str, float], str | None],
+    urls: list[str],
     timeout: float,
-    targets: tuple[tuple[str, str], ...] | None = None,
-) -> list[ProbeResult]:
-    """Probe every source in parallel; one that does not answer in time counts as blocked."""
-    targets = PROBE_TARGETS if targets is None else targets
+) -> list[tuple[str | None, int]]:
+    """(reason, duration in ms) of every URL, probed in parallel within ``timeout``."""
 
     def one(url: str) -> tuple[str | None, int]:
         started = monotonic()
         try:
             reason = prober(url, timeout)
-        except Exception as exc:  # noqa: BLE001 - a broken probe is a blocked source
+        except Exception as exc:  # noqa: BLE001 - a broken probe is a failed probe
             reason = source_http.describe_error(exc)
         return reason, int((monotonic() - started) * 1000)
 
-    executor = ThreadPoolExecutor(max_workers=len(targets), thread_name_prefix="source-probe")
-    futures = [executor.submit(one, url) for _, url in targets]
+    futures = [executor.submit(one, url) for url in urls]
     wait(futures, timeout=timeout + PROBE_GRACE_SECONDS)
+    silent = (f"{NO_ANSWER} {timeout:g} s", int(timeout * 1000))
+    return [future.result() if future.done() else silent for future in futures]
+
+
+def probe_all(
+    prober: Callable[[str, float], str | None],
+    timeout: float,
+    targets: tuple[tuple[str, str], ...] | None = None,
+    retry_timeout: float | None = None,
+) -> list[ProbeResult]:
+    """Probe every source in parallel. One that times out is probed once more with
+    ``retry_timeout`` (default ``source_http.PROBE_RETRY_TIMEOUT_SECONDS``); if that fails too
+    it is slow, not blocked (see :func:`probe_state`)."""
+    targets = PROBE_TARGETS if targets is None else targets
+    if retry_timeout is None:
+        retry_timeout = source_http.PROBE_RETRY_TIMEOUT_SECONDS
+    # Twice the workers: a hung first probe must not hold up its retry.
+    executor = ThreadPoolExecutor(max_workers=2 * len(targets), thread_name_prefix="source-probe")
+    try:
+        first = _probe_wave(executor, prober, [url for _, url in targets], timeout)
+        slow = [i for i, (reason, _) in enumerate(first) if probe_state(reason) == PROBE_SLOW]
+        retried: dict[int, tuple[str | None, int]] = {}
+        if slow and retry_timeout > timeout:
+            answers = _probe_wave(executor, prober, [targets[i][1] for i in slow], retry_timeout)
+            retried = dict(zip(slow, answers, strict=True))
+    finally:
+        executor.shutdown(wait=False)
     results = []
-    for (source, url), future in zip(targets, futures, strict=True):
+    for index, (source, url) in enumerate(targets):
         endpoint = urlsplit(url).hostname or ""
-        if future.done():
-            reason, duration = future.result()
-        else:
-            reason, duration = f"no answer within {timeout:g} s", int(timeout * 1000)
-        results.append(ProbeResult(source, endpoint, reason is None, reason, duration))
+        reason, duration = first[index]
+        state = probe_state(reason)
+        if index in retried:
+            again, again_ms = retried[index]
+            duration += again_ms
+            if again is None:
+                reason = f"answered only on a retry with a {retry_timeout:g} s timeout"
+            elif probe_state(again) == PROBE_SLOW:
+                reason = f"{reason}; no answer within {retry_timeout:g} s on a retry either"
+            else:
+                state, reason = probe_state(again), again
+        results.append(
+            ProbeResult(source, endpoint, state == PROBE_REACHABLE, reason, duration, state)
+        )
         logger.info(
-            "source_probe source=%s endpoint=%s reachable=%s duration_ms=%d reason=%s",
-            source, endpoint, reason is None, duration, reason,
+            "source_probe source=%s endpoint=%s state=%s duration_ms=%d reason=%s",
+            source, endpoint, state, duration, reason,
         )  # fmt: skip
-    executor.shutdown(wait=False)
     return results
 
 
@@ -152,8 +225,10 @@ class SourceResolver:
         breakers: BreakerBoard | None = None,
         probe_timeout: float = source_http.PROBE_TIMEOUT_SECONDS,
         repos: Callable[[], object] | None = None,
+        probe_retry_timeout: float | None = None,
     ):
-        """``repos``: the APT repository settings (apt_repos) of the changelog source."""
+        """``repos``: the APT repository settings (apt_repos) of the changelog source.
+        ``probe_retry_timeout``: of the retry of a probe that timed out (None: the default)."""
         self.db, self.metadata = db, metadata
         self.breakers = breakers or BreakerBoard()
         self.oval = oval or oval_feed.OvalFeed(db, self.breakers)
@@ -161,6 +236,7 @@ class SourceResolver:
         self.changelog = changelog or changelog_source.ChangelogSource(self.breakers, repos=repos)
         self.priority = priority or enrichment.Enrichment(db, self.breakers)
         self.prober, self.probe_timeout = prober, probe_timeout
+        self.probe_retry_timeout = probe_retry_timeout
         self.probes: dict[str, ProbeResult] = {}
         self._reset()
 
@@ -176,7 +252,9 @@ class SourceResolver:
         self.priority.start_run()
         mirror = self._changelog_mirror(_PROBE_RELEASE, _PROBE_ARCHITECTURE) or SECURITY_MIRROR
         targets = probe_targets(mirror)
-        results = probe_all(self.prober or source_http.probe, self.probe_timeout, targets)
+        results = probe_all(
+            self.prober or source_http.probe, self.probe_timeout, targets, self.probe_retry_timeout
+        )
         self.probes = {r.source: r for r in results}
         reason = self.blocked(CVE_JSON)
         if reason:
@@ -189,9 +267,10 @@ class SourceResolver:
         return mirror(codename, architecture) if callable(mirror) else None
 
     def blocked(self, source: str) -> str | None:
-        """Why ``source`` is skipped this run; None if it was reachable or not probed."""
+        """Why ``source`` is skipped this run; None if it is used (reachable, slow or degraded)
+        or was not probed."""
         probe = self.probes.get(source)
-        return probe.reason if probe and not probe.reachable else None
+        return probe.reason if probe and probe.blocked else None
 
     def clear(self) -> bool:
         """Forget all stored source data (Clear Security Cache)."""

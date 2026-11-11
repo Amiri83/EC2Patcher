@@ -224,6 +224,11 @@ class FakeUbuntu:
         self.install_versions: dict[str, str] = {}  # package -> version actually installed
         self.cleanup_fail = False
         self.skip: set[str] = set()  # packages apt 'installs' without effect
+        # free-space pre-flight: path -> mount point, mount point -> available KiB
+        self.mounts = {"/": "/", "/boot": "/", "/usr/src": "/"}
+        self.free_kb = {"/": 20 * 1024 * 1024}
+        self.installed_kb: dict[str, int] = {}  # package -> Installed-Size (default 1024)
+        self.space_output: str | None = None  # replaces the whole answer when set
         # reboot: ok | refused (sudo denied) | never-returns (SSH stays down) | ignored
         # (command accepted but the server keeps running on the same boot)
         self.reboot_mode = "ok"
@@ -358,6 +363,21 @@ class FakeUbuntu:
             sha_lines.append(f"{sha(data)}  {d}/{name}")
         out = ["@@EC2P stat", *stat_lines, "@@EC2P sha256", *sha_lines, "@@EC2P end"]
         return _done(args, "\n".join(out) + "\n")
+
+    def _op_installed_size(self, args, command):
+        assert "sudo" not in command  # read-only, no privileges
+        if self.space_output is not None:
+            return _done(args, self.space_output)
+        d = self._dir(command)
+        lines = ["@@EC2P installed-size"]
+        for name in self._files(command):
+            package = self.debs[name][0]
+            lines.append(f"{d}/{name}\t{self.installed_kb.get(package, 1024)}")
+        lines.append("@@EC2P df")
+        for path, mount in self.mounts.items():
+            lines.append(f"{path}\t/dev/root 41000000 1000 {self.free_kb[mount]} 1% {mount}")
+        lines.append("@@EC2P end")
+        return _done(args, "\n".join(lines) + "\n")
 
     def _op_simulate(self, args, command):
         plain = command.replace("'", "")

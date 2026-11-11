@@ -14,13 +14,17 @@ via argument-list subprocesses. Lint/format: ruff (line length 100).
 - `src/ec2patcher/app.py` – all routes; `main.py` – CLI; `config.py` – paths/env vars
 - `src/ec2patcher/database.py` – schema, `_MIGRATIONS`, `SCHEMA_VERSION`, all queries
 - `src/ec2patcher/services/` – `analysis_service` (runs), `cve_resolver` (statuses/plan),
-  `cve_sources` (resolver chain, source probes), `oval_feed`, `usn_notices`, `changelog_source`,
+  `cve_sources` (resolver chain, source probes: reachable / slow / degraded / blocked),
+  `oval_feed` (every criterion wording of Canonical's feed has one definition in
+  `tests/fixtures/oval_forms.cve.oval.xml`; a feed mostly not understood is refused as
+  "parser out of date"), `usn_notices`, `changelog_source`,
   `security_metadata` (per-CVE JSON, last resort), `source_breaker` (per-source breakers),
   `source_http` (their HTTP), `enrichment` (KEV, EPSS),
   `nvd` (CVSS), `local_apt`/`apt_planner` (workstation APT), `apt_repos` (Settings → APT
   Repositories: mirror URLs with `${codename}`, keyring, changelog via mirrors, opt-in fallbacks;
   validation, sources.list preview, InRelease test),
-  `patch_service`/`patch_remote`/`downloader`/`staging` (patching), `ssh_service`,
+  `patch_service`/`patch_remote`/`downloader`/`staging` (patching; read-only free-space
+  pre-flight before the simulation), `ssh_service`,
   `ssm_service` (SSH over SSM: ProxyCommand, preflight, instance IDs, status),
   `ssm_plugin` (app-managed session-manager-plugin: detection, PATH, install),
   `aws_config` (read-only AWS CLI config: profiles, their regions; region list, form choices),

@@ -306,21 +306,35 @@ Needs no configuration. Each Ubuntu CVE is resolved by the first source that ans
 
 | # | Source (as shown in reports) | What it is |
 | --- | --- | --- |
-| 1 | `oval` | Canonical's OVAL feed (`security-metadata.canonical.com/oval/com.ubuntu.<codename>.cve.oval.xml.bz2`), one file per release found on the run's servers, stored in SQLite, refreshed after 24 h. A network failure is retried twice (after 2 s, then 4 s); a corrupt or truncated download is discarded and the previous copy stays in use. CVEs are then answered locally, without a request per CVE. The version of a fix *pending publication* is kept too. |
-| 2 | `notices` | USNs from `ubuntu.com/security/notices.json`: paged, stored, refreshed after 24 h. The first download may span several runs (each gives it up to 2 minutes). Also supplies the USN and title of the report: a CVE in several USNs keeps them all, and the report shows the one for the server's release, then the latest, then the highest number. |
+| 1 | `oval` | Canonical's OVAL feed (`security-metadata.canonical.com/oval/com.ubuntu.<codename>.cve.oval.xml.bz2`), one file per release found on the run's servers, stored in SQLite, refreshed after 24 h. A network failure is retried twice (after 2 s, then 4 s); a corrupt or truncated download is discarded and the previous copy stays in use. CVEs are then answered locally, without a request per CVE. The version of a fix *pending publication* is kept too. Criterion wordings understood: `<pkg> source package in <codename>, <status>`, the same in `esm-apps/` / `esm-infra/<codename>` (kept as an Ubuntu Pro statement; the release's own statement wins), `'<kernel source>' kernel in <codename> <status>` (and the older `<pkg> package in <codename> <status>`); `Is kernel '…' running?` is only an applicability check. If fewer than half of the vulnerability definitions parse, the download is kept out with **OVAL format not recognised (parser out of date)**. |
+| 2 | `notices` | USNs from `ubuntu.com/security/notices.json`: paged, stored, refreshed after 24 h. The first download may span several runs (each gives it up to 2 minutes). A page answered with HTTP 5xx (often a cached error page) is asked once more with a `nocache=` query parameter. Also supplies the USN and title of the report: a CVE in several USNs keeps them all, and the report shows the one for the server's release, then the latest, then the highest number. |
 | 3 | `changelog` | `changelog.Debian.gz` of the package's candidate `.deb` on `security.ubuntu.com` (`ports.ubuntu.com` for arm64), or on the configured security / ports mirror with **Use mirrors for changelog** ([APT mirrors](#corporate-networks-apt-mirrors-and-proxies)). The oldest entry mentioning the CVE is the fix version. Bounded per run, one read per package, and only for packages already linked to the CVE (pasted list, other releases, USNs). |
 | 4 | `cve-json` | The per-CVE `ubuntu.com/security/cves/<CVE>.json`, as a last resort, with a 5 s timeout. |
 
-When a run starts, every source (and NVD, KEV, EPSS) is probed in parallel with one small request.
-The progress panel shows one line per source; a blocked one is skipped for that run, with its reason
-recorded, while data already stored from it is still used. Circuit breakers are per source and
-endpoint, half-open with a doubling backoff and held in memory: a blocked `ubuntu.com` never disables
-`security.ubuntu.com`, NVD, KEV or EPSS.
+When a run starts, every source (and NVD, KEV, EPSS) is probed in parallel with one small request
+(5 s timeout, `source_http.PROBE_TIMEOUT_SECONDS`; the notices probe asks the same
+`?limit=20&offset=0` page the refresh reads first). The progress panel and the run page show each
+source as:
+
+- **reachable**;
+- **slow**: the probe timed out, and again on its one retry with a 15 s timeout
+  (`PROBE_RETRY_TIMEOUT_SECONDS`), or only answered on that retry. Still used;
+- **degraded**: HTTP 5xx. Still used;
+- **blocked**: a clear refusal (DNS failure, connection refused, HTTP 403 from a proxy, ...). Skipped
+  for that run, with its reason recorded, while data already stored from it is still used.
+
+A slow or degraded source that keeps failing is stopped by its own circuit breaker. Circuit breakers
+are per source and endpoint, half-open with a doubling backoff and held in memory: a blocked
+`ubuntu.com` never disables `security.ubuntu.com`, NVD, KEV or EPSS.
 
 **Unresolved CVEs** are summed up as `Unresolved: N (reason: count, ...)`, each reason naming the
 source that failed. They do not block the resolved plan: patching one server or Patch All asks for an
 explicit confirmation of how many CVEs stay unresolved. An analysis error (a required package mapping
-failed) still blocks.
+failed) still blocks. A run with unresolved CVEs or skipped sources says so: its end event is a
+warning (`...; 2 CVEs unresolved; 1 source skipped (oval)`), the run page shows a warning banner
+listing the CVEs with each source's reason and the skipped / slow / degraded sources, the
+metadata tally names the skipped sources, and the `.xlsx` Summary has `Security Data Sources` and
+`Run Warnings` rows.
 
 **Priority only, never the status**: CISA's KEV catalogue (one file, cached 24 h) and FIRST's EPSS
 scores (batches of 50 CVEs, cached 24 h) join the NVD CVSS severity. They are best-effort and get at
@@ -390,7 +404,12 @@ executed, and each approved analysis only once. The pipeline stops at the first 
 2. **Download** each approved `.deb` from its recorded URI; keep it only if size and SHA256
    match the plan.
 3. **Transfer** with `scp` to `/tmp/<server name>` and verify size + `sha256sum` (one retry).
-4. **Simulate** `apt-get -s install <explicit .deb paths>`: must install exactly the approved
+4. **Simulate**: first a read-only free-space check (no sudo): the `Installed-Size` of every
+   staged `.deb` (`dpkg-deb -f`) against the free space (`df -Pk`) of `/`, `/boot` (kernel images
+   plus 128 MiB for the initrd) and `/usr/src` (headers), paths on one filesystem adding up, plus
+   a margin (20 %, at least 64 MiB). Too little space stops the patch before anything is
+   installed, suggesting `sudo apt-get autoremove --purge` for old kernels; an unusable answer is
+   only noted. Then `apt-get -s install <explicit .deb paths>`: must install exactly the approved
    packages/versions, with no removal or downgrade.
 5. **Install** `sudo -n apt-get install -y <explicit .deb paths>` with no remote APT sources,
    `--no-remove`, `DEBIAN_FRONTEND=noninteractive`, `NEEDRESTART_MODE=l`.

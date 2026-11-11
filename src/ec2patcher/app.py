@@ -905,6 +905,7 @@ def create_app(
             eligible_count = sum(c.allowed for _, c in patcher.queue_preview(run))
         return render(
             request, "analysis_run.html", "analysis", run=run, summaries=summaries,
+            run_warnings=analysis_service.run_warnings(run),
             notice=notice_from_query(request), patch_running=patcher.is_running,
             latest_queue_id=db.latest_queue_id(run_id), eligible_count=eligible_count,
         )  # fmt: skip

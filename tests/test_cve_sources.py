@@ -19,8 +19,9 @@ from phase3_fixtures import IP, SERVER, FakeFetcher, FakeUbuntu, make_analysis
 
 from ec2patcher.app import create_app
 from ec2patcher.database import _MIGRATIONS, SCHEMA_VERSION, Database
-from ec2patcher.models import PatchReportRow
+from ec2patcher.models import PatchReportRow, probe_state
 from ec2patcher.services import (
+    analysis_service,
     changelog_source,
     cve_resolver,
     cve_sources,
@@ -574,7 +575,7 @@ def test_changelog_miss_then_cve_json(db):
 
 def test_every_source_failing_records_the_reason_with_the_source(db):
     def probe(url, timeout):
-        return "HTTP 504" if "/security/cves/" in url or "oval" in url else None
+        return "HTTP 403" if "/security/cves/" in url or "oval" in url else None
 
     meta = SecurityMetadata(db, fetcher=fail_lookup)
     resolver = chain(db, prober=probe, meta=meta)
@@ -584,8 +585,8 @@ def test_every_source_failing_records_the_reason_with_the_source(db):
     (finding,) = findings
     assert finding.status == cve_resolver.METADATA_UNAVAILABLE
     assert finding.resolution_source is None
-    assert "oval: blocked (HTTP 504)" in finding.failure_reason
-    assert "cve-json: blocked (HTTP 504)" in finding.failure_reason
+    assert "oval: blocked (HTTP 403)" in finding.failure_reason
+    assert "cve-json: blocked (HTTP 403)" in finding.failure_reason
 
 
 def test_the_resolved_record_marks_its_source_on_the_findings(db):
@@ -608,20 +609,20 @@ def test_the_resolved_record_marks_its_source_on_the_findings(db):
 def test_probe_one_result_per_source_with_the_reason(db):
     def probe(url, timeout):
         assert timeout == cve_sources.source_http.PROBE_TIMEOUT_SECONDS
-        return "HTTP 504" if url.startswith("https://ubuntu.com/security/cves/") else None
+        return "HTTP 403" if url.startswith("https://ubuntu.com/security/cves/") else None
 
     results = cve_sources.probe_all(probe, cve_sources.source_http.PROBE_TIMEOUT_SECONDS)
     assert [r.source for r in results] == [
         "oval", "notices", "changelog", "cve-json", "nvd", "kev", "epss",
     ]  # fmt: skip
     blocked = [r for r in results if not r.reachable]
-    assert [(r.source, r.endpoint, r.reason) for r in blocked] == [
-        ("cve-json", "ubuntu.com", "HTTP 504")
+    assert [(r.source, r.endpoint, r.reason, r.status) for r in blocked] == [
+        ("cve-json", "ubuntu.com", "HTTP 403", "blocked")
     ]
-    assert "blocked: HTTP 504" in blocked[0].message
+    assert "blocked: HTTP 403" in blocked[0].message
 
 
-def test_probes_run_in_parallel_and_a_silent_source_counts_as_blocked(monkeypatch):
+def test_probes_run_in_parallel_and_a_silent_source_is_slow_not_blocked(monkeypatch):
     import threading
 
     monkeypatch.setattr(cve_sources, "PROBE_GRACE_SECONDS", 0.2)
@@ -632,10 +633,13 @@ def test_probes_run_in_parallel_and_a_silent_source_counts_as_blocked(monkeypatc
             release.wait(5)
         return None
 
-    results = {r.source: r for r in cve_sources.probe_all(probe, 0.05)}
+    results = {r.source: r for r in cve_sources.probe_all(probe, 0.05, retry_timeout=0.1)}
     release.set()
-    assert not results["epss"].reachable and "no answer within" in results["epss"].reason
-    assert results["oval"].reachable
+    epss = results["epss"]
+    assert epss.status == "slow" and not epss.blocked and not epss.reachable
+    assert "no answer within 0.05 s" in epss.reason and "0.1 s on a retry" in epss.reason
+    assert "still used for this run" in epss.message
+    assert results["oval"].reachable and results["oval"].status == "reachable"
 
 
 def test_a_failing_probe_is_a_blocked_source_not_an_error():
@@ -685,7 +689,7 @@ def test_blocked_cve_json_makes_no_request_per_cve(db, tmp_path):
         raise OSError("must not be asked")
 
     def probe(url, timeout):
-        return "HTTP 504" if "/security/cves/" in url else None
+        return "HTTP 403" if "/security/cves/" in url else None
 
     meta = SecurityMetadata(db, fetcher=fetch)
     meta.start_run()
@@ -693,7 +697,7 @@ def test_blocked_cve_json_makes_no_request_per_cve(db, tmp_path):
     for cve in ("CVE-2000-0001", "CVE-2000-0002"):
         with pytest.raises(OSError, match="blocked for this run") as caught:
             resolver.lookup(cve, facts())
-        assert "cve-json: blocked (HTTP 504)" in caught.value.failure_reason
+        assert "cve-json: blocked (HTTP 403)" in caught.value.failure_reason
     assert calls == []
     meta.start_run()  # the next run tries again
     with pytest.raises(OSError, match="must not be asked"):
@@ -702,7 +706,7 @@ def test_blocked_cve_json_makes_no_request_per_cve(db, tmp_path):
 
 def test_analysis_run_records_probes_as_events_and_on_the_run(db, pem_file, monkeypatch):
     def probe(url, timeout):
-        return "HTTP 504" if "/security/cves/" in url else None
+        return "HTTP 403" if "/security/cves/" in url else None
 
     monkeypatch.setattr(cve_sources.source_http, "probe", probe)
     db.create_server("ip-10-0-0-1", "192.0.2.1", str(pem_file))
@@ -715,12 +719,169 @@ def test_analysis_run_records_probes_as_events_and_on_the_run(db, pem_file, monk
     probes = [r for r in rows if r["phase"] == run_events.PROBE_SOURCES]
     assert len(probes) == 7 and all(r["server"] is None for r in probes)
     blocked = next(r for r in probes if r["message"].startswith("cve-json"))
-    assert blocked["level"] == "warning" and "HTTP 504" in blocked["message"]
+    assert blocked["level"] == "warning" and "HTTP 403" in blocked["message"]
     assert {p["source"]: p["reachable"] for p in run.source_probes}["cve-json"] is False
+    assert {p["source"]: p["state"] for p in run.source_probes}["cve-json"] == "blocked"
     # Blocked per-CVE JSON and offline OVAL: unresolved with the reason, no request per CVE.
     (finding,) = run.servers[0].findings
     assert finding.status == cve_resolver.METADATA_UNAVAILABLE
-    assert "cve-json: blocked (HTTP 504)" in finding.failure_reason
+    assert "cve-json: blocked (HTTP 403)" in finding.failure_reason
+    # ... and the run says so instead of finishing as if nothing had been missed.
+    warnings = analysis_service.run_warnings(run)
+    assert any("1 CVE unresolved" in w and "CVE-2026-63076" in w for w in warnings)
+    assert any("cve-json" in w and "skipped" in w for w in warnings)
+    end = [r for r in rows if r["phase"] == run_events.DONE and r["server"] is None][-1]
+    assert end["level"] == "warning" and "1 CVE unresolved" in end["message"]
+    assert "1 source skipped (cve-json)" in end["message"]
+
+
+# --- slow, degraded and blocked sources -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reason, state",
+    [
+        (None, "reachable"),
+        ("timed out", "slow"),
+        ("The read operation timed out", "slow"),
+        ("no answer within 5 s", "slow"),
+        ("HTTP 503", "degraded"),
+        ("HTTP 504", "degraded"),
+        ("HTTP 403", "blocked"),
+        ("[Errno -2] Name or service not known", "blocked"),
+        ("[Errno 111] Connection refused", "blocked"),
+        ("Tunnel connection failed: 403 Forbidden", "blocked"),
+    ],
+)
+def test_probe_state_hard_blocks_only_clear_refusals(reason, state):
+    assert cve_sources.probe_state(reason) == state
+
+
+def test_a_probe_that_times_out_is_retried_with_a_longer_timeout():
+    timeouts = []
+
+    def probe(url, timeout):
+        if "/security/cves/" in url:
+            timeouts.append(timeout)
+            return "timed out" if len(timeouts) == 1 else None
+        return None
+
+    results = {r.source: r for r in cve_sources.probe_all(probe, 5)}
+    assert timeouts == [5, cve_sources.source_http.PROBE_RETRY_TIMEOUT_SECONDS] == [5, 15]
+    cve_json = results["cve-json"]
+    assert cve_json.status == "slow" and not cve_json.blocked
+    assert "answered only on a retry with a 15 s timeout" in cve_json.reason
+    assert cve_json.as_dict()["state"] == "slow"
+
+
+def test_a_refused_retry_blocks_and_other_sources_are_not_retried():
+    calls = []
+
+    def probe(url, timeout):
+        calls.append(url)
+        if "/security/cves/" in url:
+            return "timed out" if calls.count(url) == 1 else "[Errno 111] Connection refused"
+        return "HTTP 403" if "first.org" in url else None
+
+    results = {r.source: r for r in cve_sources.probe_all(probe, 5)}
+    assert results["cve-json"].blocked and "Connection refused" in results["cve-json"].reason
+    assert results["epss"].blocked and len(calls) == len(cve_sources.PROBE_TARGETS) + 1
+
+
+def test_slow_or_degraded_cve_json_is_still_asked(db):
+    for reason in ("timed out", "HTTP 503"):
+        calls = []
+
+        def fetch(url, calls=calls):
+            calls.append(url)
+            return {"id": "CVE-2000-0001", "packages": []}
+
+        def probe(url, timeout, reason=reason):
+            return reason if "/security/cves/" in url else None
+
+        meta = SecurityMetadata(db, fetcher=fetch, pace=0)
+        meta.start_run()
+        resolver = chain(db, prober=probe, meta=meta)
+        assert resolver.blocked("cve-json") is None
+        assert resolver.lookup("CVE-2000-0001", facts()).origin == "cve-json"
+        assert len(calls) == 1
+        meta.clear()
+
+
+def test_notices_probe_uses_the_page_shape_of_the_refresh():
+    url = dict(cve_sources.probe_targets())["notices"]
+    assert url == "https://ubuntu.com/security/notices.json?limit=20&offset=0"
+
+
+def test_a_degraded_notices_source_is_still_refreshed(db):
+    def probe(url, timeout):
+        return "HTTP 503" if "notices.json" in url else None
+
+    notices = usn_notices.UsnNotices(db, fetcher=lambda url: NOTICES, now=Clock())
+    resolver = chain(db, notices=notices, prober=probe)
+    assert resolver.probes["notices"].status == "degraded"
+    assert resolver.blocked("notices") is None
+    resolver.prepare("noble")
+    assert db.count_usn_notices() == 2
+
+
+def test_a_5xx_notices_page_is_retried_once_past_the_caches(db):
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        if usn_notices.CACHE_BUSTER not in url:
+            raise HTTPError(url, 503, "Service Unavailable", None, None)
+        return NOTICES
+
+    source = usn_notices.UsnNotices(db, fetcher=fetch, now=Clock(), sleep=lambda s: None)
+    assert "notices stored" in source.refresh()
+    assert len(calls) == 2 and calls[1].startswith(calls[0] + f"&{usn_notices.CACHE_BUSTER}=")
+    assert db.count_usn_notices() == 2
+
+
+def test_a_5xx_notices_page_fails_after_the_one_retry(db):
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        raise HTTPError(url, 503, "Service Unavailable", None, None)
+
+    source = usn_notices.UsnNotices(db, fetcher=fetch, now=Clock(), sleep=lambda s: None)
+    assert "could not refresh (HTTP 503)" in source.refresh()
+    assert len(calls) == 2
+
+
+def test_run_page_and_export_show_unresolved_cves_and_source_states(web, db_path, pem_file):
+    db = Database(db_path)
+    analysis = unresolved_analysis(db, pem_file)
+    probes = [
+        cve_sources.ProbeResult("oval", "example.invalid", False, "HTTP 403", 5, "blocked"),
+        cve_sources.ProbeResult("cve-json", "ubuntu.com", False, "timed out", 5, "slow"),
+        cve_sources.ProbeResult("kev", "example.invalid", True, None, 5, "reachable"),
+    ]
+    db.update_analysis_run(analysis.run_id, source_probes=[p.as_dict() for p in probes])
+    page = web.get(f"/analysis/{analysis.run_id}").text
+    assert "1 CVE unresolved" in page and "CVE-2000-0001 (cve-json: HTTP 504)" in page
+    assert "Source oval (example.invalid) was skipped for this run: HTTP 403." in page
+    assert "Source cve-json (ubuntu.com) was slow (timed out) but still used." in page
+    assert "oval: blocked" in page and "cve-json: slow, still used" in page
+    assert "1 security data source skipped for this run (oval)" in page
+    url = f"/analysis/{analysis.run_id}/servers/{analysis.id}/export.xlsx"
+    wb = load_workbook(io.BytesIO(web.get(url).content))
+    summary = {r[0]: r[1] for r in wb["Summary"].iter_rows(min_row=5, values_only=True) if r[0]}
+    assert "1 CVE unresolved" in summary["Run Warnings"]
+    assert "cve-json: HTTP 504" in summary["Run Warnings"]
+    assert "oval" in summary["Run Warnings"] and "skipped" in summary["Run Warnings"]
+    assert summary["Security Data Sources"] == "oval: blocked, cve-json: slow, kev: reachable"
+    assert "1 source(s) skipped (oval)" in summary["Canonical Security Metadata"]
+
+
+def test_runs_from_before_the_probe_states_still_read():
+    run = cve_sources.ProbeResult("oval", "example.invalid", False, "HTTP 504").as_dict()
+    del run["state"]
+    assert probe_state(run) == "blocked"
+    assert probe_state({"source": "kev", "reachable": True}) == "reachable"
 
 
 # --- breakers ---------------------------------------------------------------------------------

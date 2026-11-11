@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Trimmed: one definition per criterion wording of Canonical's OVAL CVE feed (placeholders). -->
+<oval_definitions xmlns="http://oval.mitre.org/XMLSchema/oval-definitions-5" xmlns:linux="http://oval.mitre.org/XMLSchema/oval-definitions-5#linux">
+  <definitions>
+    <definition class="inventory" id="oval:com.ubuntu.noble:def:100" version="1">
+      <metadata><title>Check that Ubuntu 24.04 LTS (noble) is installed.</title></metadata>
+      <criteria><criterion test_ref="oval:com.ubuntu.noble:tst:100" comment="The host is part of the unix family."/></criteria>
+    </definition>
+    <!-- "<pkg> source package in <codename>, <status>" -->
+    <definition class="vulnerability" id="oval:com.ubuntu.noble:def:101" version="1">
+      <metadata>
+        <title>CVE-2000-0101 on Ubuntu 24.04 LTS (noble) - medium</title>
+        <reference source="CVE" ref_id="CVE-2000-0101" ref_url="https://ubuntu.com/security/CVE-2000-0101"/>
+        <advisory><severity>Medium</severity></advisory>
+      </metadata>
+      <criteria>
+        <extend_definition definition_ref="oval:com.ubuntu.noble:def:100" comment="Ubuntu 24.04 LTS (noble) is installed." applicability_check="true"/>
+        <criteria operator="OR">
+          <criterion test_ref="oval:com.ubuntu.noble:tst:1" comment="example-package source package in noble, was vulnerable but has been fixed (note: '1.2.3-1ubuntu0.1')."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:2" comment="curl source package in noble, is affected and has been fixed (note: '8.5.0-2ubuntu10.5')."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:3" comment="vim source package in noble, might be affected and may need fixing."/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:4" comment="sudo source package in noble, is affected and needs fixing."/>
+        </criteria>
+      </criteria>
+    </definition>
+    <!-- "<pkg> source package in esm-apps/<codename>, <status>"; the release beats its pocket -->
+    <definition class="vulnerability" id="oval:com.ubuntu.noble:def:102" version="1">
+      <metadata>
+        <title>CVE-2000-0102 on Ubuntu 24.04 LTS (noble) - low</title>
+        <reference source="CVE" ref_id="CVE-2000-0102"/>
+      </metadata>
+      <criteria operator="OR">
+        <criterion test_ref="oval:com.ubuntu.noble:tst:5" comment="example-package source package in esm-apps/noble, is affected and has been fixed (note: '2.0-1ubuntu0.1~esm1')."/>
+        <criterion test_ref="oval:com.ubuntu.noble:tst:6" comment="openssl source package in esm-infra/noble, was vulnerable but has been fixed (note: '3.0.13-0ubuntu3.9+esm1')."/>
+        <criterion test_ref="oval:com.ubuntu.noble:tst:7" comment="openssl source package in noble, is affected and needs fixing."/>
+      </criteria>
+    </definition>
+    <!-- "'<kernel source>' kernel in <codename> <status>", AND-paired with "Is kernel ... running?" -->
+    <definition class="vulnerability" id="oval:com.ubuntu.noble:def:103" version="1">
+      <metadata>
+        <title>CVE-2000-0103 on Ubuntu 24.04 LTS (noble) - high</title>
+        <reference source="CVE" ref_id="CVE-2000-0103"/>
+      </metadata>
+      <criteria operator="OR">
+        <criteria operator="AND">
+          <criterion test_ref="oval:com.ubuntu.noble:tst:20" comment="Is kernel 'linux-aws' running?"/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:21" comment="'linux-aws' kernel in noble is affected and has been fixed (note: '6.8.0-1015.16')."/>
+        </criteria>
+        <criteria operator="AND">
+          <criterion test_ref="oval:com.ubuntu.noble:tst:22" comment="Is kernel 'linux' running?"/>
+          <criterion test_ref="oval:com.ubuntu.noble:tst:23" comment="'linux' kernel in noble might be affected and may need fixing."/>
+        </criteria>
+      </criteria>
+    </definition>
+    <!-- kernel fixed without a note: the version comes from the state of its test -->
+    <definition class="vulnerability" id="oval:com.ubuntu.noble:def:104" version="1">
+      <metadata>
+        <title>CVE-2000-0104 on Ubuntu 24.04 LTS (noble) - medium</title>
+        <reference source="CVE" ref_id="CVE-2000-0104"/>
+      </metadata>
+      <criteria operator="AND">
+        <criterion test_ref="oval:com.ubuntu.noble:tst:24" comment="Is kernel 'linux-aws' running?"/>
+        <criterion test_ref="oval:com.ubuntu.noble:tst:25" comment="'linux-aws' kernel in noble was vulnerable but has been fixed."/>
+      </criteria>
+    </definition>
+    <!-- the older wording still parses -->
+    <definition class="vulnerability" id="oval:com.ubuntu.noble:def:105" version="1">
+      <metadata>
+        <title>CVE-2000-0105 on Ubuntu 24.04 LTS (noble) - medium</title>
+        <reference source="CVE" ref_id="CVE-2000-0105"/>
+      </metadata>
+      <criteria operator="OR">
+        <criterion test_ref="oval:com.ubuntu.noble:tst:30" comment="example-package package in noble was vulnerable but has been fixed (note: '1.0-1ubuntu1')."/>
+        <criterion test_ref="oval:com.ubuntu.noble:tst:31" comment="zlib package does not exist in noble."/>
+      </criteria>
+    </definition>
+  </definitions>
+  <tests>
+    <linux:dpkginfo_test id="oval:com.ubuntu.noble:tst:25" check="at least one" comment="linux-aws">
+      <linux:object object_ref="oval:com.ubuntu.noble:obj:25"/>
+      <linux:state state_ref="oval:com.ubuntu.noble:ste:25"/>
+    </linux:dpkginfo_test>
+  </tests>
+  <objects>
+    <linux:dpkginfo_object id="oval:com.ubuntu.noble:obj:25"><linux:name>linux-image-aws</linux:name></linux:dpkginfo_object>
+  </objects>
+  <states>
+    <linux:dpkginfo_state id="oval:com.ubuntu.noble:ste:25">
+      <linux:evr datatype="debian_evr" operation="less than">0:6.8.0-1024.26</linux:evr>
+    </linux:dpkginfo_state>
+  </states>
+</oval_definitions>
