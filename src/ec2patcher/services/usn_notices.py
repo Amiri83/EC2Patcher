@@ -5,6 +5,9 @@ time and the next run resumes at the stored offset, so a large first download ne
 up. After one complete pull a refresh stops as soon as every notice is known, whatever the order
 of the pages.
 
+A page the API cannot serve (a persistent HTTP 5xx at the same offset, run after run) is split
+until the failing notice is isolated; that notice is skipped and logged so the pull can finish.
+
 A CVE can appear in several USNs: all links are kept, :func:`best_usn` picks one for the report
 deterministically. A USN also names the fixed source package versions per release, which makes
 this the resolver's second source.
@@ -34,6 +37,9 @@ TTL = timedelta(hours=24)
 RUN_BUDGET_SECONDS = 120.0
 PACE_SECONDS = 0.2
 CACHE_BUSTER = "nocache"  # query parameter of the one retry after an HTTP 5xx
+# A page that keeps failing with HTTP 5xx is split in halves down to single notices; a single
+# notice that still fails is skipped. Past this many skips in one run it is an outage: stop.
+MAX_SKIPS_PER_RUN = 3
 _NOTICE_ID_RE = re.compile(r"^[A-Z]{2,5}-\d+(?:-\d+)?$")
 _CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
 
@@ -79,6 +85,17 @@ def parse_notice(notice) -> dict | None:
         "cves": sorted({str(c).upper() for c in cves if c and _CVE_RE.match(str(c).upper())}),
         "packages": packages,
     }
+
+
+def _page_url(offset: int, limit: int) -> str:
+    return f"{URL}?limit={limit}&offset={offset}"
+
+
+def _notices_of(page: dict) -> list:
+    notices = page["notices"]
+    if not isinstance(notices, list):
+        raise ValueError("no notices list")
+    return notices
 
 
 def _usn_order(usn_id: str) -> tuple[int, ...]:
@@ -134,27 +151,39 @@ class UsnNotices:
         offset = feed["next_offset"] if feed and not feed["complete"] else 0
         deadline = self.monotonic() + self.budget
         pages = 0
+        skipped: list[int] = []
+        total: int | None = None
         while True:
             check()
             if not breaker.allow():
                 return self._stop(feed, offset, f"backing off ({breaker.reason})")
             try:
-                page = self._fetch_page(fetch, f"{URL}?limit={PAGE_SIZE}&offset={offset}")
-                notices = page["notices"]
-                if not isinstance(notices, list):
-                    raise ValueError("no notices list")
+                page = self._fetch_page(fetch, _page_url(offset, PAGE_SIZE))
+                notices = _notices_of(page)
+                consumed = len(notices)
+            except urllib.error.HTTPError as exc:
+                if exc.code < 500 or (total is not None and offset >= total):
+                    reason = source_http.describe_error(exc)
+                    breaker.failure(reason)
+                    return self._stop(feed, offset, reason)
+                try:
+                    page, notices, consumed = self._split(fetch, offset, PAGE_SIZE, skipped)
+                except (OSError, ValueError, KeyError, TypeError) as split_exc:
+                    reason = source_http.describe_error(split_exc)
+                    breaker.failure(reason)
+                    return self._stop(feed, offset, reason)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 reason = source_http.describe_error(exc)
                 breaker.failure(reason)
                 return self._stop(feed, offset, reason)
             breaker.success()
             self.db.store_usn_page([n for n in map(parse_notice, notices) if n])
-            offset += len(notices)
+            offset += consumed
             pages += 1
-            total = page.get("total_results", page.get("total"))
-            total = total if isinstance(total, int) else None
+            page_total = page.get("total_results", page.get("total")) if page else None
+            total = page_total if isinstance(page_total, int) else total
             if (
-                len(notices) < PAGE_SIZE
+                consumed < PAGE_SIZE
                 or (total is not None and offset >= total)
                 or (was_complete and total is not None and self.db.count_usn_notices() >= total)
             ):
@@ -172,8 +201,51 @@ class UsnNotices:
         self.db.put_source_feed(
             SOURCE, fetched_at=self.now().isoformat(), entries=count, complete=True, next_offset=0
         )
-        logger.info("usn_notices pages=%d stored=%d", pages, count)
-        return f"{pages} pages read, {count} notices stored"
+        logger.info("usn_notices pages=%d stored=%d skipped=%d", pages, count, len(skipped))
+        note = f", {len(skipped)} unservable skipped" if skipped else ""
+        return f"{pages} pages read, {count} notices stored{note}"
+
+    def _split(
+        self, fetch: Callable[[str], dict], offset: int, limit: int, skipped: list[int]
+    ) -> tuple[dict | None, list, int]:
+        """Fetch ``limit`` notices from ``offset`` in halves after a persistent 5xx.
+
+        Returns (the last page read, its notices, how many offsets were consumed). A single
+        notice that still fails is skipped; more than MAX_SKIPS_PER_RUN skips re-raise."""
+        if limit == 1:
+            try:
+                page = fetch(_page_url(offset, 1))
+            except urllib.error.HTTPError as exc:
+                if exc.code < 500 or len(skipped) >= MAX_SKIPS_PER_RUN:
+                    raise
+                skipped.append(offset)
+                logger.warning(
+                    "usn_notices skipped offset=%d (%s): the API cannot serve this notice",
+                    offset, source_http.describe_error(exc),
+                )  # fmt: skip
+                return None, [], 1
+            return page, _notices_of(page), len(_notices_of(page))
+        half = limit // 2
+        try:
+            page = fetch(_page_url(offset, half))
+            notices, consumed = _notices_of(page), len(_notices_of(page))
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            page, notices, consumed = self._split(fetch, offset, half, skipped)
+        if consumed < half:  # end of the feed
+            return page, notices, consumed
+        self.sleep(self.pace)
+        try:
+            rest_page = fetch(_page_url(offset + half, limit - half))
+            rest, rest_consumed = _notices_of(rest_page), len(_notices_of(rest_page))
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            rest_page, rest, rest_consumed = self._split(
+                fetch, offset + half, limit - half, skipped
+            )
+        return rest_page or page, notices + rest, consumed + rest_consumed
 
     def _fetch_page(self, fetch: Callable[[str], dict], url: str) -> dict:
         """One page. An HTTP 5xx is often a cached error page: asked once more, with a query

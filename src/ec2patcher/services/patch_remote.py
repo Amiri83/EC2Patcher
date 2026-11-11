@@ -289,7 +289,11 @@ def space_problems(check: SpaceCheck, deb_sizes: dict[str, int]) -> list[str]:
             kb += INITRD_ALLOWANCE_KB
         mount = check.filesystems.get(path, (root, 0))[0]
         need[mount] = need.get(mount, 0) + kb
-    free = {mount: kb for mount, kb in check.filesystems.values()}
+    free: dict[str, int] = {}  # first reading per mount wins, in SPACE_PATHS order ("/" first)
+    for path in SPACE_PATHS:
+        if path in check.filesystems:
+            mount, kb = check.filesystems[path]
+            free.setdefault(mount, kb)
     problems = []
     for mount, kb in need.items():
         required = kb + max(SPACE_MARGIN_KB, int(kb * SPACE_MARGIN_RATIO))

@@ -33,6 +33,29 @@ def _open(url: str, timeout: float, headers: dict[str, str] | None = None):
     return open_url(request, timeout)
 
 
+class IncompleteResponse(OSError):
+    """A body cut off before its end or not parseable: a transfer failure, retried like one."""
+
+
+def read_json(response, max_bytes: int) -> dict:
+    """Read and parse one JSON body, checked against its Content-Length.
+
+    ``response.read`` returns a short body without an error when the connection drops early, so
+    the length is checked here; a body that still does not parse is reported the same way."""
+    raw = response.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("response is unexpectedly large")
+    expected = response.headers.get("Content-Length") if response.headers else None
+    encoded = response.headers.get("Content-Encoding") if response.headers else None
+    if expected and expected.strip().isdigit() and not encoded:
+        if int(expected) != len(raw):
+            raise IncompleteResponse(f"incomplete response: {len(raw)} of {expected} bytes")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise IncompleteResponse(f"unparseable response ({len(raw)} bytes): {exc}") from exc
+
+
 def describe_error(exc: BaseException) -> str:
     """A short reason for a failed request: 'HTTP 504', 'timed out', the network error."""
     if isinstance(exc, urllib.error.HTTPError):
@@ -45,15 +68,13 @@ def describe_error(exc: BaseException) -> str:
 
 
 def fetch_json(url: str, timeout: float = JSON_TIMEOUT_SECONDS) -> dict:
-    """One bounded JSON response. Network failures are OSError, bad content ValueError."""
+    """One bounded JSON response. Network failures and cut-off or unparseable bodies are
+    OSError (retryable); a body over the size limit is ValueError."""
     try:
         with _open(url, timeout, {"Accept": "application/json"}) as response:
-            raw = response.read(MAX_JSON_BYTES + 1)
+            return read_json(response, MAX_JSON_BYTES)
     except http.client.HTTPException as exc:
-        raise OSError(f"incomplete response: {exc}") from exc
-    if len(raw) > MAX_JSON_BYTES:
-        raise ValueError("response is unexpectedly large")
-    return json.loads(raw)
+        raise IncompleteResponse(f"incomplete response: {exc}") from exc
 
 
 def fetch_to_file(url: str, out: BinaryIO, max_bytes: int, timeout: float) -> None:

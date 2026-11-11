@@ -103,6 +103,10 @@ KERNEL_BINARY_RE = re.compile(
     r"-\d+\.\d+\.\d+-\d+"
 )
 KERNEL_REBOOT_RE = re.compile(r"^linux-(?:image|modules|modules-extra)-(?:unsigned-)?\d+\.\d+")
+# Built from the kernel source but userspace only: upgrading them never needs a reboot.
+KERNEL_USERSPACE_RE = re.compile(r"^linux-(?:tools|cloud-tools|headers)-")
+NO_REBOOT = "No reboot expected"
+KERNEL_TOOLS_NO_REBOOT = "Tools only, no reboot (kernel userspace package, not a new kernel)"
 REBOOT_HELP = (
     "Expected based on the planned package set. Final reboot requirement will be verified "
     "after installation in Phase 3."
@@ -800,6 +804,13 @@ def reboot_impact(package: str, requests_reboot: bool) -> str | None:
     return None
 
 
+def no_reboot_label(package: str) -> str:
+    """Reboot impact text of a package that needs no reboot: kernel tools/headers say so, so
+    they are not mistaken for a kernel patch."""
+    base = package.split(":", 1)[0]
+    return KERNEL_TOOLS_NO_REBOOT if KERNEL_USERSPACE_RE.match(base) else NO_REBOOT
+
+
 def build_plan(
     findings: list[Finding],
     download: DownloadPlan,
@@ -845,7 +856,7 @@ def build_plan(
             size=deb.size,
             checksum=deb.checksum,
             is_dependency=base not in requested,
-            reboot_impact=impact or "No reboot expected",
+            reboot_impact=impact or no_reboot_label(base),
             requests_reboot=impact is not None,
             status="planned" if deb.deb_filename else "unresolved",
             reason=(f"Unable to resolve package download plan: {deb.error}" if deb.error else None),
