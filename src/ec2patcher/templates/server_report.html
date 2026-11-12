@@ -6,11 +6,11 @@
 {% block header_actions %}<div class="header-actions">
   {% if analysis.server_id and not run.is_running %}
     <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/reanalyze" class="inline-form" title="Re-collect this server's facts (read-only) and fetch all of its CVEs from Canonical again, bypassing the cache">
-      <button type="submit" class="btn btn-secondary">Re-analyze</button>
+      <button type="submit" class="btn secondary">Re-analyze</button>
     </form>
   {% endif %}
-  <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/export.xlsx" class="btn btn-primary" download>Export to Excel</a>
-  <a href="/analysis/{{ run.id }}" class="btn btn-secondary">All Servers</a>
+  <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/export.xlsx" class="btn" download>Export to Excel</a>
+  <a href="/analysis/{{ run.id }}" class="btn secondary">All Servers</a>
 </div>{% endblock %}
 {% block content %}
 {% set amazon = analysis.os_id == "amzn" %}
@@ -68,7 +68,7 @@
   <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>
 {% endif %}
 {% if not is_latest %}
-  <div class="alert alert-warning">This is a historical report from analysis #{{ run.id }}. A newer analysis exists.</div>
+  <div class="flash warn">This is a historical report from analysis #{{ run.id }}. A newer analysis exists.</div>
 {% endif %}
 
 <div class="card">
@@ -79,8 +79,8 @@
     {% elif analysis.status == "unsupported" %}<span class="badge badge-neutral">{{ "OS NOT SUPPORTED" if (analysis.error or "").endswith("(end of life)") else "OS NOT SUPPORTED YET" }}</span>
     {% else %}<span class="badge badge-warning">{{ analysis.status|upper }}</span>{% endif %}
   </div>
-  {% if analysis.error and analysis.status == "unsupported" %}<div class="alert alert-warning">{{ analysis.error }}</div>
-  {% elif analysis.error %}<div class="alert alert-error">{{ analysis.error }}</div>{% endif %}
+  {% if analysis.error and analysis.status == "unsupported" %}<div class="flash warn">{{ analysis.error }}</div>
+  {% elif analysis.error %}<div class="flash error">{{ analysis.error }}</div>{% endif %}
   <dl class="kv report-header">
     <dt>Server Name</dt><dd>{{ analysis.server_name }}</dd>
     {% if analysis.display_name %}<dt>Display Name</dt><dd>{{ analysis.display_name }}</dd>{% endif %}
@@ -111,7 +111,7 @@
         <div class="muted small">{{ reboot_help }}</div></dd>
   </dl>
   {% if analysis.warnings %}
-    <div class="alert alert-warning"><ul class="plain-list">{% for w in analysis.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>
+    <div class="flash warn"><ul class="plain-list">{% for w in analysis.warnings %}<li>{{ w }}</li>{% endfor %}</ul></div>
   {% endif %}
 </div>
 
@@ -125,12 +125,12 @@
   {% if patching_unsupported %}
     <p class="muted patching-unsupported">{{ patching_unsupported }}</p>
   {% else %}
-  {% if patch.not_checked_warning %}<div class="alert alert-warning not-checked-warning">{{ patch.not_checked_warning }}</div>{% endif %}
-  {% if patch.excluded_warning %}<div class="alert alert-warning excluded-warning">{{ patch.excluded_warning }}</div>{% endif %}
+  {% if patch.not_checked_warning %}<div class="flash warn not-checked-warning">{{ patch.not_checked_warning }}</div>{% endif %}
+  {% if patch.excluded_warning %}<div class="flash warn excluded-warning">{{ patch.excluded_warning }}</div>{% endif %}
   {% if ex and ex.decision == "REJECTED" %}
     <p><strong>Rejected</strong> on {{ ex.decided_at|timestamp }}. No packages were downloaded, copied or installed. The report remains available for reference.</p>
   {% elif ex %}
-    <p>Approved on {{ ex.decided_at|timestamp }}. <a href="/patch/{{ ex.id }}" class="btn btn-secondary btn-sm">View Patch Execution #{{ ex.id }}</a></p>
+    <p>Approved on {{ ex.decided_at|timestamp }}. <a href="/patch/{{ ex.id }}" class="btn secondary btn-sm">View Patch Execution #{{ ex.id }}</a></p>
   {% else %}
     <dl class="kv">
       <dt>Local Staging</dt><dd>{% if patch.local_path %}<code>{{ patch.local_path }}</code>{% else %}<span class="text-danger">unavailable</span>{% endif %}
@@ -141,7 +141,7 @@
       <dt>Download Size</dt><dd>{{ patch.download_bytes|filesize }}</dd>
     </dl>
     {% if patch.reasons %}
-      <div class="alert alert-warning patch-blocked"><strong>Patching is not available for this report.</strong>
+      <div class="flash warn patch-blocked"><strong>Patching is not available for this report.</strong>
         <ul class="plain-list">{% for r in patch.reasons %}<li>{{ r }}</li>{% endfor %}</ul></div>
     {% endif %}
     {% if patch.unpatched_notes %}
@@ -152,12 +152,12 @@
       <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/reject"
             data-confirm="Reject patching for {{ analysis.server_name }}? No action will be taken on the server.">
         <input type="hidden" name="confirm" value="yes">
-        <button type="submit" class="btn btn-danger-outline">Reject</button>
+        <button type="submit" class="btn danger">Reject</button>
       </form>
       {% if patch.allowed %}
-        <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/approve" class="btn btn-primary">Approve &amp; Patch</a>
+        <a href="/analysis/{{ run.id }}/servers/{{ analysis.id }}/approve" class="btn">Approve &amp; Patch</a>
       {% else %}
-        <button type="button" class="btn btn-primary" disabled>Approve &amp; Patch</button>
+        <button type="button" class="btn" disabled>Approve &amp; Patch</button>
       {% endif %}
     </div>
   {% endif %}
@@ -194,7 +194,7 @@
     </p>
   {% endif %}
   {% if summary.unresolved %}
-    <div class="alert alert-warning">{{ summary.unresolved }} package(s) in the plan could not be resolved to an exact .deb file. See the package plan below.</div>
+    <div class="flash warn">{{ summary.unresolved }} package(s) in the plan could not be resolved to an exact .deb file. See the package plan below.</div>
   {% endif %}
 </div>
 
@@ -215,7 +215,7 @@
         <h3 class="bucket bucket-{{ b.key }}">{{ b.title }} <span class="muted small">({{ b.count }})</span></h3>
         {% if b.key == "investigate" and b.count and analysis.server_id and not run.is_running %}
           <form method="post" action="/analysis/{{ run.id }}/servers/{{ analysis.id }}/retry-investigate" class="inline-form">
-            <button type="submit" class="btn btn-secondary btn-sm">Retry these CVEs ({{ b.cve_count }})</button>
+            <button type="submit" class="btn secondary btn-sm">Retry these CVEs ({{ b.cve_count }})</button>
           </form>
           <span class="muted small">Fetches these CVEs from Canonical again (bypassing the cache) and re-analyzes this server.</span>
         {% endif %}
@@ -254,7 +254,7 @@
     <p class="muted">Package planning is not supported yet for this operating system.</p>
   {% else %}
     <p class="muted">No package updates are planned for this server{% if patch.not_checked_warning %} for the CVEs that were checked{% endif %}.</p>
-    {% if patch.not_checked_warning %}<div class="alert alert-warning">{{ patch.not_checked_warning }}</div>{% endif %}
+    {% if patch.not_checked_warning %}<div class="flash warn">{{ patch.not_checked_warning }}</div>{% endif %}
   {% endif %}
 </div>
 

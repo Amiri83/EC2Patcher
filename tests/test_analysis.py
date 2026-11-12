@@ -923,4 +923,4 @@ def test_analysis_menu_entry_opens_the_latest_run(web, pem_file):
         latest = c.get("/analysis/latest", follow_redirects=False)
         assert latest.status_code == 303 and latest.headers["location"] == run_url
         page = c.get(run_url).text
-        assert 'href="/analysis/latest" class="nav-link active"' in page
+        assert 'href="/analysis/latest" class="active" aria-current="page"' in page

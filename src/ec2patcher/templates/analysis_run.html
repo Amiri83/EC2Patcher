@@ -3,8 +3,8 @@
 {% block head %}{% if run.is_running %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}
 {% block heading %}Pre-Patch Analysis #{{ run.id }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
-  <button type="button" class="btn btn-secondary rp-needs-js" data-rp-show>Show progress</button>
-  <a href="/reports#analysis" class="btn btn-secondary">Back to Reports</a>
+  <button type="button" class="btn secondary rp-needs-js" data-rp-show>Show progress</button>
+  <a href="/reports#analysis" class="btn secondary">Back to Reports</a>
 </div>{% endblock %}
 {% block overlay %}{% with progress_ref=run.id, progress_active=run.is_running %}{% include "_run_progress.html" %}{% endwith %}{% endblock %}
 {% block content %}
@@ -21,7 +21,7 @@
     <dd>{% include "_metadata_status.html" %}
       {% if run.failed_lookups and not run.is_running %}
         <form method="post" action="/analysis/{{ run.id }}/retry-lookups" class="inline-form">
-          <button type="submit" class="btn btn-secondary btn-sm">Retry failed lookups ({{ run.failed_lookups|length }})</button>
+          <button type="submit" class="btn secondary btn-sm">Retry failed lookups ({{ run.failed_lookups|length }})</button>
         </form>
         <div class="muted small">Queries ubuntu.com again for the failed CVEs only and re-analyzes the servers that reported them.</div>
       {% endif %}</dd>
@@ -35,9 +35,9 @@
   {% if run.is_running and run.progress_message %}
     <p class="progress-message">{{ run.progress_message }}&hellip; <span class="muted small">(this page refreshes automatically)</span></p>
   {% endif %}
-  {% if run.metadata_warning %}<div class="alert alert-warning">{{ run.metadata_warning }}</div>{% endif %}
-  {% for w in run_warnings %}<div class="alert alert-warning run-warning">{{ w }}</div>{% endfor %}
-  {% if run.error %}<div class="alert alert-error">{{ run.error }}</div>{% endif %}
+  {% if run.metadata_warning %}<div class="flash warn">{{ run.metadata_warning }}</div>{% endif %}
+  {% for w in run_warnings %}<div class="flash warn run-warning">{{ w }}</div>{% endfor %}
+  {% if run.error %}<div class="flash error">{{ run.error }}</div>{% endif %}
   <p class="muted small">Read-only analysis. No packages were downloaded, copied or installed, and nothing was restarted.</p>
 </div>
 
@@ -77,7 +77,7 @@
           {% endif %}
         </div>
         {% if s.status in ("complete", "failed", "unsupported") %}
-          <a href="/analysis/{{ run.id }}/servers/{{ s.id }}" class="btn btn-secondary btn-sm">View Report</a>
+          <a href="/analysis/{{ run.id }}/servers/{{ s.id }}" class="btn secondary btn-sm">View Report</a>
         {% endif %}
       </li>
     {% endfor %}
@@ -88,13 +88,13 @@
 <div class="card patch-decision" id="patch-all">
   <div class="card-header">
     <h2>Patch All</h2>
-    {% if latest_queue_id %}<a href="/patch-all/{{ latest_queue_id }}" class="btn btn-secondary btn-sm">Last Patch All Run</a>{% endif %}
+    {% if latest_queue_id %}<a href="/patch-all/{{ latest_queue_id }}" class="btn secondary btn-sm">Last Patch All Run</a>{% endif %}
   </div>
   <p class="muted small">Patches every eligible server of this analysis one at a time with the same approve &rarr; revalidate &rarr; simulate &rarr; install &rarr; verify &rarr; cleanup pipeline as a single server, then reboots it if <code>/run/reboot-required</code> exists (unless Skip reboot is checked). The queue stops at the first failure. You confirm the server list on the next page; servers that are not eligible are skipped.</p>
   {% if eligible_count %}
   <form method="get" action="/analysis/{{ run.id }}/patch-all" class="form-actions">
     <label class="check-label"><input type="checkbox" name="skip_reboot" value="1"> Skip reboot</label>
-    <button type="submit" class="btn btn-danger"{% if patch_running %} disabled{% endif %}>Patch All</button>
+    <button type="submit" class="btn danger"{% if patch_running %} disabled{% endif %}>Patch All</button>
     {% if patch_running %}<span class="muted small">A patch execution is running.</span>{% endif %}
   </form>
   {% elif patch_running %}

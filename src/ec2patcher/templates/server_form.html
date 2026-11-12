@@ -5,10 +5,10 @@
 {% block content %}
 <div class="card form-card">
   {% if errors %}
-    <div class="alert alert-error" role="alert">Please correct the highlighted fields.</div>
+    <div class="flash error" role="alert">Please correct the highlighted fields.</div>
   {% endif %}
   {% if clone_source %}
-    <div class="alert alert-warning clone-note" role="status">Cloning <strong>{{ clone_source.name }}</strong>: enter this server's own name, IP address, PEM file and instance ID. Everything else is copied; saving creates a new server and leaves {{ clone_source.name }} unchanged.</div>
+    <div class="flash warn clone-note" role="status">Cloning <strong>{{ clone_source.name }}</strong>: enter this server's own name, IP address, PEM file and instance ID. Everything else is copied; saving creates a new server and leaves {{ clone_source.name }} unchanged.</div>
   {% endif %}
   <form method="post" action="{{ '/servers/%d/edit' % server_id if editing else '/servers/new' }}" novalidate>
     {% if clone_source %}<input type="hidden" name="clone_from" value="{{ clone_source.id }}">{% endif %}
@@ -87,14 +87,16 @@
       </div>
       <div class="field{% if errors.aws_profile %} has-error{% endif %}">
         <label for="aws_profile">AWS profile <span class="muted small">(optional)</span></label>
-        {{ aws_dropdown("profile", "aws_profile", "aws_profile", aws_dropdown_view(form.aws_profile, aws.profiles, "aws_profile" in (form.other_chosen or [])), "Default from Settings", 128, defaults.profile or "example") }}
-        <div class="hint">Default from Settings{% if defaults.profile %} (<code>{{ defaults.profile }}</code>){% endif %} unless you choose one. The list comes from your AWS CLI config.{% if aws.reason %} <span class="aws-config-reason">{{ aws.reason }}</span> Use Other… to type a name.{% endif %}</div>
+        {% set profile_from = "Default from " ~ ("Settings" if defaults.profile_source in (none, "settings") else defaults.profile_source) %}
+        {{ aws_dropdown("profile", "aws_profile", "aws_profile", aws_dropdown_view(form.aws_profile, aws.profiles, "aws_profile" in (form.other_chosen or [])), profile_from, 128, defaults.profile or "example") }}
+        <div class="hint">{{ profile_from }}{% if defaults.profile %} (<code>{{ defaults.profile }}</code>){% endif %} unless you choose one. The list comes from your AWS CLI config.{% if aws.reason %} <span class="aws-config-reason">{{ aws.reason }}</span> Use Other… to type a name.{% endif %}</div>
         {% if errors.aws_profile %}<div class="field-error">{{ errors.aws_profile }}</div>{% endif %}
       </div>
       <div class="field{% if errors.aws_region %} has-error{% endif %}">
         <label for="aws_region">AWS region <span class="muted small">(optional)</span></label>
-        {{ aws_dropdown("region", "aws_region", "aws_region", aws_dropdown_view(form.aws_region, aws_regions, "aws_region" in (form.other_chosen or [])), "Default from Settings", 32, defaults.region or "us-east-1") }}
-        <div class="hint">Default from Settings{% if defaults.region %} (<code>{{ defaults.region }}</code>){% endif %} unless you choose one. Choosing a profile selects its region from the AWS CLI config, if it has one. Other… must look like <code>us-east-1</code>.</div>
+        {% set region_from = "Default from " ~ ("Settings" if defaults.region_source in (none, "settings") else defaults.region_source) %}
+        {{ aws_dropdown("region", "aws_region", "aws_region", aws_dropdown_view(form.aws_region, aws_regions, "aws_region" in (form.other_chosen or [])), region_from, 32, defaults.region or "us-east-1") }}
+        <div class="hint">{{ region_from }}{% if defaults.region %} (<code>{{ defaults.region }}</code>){% endif %} unless you choose one. Choosing a profile selects its region from the AWS CLI config, if it has one. Other… must look like <code>us-east-1</code>.</div>
         {% if errors.aws_region %}<div class="field-error">{{ errors.aws_region }}</div>{% endif %}
       </div>
     </div>
@@ -110,7 +112,7 @@
                    aria-label="Tag key" maxlength="64" autocomplete="off">
             <input type="text" name="tag_value" value="{{ tag.value }}" placeholder="Value"
                    aria-label="Tag value" maxlength="256" autocomplete="off">
-            <button type="button" class="btn btn-ghost btn-sm" data-remove-tag>Remove</button>
+            <button type="button" class="btn ghost btn-sm" data-remove-tag>Remove</button>
           </div>
         {% endfor %}
       </div>
@@ -120,20 +122,20 @@
                  aria-label="Tag key" maxlength="64" autocomplete="off">
           <input type="text" name="tag_value" value="" placeholder="Value"
                  aria-label="Tag value" maxlength="256" autocomplete="off">
-          <button type="button" class="btn btn-ghost btn-sm" data-remove-tag>Remove</button>
+          <button type="button" class="btn ghost btn-sm" data-remove-tag>Remove</button>
         </div>
       </template>
-      <button type="button" class="btn btn-secondary btn-sm" id="add-tag">+ Add Tag</button>
+      <button type="button" class="btn secondary btn-sm" id="add-tag">+ Add Tag</button>
       {% if errors.tags %}<div class="field-error">{{ errors.tags }}</div>{% endif %}
     </fieldset>
 
     {% if ssh_result %}{% include "_ssh_result.html" %}{% endif %}
 
     <div class="form-actions">
-      <button type="submit" name="action" value="test" class="btn btn-secondary">Test Connection</button>
+      <button type="submit" name="action" value="test" class="btn secondary">Test Connection</button>
       <span class="spacer"></span>
-      <a href="/servers" class="btn btn-ghost">Cancel</a>
-      <button type="submit" name="action" value="save" class="btn btn-primary">Save Server</button>
+      <a href="/servers" class="btn ghost">Cancel</a>
+      <button type="submit" name="action" value="save" class="btn">Save Server</button>
     </div>
   </form>
 </div>

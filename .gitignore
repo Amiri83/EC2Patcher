@@ -10,5 +10,7 @@ dist/
 *.log
 # SSH key pair of the local test targets (generated at runtime by scripts/test-targets/up.sh)
 scripts/test-targets/.keys/
+# Staged copies from other DadsOps repos (e.g. the shared theme master), never committed
+reference/
 # Fernet key of the stored secrets (normally in the config dir, never in the repo)
 secret.key

@@ -59,7 +59,7 @@ ec2patcher = "ec2patcher.main:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ec2patcher = ["templates/*.html", "static/*"]
+ec2patcher = ["templates/*.html", "static/*", "static/theme/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

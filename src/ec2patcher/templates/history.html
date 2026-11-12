@@ -19,7 +19,7 @@
         <td>{% if ex.cves %}{{ ex.cves_verified }}/{{ ex.cves|length }} verified{% else %}-{% endif %}</td>
         <td>{% if ex.reboot_required_after is none %}-{% elif ex.reboot_required_after %}<strong>YES</strong>{% else %}NO{% endif %}</td>
         <td>{% if ex.reboot_status %}<span class="badge {{ reboot_badges.get(ex.reboot_status, 'badge-warning') }}">{{ reboot_labels.get(ex.reboot_status, ex.reboot_status) }}</span>{% else %}-{% endif %}</td>
-        <td>{% if ex.decision == "REJECTED" %}<a href="/analysis/{{ ex.analysis_run_id }}/servers/{{ ex.server_analysis_id }}" class="btn btn-secondary btn-sm">Report</a>{% else %}<a href="/patch/{{ ex.id }}" class="btn btn-secondary btn-sm">Details</a>{% endif %}</td>
+        <td>{% if ex.decision == "REJECTED" %}<a href="/analysis/{{ ex.analysis_run_id }}/servers/{{ ex.server_analysis_id }}" class="btn secondary btn-sm">Report</a>{% else %}<a href="/patch/{{ ex.id }}" class="btn secondary btn-sm">Details</a>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>

@@ -217,7 +217,7 @@ def test_export_button_per_server(web, analyzed):
         for s in analyzed.servers:
             page = c.get(f"/analysis/{analyzed.id}/servers/{s.id}").text
             href = f"/analysis/{analyzed.id}/servers/{s.id}/export.xlsx"
-            assert f'<a href="{href}" class="btn btn-primary" download>Export to Excel</a>' in page
+            assert f'<a href="{href}" class="btn" download>Export to Excel</a>' in page
             assert page.count("export.xlsx") == 1
 
 

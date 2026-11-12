@@ -3,14 +3,14 @@
 {% block head %}{% if is_active %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}
 {% block heading %}Patch Execution #{{ execution.id }}: {{ execution.server_name }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
-  <button type="button" class="btn btn-secondary rp-needs-js" data-rp-show>Show progress</button>
-  <a href="/analysis/{{ execution.analysis_run_id }}/servers/{{ execution.server_analysis_id }}" class="btn btn-secondary">Approved Report</a>
-  <a href="/history" class="btn btn-secondary">History</a>
+  <button type="button" class="btn secondary rp-needs-js" data-rp-show>Show progress</button>
+  <a href="/analysis/{{ execution.analysis_run_id }}/servers/{{ execution.server_analysis_id }}" class="btn secondary">Approved Report</a>
+  <a href="/history" class="btn secondary">History</a>
   {% if can_retry %}
   <form method="post" action="/patch/{{ execution.id }}/retry" class="inline-form"
         data-confirm="Retry patching {{ execution.server_name }}? EC2Patcher first runs 'sudo dpkg --configure -a' on the server to finish any half-installed packages (nothing is downloaded or removed), then starts a fresh analysis. You approve the new plan before anything is installed.">
     <input type="hidden" name="confirm" value="yes">
-    <button type="submit" class="btn btn-primary">Retry</button>
+    <button type="submit" class="btn">Retry</button>
   </form>
   {% endif %}
 </div>{% endblock %}
@@ -80,7 +80,7 @@
 {% endif %}
 
 {% if ex.state == "ALREADY_PATCHED" %}
-  <div class="alert alert-success"><strong>ALREADY PATCHED</strong> &mdash; every approved package was already installed at its target version when the server was revalidated. Nothing was downloaded, transferred or installed.</div>
+  <div class="flash ok"><strong>ALREADY PATCHED</strong> &mdash; every approved package was already installed at its target version when the server was revalidated. Nothing was downloaded, transferred or installed.</div>
 {% endif %}
 
 {% if ex.transfer_attempts %}
@@ -106,7 +106,7 @@
 {% endif %}
 
 {% if ex.state == "SUCCESS_WITH_CLEANUP_WARNING" %}
-  <div class="alert alert-warning"><strong>CLEANUP WARNING</strong> &mdash; the patch succeeded but temporary files could not be fully removed.
+  <div class="flash warn"><strong>CLEANUP WARNING</strong> &mdash; the patch succeeded but temporary files could not be fully removed.
     Local: <code>{{ ex.local_staging_path }}</code>, Remote: <code>{{ ex.remote_staging_path }}</code>. {{ ex.cleanup_detail or "" }}</div>
 {% endif %}
 

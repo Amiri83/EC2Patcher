@@ -1230,13 +1230,22 @@ def create_app(
         preview_name = ctx.pop("preview_name", None) or (names[0] if names else "ip-10-0-0-1")
         log_dir_value = ctx.pop("log_dir_value", None) or str(log_dir())
         defaults = ssm_service.load_defaults(db)
-        # With no region saved, the default profile's own region is the default selection.
-        profile_region = "" if defaults.region else aws_config.region_of(defaults.profile)
+        # With no region saved (nor $AWS_REGION), the default profile's own region is the
+        # default selection.
+        profile_region = "" if defaults.region else aws_config.region_of(defaults.saved_profile)
+        # The form only holds saved values: a default from $AWS_PROFILE / $AWS_REGION is shown
+        # on the empty choice, so saving the form never stores it.
         connection_form = ctx.pop("connection_form", None) or {
             "connection_type": defaults.connection_type,
-            "aws_profile": defaults.profile or "",
-            "aws_region": defaults.region or profile_region,
+            "aws_profile": defaults.saved_profile or "",
+            "aws_region": defaults.saved_region or profile_region,
             "region_from_profile": bool(profile_region),
+        }
+        env_defaults = {
+            "profile": None if defaults.saved_profile else defaults.profile,
+            "profile_env": config.AWS_PROFILE_ENV,
+            "region": None if defaults.saved_region else defaults.region,
+            "region_env": config.AWS_REGION_ENV,
         }
         preview, preview_error = None, None
         try:
@@ -1262,7 +1271,8 @@ def create_app(
             cache_ttl_values=ctx.pop("cache_ttl_values", None) or ttls.form_values(),
             cache_ttl_errors=ctx.pop("cache_ttl_errors", {}),
             cache_ttl_labels=cache_settings.LABELS, cache_ttl_saved=bool(ttls.saved()),
-            connection_form=connection_form,
+            connection_form=connection_form, env_defaults=env_defaults,
+            default_log_dir_env=config.default_log_dir_source()[1],
             connection_errors=ctx.pop("connection_errors", {}),
             ssm_plugin_location=ssm_plugin.find_plugin(),
             ssm_plugin_dir=config.get_plugin_bin_dir(), ssm_status=ctx.pop("ssm_status", None),

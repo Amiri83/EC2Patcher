@@ -20,13 +20,13 @@
     </div>
     <div class="hint">Hours (<code>24h</code>) or days (<code>30d</code>), between 1 hour and 365 days. Defaults: NVD 30d, Canonical 24h (1h while a release is under investigation), Amazon updateinfo 24h.{% if not cache_ttl_saved %} The defaults are in use.{% endif %}</div>
     <div class="form-actions">
-      <button type="submit" name="action" value="save" class="btn btn-primary">Save TTLs</button>
-      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+      <button type="submit" name="action" value="save" class="btn">Save TTLs</button>
+      <button type="submit" name="action" value="reset" class="btn secondary">Reset to Default</button>
     </div>
   </form>
   <p class="muted">Clear Security Cache empties these caches (NVD, Canonical and Amazon updateinfo), the stored OVAL, USN, KEV and EPSS data and the in-memory lookup state.</p>
   <form method="post" action="/settings/clear-cache">
-    <button type="submit" class="btn btn-secondary">Clear Security Cache</button>
+    <button type="submit" class="btn secondary">Clear Security Cache</button>
   </form>
 </div>
 <div class="card form-card" id="run-progress-settings">
@@ -39,8 +39,8 @@
       <div class="hint">Between {{ step_timeout_min }} and {{ step_timeout_max }} seconds; default {{ step_timeout_default }}. In an analysis, a blocking call that takes longer (opening SSH, listing packages, one CVE lookup) fails that server and the run moves to the next one. When patching it only shortens the commands before the install; scp, the install and the reboot keep their own limits. Commands with a shorter limit of their own keep it.</div>
     </div>
     <div class="form-actions">
-      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
-      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+      <button type="submit" name="action" value="save" class="btn">Save</button>
+      <button type="submit" name="action" value="reset" class="btn secondary">Reset to Default</button>
     </div>
   </form>
 </div>
@@ -59,15 +59,15 @@
       <dt>Remote Staging</dt><dd><code>{{ remote_example }}</code> <span class="muted small">(fixed: /tmp/${server_name} on the server)</span></dd>
     </dl>
     <div class="form-actions">
-      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
-      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+      <button type="submit" name="action" value="save" class="btn">Save</button>
+      <button type="submit" name="action" value="reset" class="btn secondary">Reset to Default</button>
     </div>
   </form>
   {% if server_names|length > 1 %}
   <form method="get" action="/settings" class="inline preview-form">
     <label for="server" class="muted small">Preview for server</label>
     <select id="server" name="server">{% for n in server_names %}<option value="{{ n }}"{% if n == preview_name %} selected{% endif %}>{{ n }}</option>{% endfor %}</select>
-    <button type="submit" class="btn btn-secondary btn-sm">Preview</button>
+    <button type="submit" class="btn secondary btn-sm">Preview</button>
   </form>
   {% endif %}
 </div>
@@ -88,19 +88,19 @@
     </div>
     <div class="field{% if connection_errors.aws_profile %} has-error{% endif %}">
       <label for="default_aws_profile">Default AWS profile</label>
-      {{ aws_dropdown("profile", "aws_profile", "default_aws_profile", aws_dropdown_view(connection_form.aws_profile, aws.profiles, "aws_profile" in (connection_form.other_chosen or [])), "None", 128, "example") }}
-      <div class="hint">The list comes from your AWS CLI config.{% if aws.reason %} <span class="aws-config-reason">{{ aws.reason }}</span> Use Other… to type a name.{% endif %}</div>
+      {{ aws_dropdown("profile", "aws_profile", "default_aws_profile", aws_dropdown_view(connection_form.aws_profile, aws.profiles, "aws_profile" in (connection_form.other_chosen or [])), ("From " ~ env_defaults.profile_env ~ ": " ~ env_defaults.profile) if env_defaults.profile else "None", 128, "example") }}
+      <div class="hint">{% if env_defaults.profile %}<span class="env-source">Unset here, the default is <code>{{ env_defaults.profile }}</code> from <code>{{ env_defaults.profile_env }}</code>.</span> {% endif %}The list comes from your AWS CLI config.{% if aws.reason %} <span class="aws-config-reason">{{ aws.reason }}</span> Use Other… to type a name.{% endif %}</div>
       {% if connection_errors.aws_profile %}<div class="field-error">{{ connection_errors.aws_profile }}</div>{% endif %}
     </div>
     <div class="field{% if connection_errors.aws_region %} has-error{% endif %}">
       <label for="default_aws_region">Default AWS region</label>
-      {{ aws_dropdown("region", "aws_region", "default_aws_region", aws_dropdown_view(connection_form.aws_region, aws_regions, "aws_region" in (connection_form.other_chosen or [])), "None", 32, "us-east-1", connection_form.region_from_profile) }}
-      <div class="hint">Choosing a profile selects its region from the AWS CLI config, if it has one. Other… must look like <code>us-east-1</code>.</div>
+      {{ aws_dropdown("region", "aws_region", "default_aws_region", aws_dropdown_view(connection_form.aws_region, aws_regions, "aws_region" in (connection_form.other_chosen or [])), ("From " ~ env_defaults.region_env ~ ": " ~ env_defaults.region) if env_defaults.region else "None", 32, "us-east-1", connection_form.region_from_profile) }}
+      <div class="hint">{% if env_defaults.region %}<span class="env-source">Unset here, the default is <code>{{ env_defaults.region }}</code> from <code>{{ env_defaults.region_env }}</code>.</span> {% endif %}Choosing a profile selects its region from the AWS CLI config, if it has one. Other… must look like <code>us-east-1</code>.</div>
       {% if connection_errors.aws_region %}<div class="field-error">{{ connection_errors.aws_region }}</div>{% endif %}
     </div>
     <div class="form-actions">
-      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
-      <button type="submit" name="action" value="apply_all" class="btn btn-secondary" title="Also clears the connection type, AWS profile and region set on individual servers">Apply to all servers</button>
+      <button type="submit" name="action" value="save" class="btn">Save</button>
+      <button type="submit" name="action" value="apply_all" class="btn secondary" title="Also clears the connection type, AWS profile and region set on individual servers">Apply to all servers</button>
     </div>
     <div class="hint">Save changes the servers that follow the default. Apply to all servers also clears the connection type, AWS profile and region set on individual servers; manual instance IDs are kept.</div>
   </form>
@@ -109,10 +109,10 @@
     {% include "_ssm_status.html" %}
   </div>
   <div class="form-actions">
-    <a href="/settings?ssm_check=1#connection" class="btn btn-secondary">Check now</a>
+    <a href="/settings?ssm_check=1#connection" class="btn secondary">Check now</a>
     {% if not ssm_plugin_location or ssm_plugin_location.managed %}
     <form method="post" action="/settings/ssm-plugin/install" class="inline">
-      <button type="submit" class="btn {{ 'btn-secondary' if ssm_plugin_location else 'btn-primary' }}">{{ "Update SSM plugin" if ssm_plugin_location else "Install SSM plugin" }}</button>
+      <button type="submit" class="btn{{ ' secondary' if ssm_plugin_location else '' }}">{{ "Update SSM plugin" if ssm_plugin_location else "Install SSM plugin" }}</button>
     </form>
     {% endif %}
   </div>
@@ -134,9 +134,9 @@
       {% if nvd_key_error %}<div class="field-error">{{ nvd_key_error }}</div>{% endif %}
     </div>
     <div class="form-actions">
-      <button type="submit" name="action" value="save" class="btn btn-primary">{{ "Replace" if nvd_key.saved else "Save" }}</button>
-      {% if nvd_key.testable %}<button type="submit" name="action" value="test" class="btn btn-secondary" title="Send one request with the key in use to NVD now">Test key</button>{% endif %}
-      {% if nvd_key.saved %}<button type="submit" name="action" value="clear" class="btn btn-secondary">Clear</button>{% endif %}
+      <button type="submit" name="action" value="save" class="btn">{{ "Replace" if nvd_key.saved else "Save" }}</button>
+      {% if nvd_key.testable %}<button type="submit" name="action" value="test" class="btn secondary" title="Send one request with the key in use to NVD now">Test key</button>{% endif %}
+      {% if nvd_key.saved %}<button type="submit" name="action" value="clear" class="btn secondary">Clear</button>{% endif %}
     </div>
   </form>
 </div>
@@ -147,15 +147,15 @@
       <label for="log_dir_path">Log directory</label>
       <input type="text" id="log_dir_path" name="log_dir_path" value="{{ log_dir_value }}" autocomplete="off" spellcheck="false">
       {% if log_dir_error %}<div class="field-error">{{ log_dir_error }}</div>{% endif %}
-      <div class="hint">Absolute path (<code>~</code> is expanded); it is created if needed and must be writable. Default: <code>{{ default_log_dir }}</code>.</div>
+      <div class="hint">Absolute path (<code>~</code> is expanded); it is created if needed and must be writable. Default: <code>{{ default_log_dir }}</code>{% if default_log_dir_env %} <span class="env-source">(from <code>{{ default_log_dir_env }}</code>)</span>{% endif %}.</div>
     </div>
     <dl class="kv">
       <dt>Current log file</dt><dd>{% if active_log_file %}<code class="log-file">{{ active_log_file }}</code>{% else %}<code class="log-file">{{ log_file }}</code> <span class="muted small">(file logging is not active in this process)</span>{% endif %}</dd>
       <dt>Rotation</dt><dd>{{ log_backups }} &times; {{ log_max_mb }} MB (oldest file is removed)</dd>
     </dl>
     <div class="form-actions">
-      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
-      <button type="submit" name="action" value="reset" class="btn btn-secondary">Reset to Default</button>
+      <button type="submit" name="action" value="save" class="btn">Save</button>
+      <button type="submit" name="action" value="reset" class="btn secondary">Reset to Default</button>
     </div>
   </form>
 </div>
@@ -212,9 +212,9 @@
     </table>
     {% endif %}
     <div class="form-actions">
-      <button type="submit" name="action" value="save" class="btn btn-primary">Save</button>
-      <button type="submit" name="action" value="test" class="btn btn-secondary" title="Fetch dists/&lt;pocket&gt;/InRelease of every pocket from the values above (nothing is saved)">Test</button>
-      <button type="submit" name="action" value="reset" class="btn btn-secondary" formnovalidate>Reset to defaults</button>
+      <button type="submit" name="action" value="save" class="btn">Save</button>
+      <button type="submit" name="action" value="test" class="btn secondary" title="Fetch dists/&lt;pocket&gt;/InRelease of every pocket from the values above (nothing is saved)">Test</button>
+      <button type="submit" name="action" value="reset" class="btn secondary" formnovalidate>Reset to defaults</button>
     </div>
   </form>
 </div>
@@ -232,7 +232,7 @@
   <form method="post" action="/settings/reset-database">
     <label for="reset_confirm_text">Type <strong>RESET</strong> to confirm</label>
     <input type="text" id="reset_confirm_text" name="confirm_text" autocomplete="off" data-required-text="RESET" placeholder="RESET">
-    <button type="submit" class="btn btn-danger" data-enable-when-confirmed>Reset Database</button>
+    <button type="submit" class="btn danger" data-enable-when-confirmed>Reset Database</button>
   </form>
 </div>
 {% endblock %}

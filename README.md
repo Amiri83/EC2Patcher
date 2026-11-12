@@ -502,7 +502,7 @@ failed server.
 - **Local Patch Download Directory**: template, default `/tmp/${server_name}`; must contain
   `${server_name}` and resolve to a safe absolute path.
 - **Logging**: the **Log directory** (default: the per-user log directory from platformdirs, or
-  `$EC2PATCHER_LOG_DIR`) and the current log file path. The directory is created if needed and
+  `$EC2PATCHER_LOG_DIR`, else `$DADSOPS_LOG_DIR`) and the current log file path. The directory is created if needed and
   must be writable, or it is not saved. Logs rotate at 5 MB, keeping 5 old files.
 - **APT Repositories**: mirrors, keyring, changelog via mirrors and the opt-in fallbacks (see
   [Corporate networks](#corporate-networks-apt-mirrors-and-proxies)); stored in the settings table.
@@ -622,6 +622,9 @@ available). Stop with **Shutdown App** in the sidebar or Ctrl+C.
 
 Other environment variables: `NVD_API_KEY` (a key saved in Settings overrides it),
 `EC2PATCHER_CONFIG_DIR` (location of the secret key file), `EC2PATCHER_LOG_DIR` (default log directory),
+`DADSOPS_LOG_DIR` (shared DadsOps default log directory, used when `EC2PATCHER_LOG_DIR` is unset),
+`AWS_PROFILE` / `AWS_REGION` (default AWS profile / region when none is saved in Settings; only
+read, never stored, and shown as "from AWS_PROFILE" / "from AWS_REGION" on the forms),
 `EC2PATCHER_CANONICAL_TIMEOUT_SECONDS` (5),
 `EC2PATCHER_CANONICAL_CACHE_TTL_HOURS` (24), `EC2PATCHER_CANONICAL_BREAKER_THRESHOLD` (3).
 

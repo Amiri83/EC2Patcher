@@ -357,7 +357,7 @@ def test_superseded_report_blocked_in_web(web, pem_file, tmp_path):
         c.post("/reports/analyze")
         page = c.get(old_url).text
         assert patch_service.NEWER_ANALYSIS in page
-        assert '<button type="button" class="btn btn-primary" disabled>' in page
+        assert '<button type="button" class="btn" disabled>' in page
         r = c.post(f"{old_url}/approve", data={"confirm": "yes"})
         assert r.status_code == 409 and "A newer analysis exists" in r.text
         assert "install" not in web.state["fake"].ops and web.state["fetcher"].calls == []

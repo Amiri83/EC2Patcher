@@ -4,41 +4,35 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}EC2 Patcher{% endblock %} · EC2 Patcher</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='theme/dadsops-theme.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
   {% block head %}{% endblock %}
 </head>
 <body>
-<div class="layout">
-  <aside class="sidebar">
-    <div class="brand">
-      <span class="brand-title">EC2 Patcher</span>
-      <span class="brand-sub">v{{ version }}</span>
-    </div>
-    <nav class="nav">
-      {% set items = [('dashboard', '/', 'Dashboard'), ('servers', '/servers', 'Servers'),
-                      ('reports', '/reports', 'Reports'),
-                      ('analysis', '/analysis/latest', 'Analysis'), ('patch-report', '/patch-report', 'Patch Report'),
-                      ('history', '/history', 'History'),
-                      ('settings', '/settings', 'Settings')] %}
-      {% for key, href, label in items %}
-        <a href="{{ href }}" class="nav-link{% if active == key %} active{% endif %}"
-           {% if active == key %}aria-current="page"{% endif %}>{{ label }}</a>
-      {% endfor %}
-    </nav>
-    <div class="nav-bottom">
-      <a href="/shutdown" class="nav-link nav-shutdown{% if active == 'shutdown' %} active{% endif %}">Shutdown App</a>
-    </div>
-  </aside>
-  <main class="content">
-    <header class="page-header">
-      <h1>{% block heading %}{% endblock %}</h1>
-      {% block header_actions %}{% endblock %}
-    </header>
-    {% if notice %}<div class="alert alert-success" role="status">{{ notice }}</div>{% endif %}
-    {% if error %}<div class="alert alert-error" role="alert">{{ error }}</div>{% endif %}
-    {% block content %}{% endblock %}
-  </main>
-</div>
+<header class="shell-header">
+  <span class="brand"><a href="/">EC2 Patcher</a><span class="tagline">v{{ version }}</span></span>
+  <nav aria-label="Main">
+    {% set items = [('dashboard', '/', 'Dashboard'), ('servers', '/servers', 'Servers'),
+                    ('reports', '/reports', 'Reports'),
+                    ('analysis', '/analysis/latest', 'Analysis'), ('patch-report', '/patch-report', 'Patch Report'),
+                    ('history', '/history', 'History'),
+                    ('settings', '/settings', 'Settings')] %}
+    {% for key, href, label in items %}
+      <a href="{{ href }}"{% if active == key %} class="active" aria-current="page"{% endif %}>{{ label }}</a>
+    {% endfor %}
+    <a href="/shutdown" class="nav-shutdown{% if active == 'shutdown' %} active{% endif %}"
+       {% if active == 'shutdown' %}aria-current="page"{% endif %}>Shutdown App</a>
+  </nav>
+</header>
+<main class="page">
+  <header class="page-header">
+    <h1>{% block heading %}{% endblock %}</h1>
+    {% block header_actions %}{% endblock %}
+  </header>
+  {% if notice %}<div class="flash ok" role="status">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="flash error" role="alert">{{ error }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
 {% block overlay %}{% endblock %}
 <script src="{{ url_for('static', path='app.js') }}"></script>
 </body>
