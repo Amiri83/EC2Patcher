@@ -13,7 +13,7 @@
     <noscript>
       <div class="form-actions">
         <span class="spacer"></span>
-        <button type="submit" class="btn btn-primary">Upload Report</button>
+        <button type="submit" class="btn">Upload Report</button>
       </div>
     </noscript>
   </form>
@@ -29,7 +29,7 @@
 </div>
 
 {% if upload_error %}
-  <div class="alert alert-error" role="alert">{{ upload_error }}</div>
+  <div class="flash error" role="alert">{{ upload_error }}</div>
 {% endif %}
 
 {% if validation %}
@@ -77,7 +77,7 @@
     </dl>
     <p class="small"><a href="/reports/latest/download">Download as JSON</a></p>
     {% if missing_servers %}
-      <div class="alert alert-warning">Some servers in this report are no longer configured: {{ missing_servers|join(", ") }}</div>
+      <div class="flash warn">Some servers in this report are no longer configured: {{ missing_servers|join(", ") }}</div>
     {% endif %}
     <table class="table">
       <thead><tr><th>Server</th><th class="num">CVEs</th><th>Identifiers</th></tr></thead>
@@ -109,7 +109,7 @@
     pre-patch report. Servers that do not run Ubuntu are listed as "OS not supported yet". No packages are downloaded, installed or restarted.</p>
   {% if report %}
     <form method="post" action="/reports/analyze" class="form-actions">
-      <button type="submit" class="btn btn-primary" {% if analysis_running %}disabled{% endif %}>Analyze Report</button>
+      <button type="submit" class="btn" {% if analysis_running %}disabled{% endif %}>Analyze Report</button>
       <span class="muted small">{{ report.filename }} &middot; {{ report.server_count }} server{{ "" if report.server_count == 1 else "s" }} &middot; {{ report.cve_count }} CVE{{ "" if report.cve_count == 1 else "s" }}</span>
     </form>
   {% else %}
@@ -123,7 +123,7 @@
       notices, the package's changelog, then the per-CVE JSON as a last resort.
     </dd>
   </dl>
-  {% if metadata_status.warning %}<div class="alert alert-warning">{{ metadata_status.warning }}</div>{% endif %}
+  {% if metadata_status.warning %}<div class="flash warn">{{ metadata_status.warning }}</div>{% endif %}
 
   {% if runs %}
     <table class="table">

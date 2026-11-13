@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Patch Report{% endblock %}
 {% block heading %}Patch Report{% endblock %}
-{% block header_actions %}<a href="/patch-report/export.xlsx{% if export_query %}?{{ export_query }}{% endif %}" class="btn btn-primary" id="export-xlsx">Export .xlsx</a>{% endblock %}
+{% block header_actions %}<a href="/patch-report/export.xlsx{% if export_query %}?{{ export_query }}{% endif %}" class="btn" id="export-xlsx">Export .xlsx</a>{% endblock %}
 {% block content %}
 <div class="card">
   <form method="get" action="/patch-report" class="filter-form">
@@ -24,8 +24,8 @@
     <label>Date <input type="date" name="date" value="{{ filters.date }}"></label>
     <label>From <input type="date" name="date_from" value="{{ filters.date_from }}"></label>
     <label>To <input type="date" name="date_to" value="{{ filters.date_to }}"></label>
-    <button type="submit" class="btn btn-secondary">Apply</button>
-    <a href="/patch-report" class="btn btn-ghost">Clear</a>
+    <button type="submit" class="btn secondary">Apply</button>
+    <a href="/patch-report" class="btn ghost">Clear</a>
   </form>
   <p class="muted small">Dates match the day a row was imported or patched, in this machine's time zone.</p>
 </div>

@@ -3,7 +3,7 @@
 {% block heading %}Patch All: Analysis #{{ run.id }}{% endblock %}
 {% block content %}
 <div class="card confirm-card">
-  <div class="alert alert-error"><strong>This action will modify installed packages on {{ eligible|length }} server{{ "" if eligible|length == 1 else "s" }}{% if not skip_reboot %} and reboot the ones that require it{% endif %}.</strong></div>
+  <div class="flash error"><strong>This action will modify installed packages on {{ eligible|length }} server{{ "" if eligible|length == 1 else "s" }}{% if not skip_reboot %} and reboot the ones that require it{% endif %}.</strong></div>
   <p>The servers below are patched <strong>one at a time, in this order</strong>. Each server is revalidated, simulated, installed, verified and cleaned up exactly like a single-server patch. <strong>The queue stops at the first failure</strong>; the remaining servers are not run.</p>
 
   <h3>Servers to patch ({{ eligible|length }})</h3>
@@ -48,8 +48,8 @@
     {% set unconfirmed_total = eligible|map("last")|map(attribute="unconfirmed_count")|sum %}
     {% if unconfirmed_total %}<label class="check-label unconfirmed-ack"><input type="checkbox" name="acknowledged_unconfirmed" value="{{ unconfirmed_total }}" required> Patch anyway: the plans upgrade packages for {{ unconfirmed_total }} CVE{{ "" if unconfirmed_total == 1 else "s" }} that Canonical has not confirmed as fixed (opt-in fallback)</label>{% endif %}
     <label class="check-label"><input type="checkbox" name="skip_reboot" value="1"{% if skip_reboot %} checked{% endif %}> Skip reboot</label>
-    <a href="/analysis/{{ run.id }}" class="btn btn-secondary">Cancel</a>
-    {% if eligible %}<button type="submit" class="btn btn-danger" data-once>Patch {{ eligible|length }} Server{{ "" if eligible|length == 1 else "s" }}</button>{% endif %}
+    <a href="/analysis/{{ run.id }}" class="btn secondary">Cancel</a>
+    {% if eligible %}<button type="submit" class="btn danger" data-once>Patch {{ eligible|length }} Server{{ "" if eligible|length == 1 else "s" }}</button>{% endif %}
   </form>
   <p class="muted small">Reboot: after a server is patched and cleaned up it is rebooted with <code>sudo reboot</code> only if <code>/run/reboot-required</code> exists on it and Skip reboot is unchecked; EC2Patcher then waits up to 10 minutes for SSH to come back before continuing. A reboot that does not come back stops the queue.</p>
 </div>

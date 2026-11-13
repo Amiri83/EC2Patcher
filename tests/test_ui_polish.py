@@ -349,10 +349,12 @@ def test_main_no_longer_writes_into_the_data_dir(monkeypatch, tmp_path, restore_
 # --- 4. stylesheet ----------------------------------------------------------------------------
 
 
-def test_stylesheet_is_local_with_dark_mode(client):
-    css = client.get("/static/style.css").text
-    assert "prefers-color-scheme: dark" in css
-    assert "@import" not in css and "http://" not in css and "https://" not in css
+def test_stylesheets_are_local_and_dark_only(client):
+    for path in ("/static/style.css", "/static/theme/dadsops-theme.css"):
+        css = client.get(path).text
+        assert "prefers-color-scheme" not in css and "color-scheme: light" not in css, path
+        assert "@import" not in css and "http://" not in css and "https://" not in css, path
+    assert "color-scheme: dark" in client.get("/static/theme/dadsops-theme.css").text
     for url in ("/", "/servers", "/reports", "/settings", "/history", "/shutdown"):
         page = client.get(url).text
         hosts = re.findall(r'(?:href|src)="(?:https?:)?//([^/"]+)', page)
@@ -360,9 +362,10 @@ def test_stylesheet_is_local_with_dark_mode(client):
         assert "<style" not in page or "@import" not in page
 
 
-def test_shutdown_page_has_inline_dark_mode(client):
+def test_shutdown_page_is_inline_and_dark_only(client):
     page = client.post("/shutdown", data={"confirm": "yes"}).text
-    assert "has been shut down" in page and "prefers-color-scheme: dark" in page
+    assert "has been shut down" in page and "color-scheme: dark" in page
+    assert "prefers-color-scheme" not in page and "light" not in page
     assert "<link" not in page and "http" not in page.split("<body>")[0]
 
 

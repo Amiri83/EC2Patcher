@@ -16,6 +16,12 @@ DATA_DIR_ENV = "EC2PATCHER_DATA_DIR"
 PLUGIN_BIN_DIRNAME = "bin"  # under the data directory
 # Default log directory (the Settings page can choose another one, stored in the database).
 LOG_DIR_ENV = "EC2PATCHER_LOG_DIR"
+# Shared DadsOps log directory: the default when EC2PATCHER_LOG_DIR is unset.
+SHARED_LOG_DIR_ENV = "DADSOPS_LOG_DIR"
+# Shared AWS defaults (the AWS CLI's own variables): the default profile and region when none is
+# saved in Settings. Only read, never stored in the settings.
+AWS_PROFILE_ENV = "AWS_PROFILE"
+AWS_REGION_ENV = "AWS_REGION"
 # Config directory holding the Fernet key file of the stored secrets (never the database).
 CONFIG_DIR_ENV = "EC2PATCHER_CONFIG_DIR"
 SECRET_KEY_FILENAME = "secret.key"  # noqa: S105 - a file name, not a secret
@@ -66,10 +72,22 @@ def get_aws_config_path() -> Path:
 
 
 def get_default_log_dir() -> Path:
-    """Default log directory: $EC2PATCHER_LOG_DIR, else the per-user log dir from platformdirs
-    (e.g. ~/.local/state/ec2patcher/log on Linux). Not created here."""
-    raw = os.environ.get(LOG_DIR_ENV) or user_log_dir(APP_NAME, appauthor=False)
-    return Path(raw).expanduser()
+    """Default log directory: $EC2PATCHER_LOG_DIR, else $DADSOPS_LOG_DIR, else the per-user log
+    dir from platformdirs (e.g. ~/.local/state/ec2patcher/log on Linux). Not created here."""
+    return Path(default_log_dir_source()[0]).expanduser()
+
+
+def default_log_dir_source() -> tuple[str, str | None]:
+    """(raw directory, name of the environment variable it came from or None)."""
+    for name in (LOG_DIR_ENV, SHARED_LOG_DIR_ENV):
+        if raw := os.environ.get(name):
+            return raw, name
+    return user_log_dir(APP_NAME, appauthor=False), None
+
+
+def get_env_aws_default(name: str) -> str | None:
+    """$AWS_PROFILE / $AWS_REGION stripped, or None when unset or empty."""
+    return os.environ.get(name, "").strip() or None
 
 
 def get_apt_state_dir(data_dir: Path, override: str | None = None) -> Path:

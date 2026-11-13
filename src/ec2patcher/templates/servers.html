@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Servers{% endblock %}
 {% block heading %}Servers{% endblock %}
-{% block header_actions %}<a href="/servers/new" class="btn btn-primary">+ Add Server</a>{% endblock %}
+{% block header_actions %}<a href="/servers/new" class="btn">+ Add Server</a>{% endblock %}
 {% block content %}
 <div class="card">
   <div class="card-header">
@@ -44,18 +44,18 @@
           </div>
           <div class="server-actions">
             <form method="post" action="/servers/{{ s.id }}/test">
-              <button type="submit" class="btn btn-secondary btn-sm">Test connection</button>
+              <button type="submit" class="btn secondary btn-sm">Test connection</button>
             </form>
             {% if conn.type == "ssm" and conn.instance_source != "set manually" %}
             <form method="post" action="/servers/{{ s.id }}/resolve-instance">
-              <button type="submit" class="btn btn-secondary btn-sm">Resolve instance ID</button>
+              <button type="submit" class="btn secondary btn-sm">Resolve instance ID</button>
             </form>
             {% endif %}
-            <a href="/servers/{{ s.id }}/edit" class="btn btn-secondary btn-sm">Edit</a>
-            <a href="/servers/new?clone={{ s.id }}" class="btn btn-secondary btn-sm">Clone</a>
+            <a href="/servers/{{ s.id }}/edit" class="btn secondary btn-sm">Edit</a>
+            <a href="/servers/new?clone={{ s.id }}" class="btn secondary btn-sm">Clone</a>
             <form method="post" action="/servers/{{ s.id }}/delete"
                   data-confirm="Delete server '{{ s.name }}'?">
-              <button type="submit" class="btn btn-danger-outline btn-sm">Delete</button>
+              <button type="submit" class="btn danger btn-sm">Delete</button>
             </form>
           </div>
           {% if instance_result and tested_id == s.id %}
@@ -74,7 +74,7 @@
     <div class="empty-state">
       <p class="empty-title">No servers configured</p>
       <p class="muted">Add your first EC2 server to get started.</p>
-      <a href="/servers/new" class="btn btn-primary">+ Add Server</a>
+      <a href="/servers/new" class="btn">+ Add Server</a>
     </div>
   {% endif %}
 </div>
@@ -89,7 +89,7 @@
     <div class="inline">
       <input type="text" id="confirm_text" name="confirm_text" autocomplete="off"
              data-required-text="{{ confirm_text }}" placeholder="{{ confirm_text }}">
-      <button type="submit" class="btn btn-danger" data-enable-when-confirmed>Clear All Servers</button>
+      <button type="submit" class="btn danger" data-enable-when-confirmed>Clear All Servers</button>
     </div>
   </form>
 </div>

@@ -42,7 +42,8 @@ def test_all_pages_render(client):
 
 def test_active_nav_marked(client):
     r = client.get("/reports")
-    assert '<a href="/reports" class="nav-link active"' in r.text
+    assert '<a href="/reports" class="active" aria-current="page"' in r.text
+    assert r.text.count('aria-current="page"') == 1
 
 
 def test_static_assets_served(client):

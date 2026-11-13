@@ -1,0 +1,165 @@
+/* DadsOps shared theme v1 — master copy, tools copy this file unchanged */
+/*
+  One dark theme for every DadsOps tool, taken from TFLens (static/app.css + style.css).
+  Plain CSS: no imports, no web fonts, no image URLs. Tools link it first and put their own
+  CSS after it; to change the look, change this master copy in DadsOps and bump the version.
+
+  Markup it styles:
+    <header class="shell-header"><span class="brand"><a href="/">Name</a></span>
+      <nav><a class="active" aria-current="page" href="/">Home</a> ...</nav>
+      <span class="ctx">context</span></header>
+    <main class="page"> ... </main>
+    .card  .cards (grid)  .btn / button (.secondary .danger .ghost)  .badge (.ok .warn .err .info)
+    table (th / td)  form fields (label, input, select, textarea, fieldset, legend)
+    .flash (.ok .warn .error)  .muted .small .mono .hint .empty
+*/
+
+/* ---------------------------------------------------------------- design tokens */
+:root {
+  color-scheme: dark;
+  /* typography: one sans stack (Inter when installed locally, never downloaded), mono for code */
+  --sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --fs-xs: 12.5px; --fs-sm: 13.5px; --fs-base: 15px; --fs-md: 17px; --fs-lg: 20px; --fs-xl: 24px;
+  --lh: 1.6;
+  /* spacing and shape */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px;
+  --radius: 10px; --radius-sm: 6px; --radius-pill: 999px;
+  --page-max: 1400px;
+  /* surfaces and text */
+  --bg: #0d1117; --bg-panel: #161b22; --bg-subtle: #1c2129; --bg-hover: #262c36;
+  --fg: #f0f4f8; --fg-muted: #cdd5dd; --fg-faint: #aab4be;
+  --border: #3d444d; --border-strong: #6e7681;
+  /* the top menu */
+  --header-bg: #010409; --header-fg: #f0f6fc; --header-muted: #b7c0ca; --header-border: #30363d;
+  /* accent and states */
+  --accent: #5ca6ff; --accent-fg: #0d1117; --accent-bg: #12305a; --accent-border: #388bfd;
+  --ok: #56d364; --ok-bg: #12301b; --ok-border: #238636;
+  --warn: #e3b341; --warn-bg: #3b2e0a; --warn-border: #9e6a03;
+  --danger: #ff7b72; --danger-bg: #42181b; --danger-border: #da3633;
+  --sel-bg: #1d4b8f; --sel-fg: #ffffff;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .5), 0 8px 20px rgba(0, 0, 0, .4);
+}
+
+/* ---------------------------------------------------------------- base */
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; }
+body {
+  min-height: 100vh; display: flex; flex-direction: column;
+  font: var(--fs-base)/var(--lh) var(--sans); color: var(--fg); background: var(--bg);
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
+code, kbd, pre, samp, .mono { font-family: var(--mono); }
+.mono, code { font-size: .93em; }
+input, select, textarea, button { font: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+a { color: var(--accent); }
+h1 { font-size: var(--fs-xl); line-height: 1.25; margin: 0 0 var(--sp-4); }
+h2 { font-size: var(--fs-lg); line-height: 1.3; font-weight: 650; margin: var(--sp-5) 0 var(--sp-2); overflow-wrap: anywhere; }
+h3 { font-size: var(--fs-sm); line-height: 1.4; font-weight: 650; margin: 20px 0 var(--sp-2);
+     text-transform: uppercase; letter-spacing: .5px; color: var(--fg-muted); }
+p { margin: var(--sp-2) 0; }
+pre { margin: var(--sp-2) 0; padding: 10px 12px; overflow: auto; font: 13px/1.5 var(--mono); color: var(--fg);
+      background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); }
+.muted, .hint { color: var(--fg-faint); }
+.small { font-size: var(--fs-xs); }
+.empty { color: var(--fg-faint); font-style: italic; }
+.wrap { overflow-wrap: anywhere; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+           clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+/* ---------------------------------------------------------------- top menu */
+.shell-header {
+  display: flex; align-items: stretch; gap: 1.5rem; flex: none; min-height: 48px; padding: 0 1.25rem;
+  background: var(--header-bg); color: var(--header-fg); border-bottom: 1px solid var(--header-border);
+}
+.shell-header .brand { font-weight: 700; letter-spacing: .02em; align-self: center; white-space: nowrap; }
+.shell-header .brand a { color: inherit; text-decoration: none; }
+.shell-header .brand .tagline { font-weight: 400; color: var(--header-muted); margin-left: .4rem; }
+.shell-header nav { display: flex; align-self: stretch; }
+.shell-header nav a {
+  display: flex; align-items: center; padding: 0 .9rem; color: var(--header-muted); white-space: nowrap;
+  text-decoration: none; font-weight: 500; border-top: 3px solid transparent; border-bottom: 3px solid transparent;
+}
+.shell-header nav a:hover, .shell-header nav a:focus-visible { color: var(--header-fg); background: var(--bg-hover); }
+.shell-header nav a.active, .shell-header nav a[aria-current="page"] {
+  color: var(--header-fg); font-weight: 700; border-bottom-color: var(--accent); background: var(--bg-hover);
+}
+.shell-header .ctx {
+  margin-left: auto; align-self: center; color: var(--header-muted); font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+
+/* ---------------------------------------------------------------- page layout */
+main.page { flex: 1; width: 100%; max-width: var(--page-max); margin: 0 auto; padding: 1.25rem; }
+.shell-footer { flex: none; padding: var(--sp-4) 1.25rem; text-align: center; color: var(--fg-faint);
+                font-size: var(--fs-xs); border-top: 1px solid var(--header-border); }
+
+/* ---------------------------------------------------------------- flash / banner messages */
+.flash { padding: .55rem .8rem; border-radius: var(--radius-sm); margin: 0 0 var(--sp-3);
+         color: var(--fg); background: var(--bg-subtle); border: 1px solid var(--border); }
+.flash a { color: var(--accent); }
+.flash.ok { background: var(--ok-bg); border-color: var(--ok-border); }
+.flash.warn { background: var(--warn-bg); border-color: var(--warn-border); }
+.flash.error { background: var(--danger-bg); border-color: var(--danger-border); }
+
+/* ---------------------------------------------------------------- buttons */
+button, .btn {
+  display: inline-flex; align-items: center; gap: var(--sp-1); padding: .4rem .85rem; cursor: pointer;
+  font-weight: 600; text-decoration: none; color: var(--accent-fg); background: var(--accent);
+  border: 1px solid var(--accent-border); border-radius: var(--radius-sm); line-height: 1.3;
+}
+button:hover, .btn:hover { filter: brightness(1.1); }
+button:disabled, .btn[aria-disabled="true"] { opacity: .6; cursor: not-allowed; filter: none; }
+button.secondary, .btn.secondary { color: var(--fg); background: var(--bg-subtle); border-color: var(--border); }
+button.secondary:hover, .btn.secondary:hover { background: var(--bg-hover); filter: none; }
+button.danger, .btn.danger { color: var(--fg); background: var(--danger-bg); border-color: var(--danger-border); }
+button.ghost, .btn.ghost { color: var(--accent); background: none; border-color: transparent; padding: 0 var(--sp-1); }
+.actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+
+/* ---------------------------------------------------------------- badges */
+.badge {
+  display: inline-block; padding: 0 .55rem; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600;
+  line-height: 1.7; white-space: nowrap; color: var(--fg-muted); background: var(--bg-hover);
+  border: 1px solid var(--border);
+}
+.badge.ok { color: var(--ok); background: var(--ok-bg); border-color: var(--ok-border); }
+.badge.warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-border); }
+.badge.err { color: var(--danger); background: var(--danger-bg); border-color: var(--danger-border); }
+.badge.info { color: var(--accent); background: var(--accent-bg); border-color: var(--accent-border); }
+
+/* ---------------------------------------------------------------- cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; margin: var(--sp-2) 0; }
+.card {
+  position: relative; display: flex; flex-direction: column; gap: var(--sp-2); padding: 1rem 1.15rem;
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.card h2, .card h3 { margin: 0; }
+.card.muted-card { opacity: .8; }
+
+/* ---------------------------------------------------------------- tables */
+table { width: 100%; border-collapse: collapse; background: var(--bg-panel); }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--fg-muted); font-weight: 650; font-size: var(--fs-sm); background: var(--bg-subtle); }
+tbody tr:hover td { background: var(--bg-subtle); }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+.table-wrap table { border: 0; }
+
+/* ---------------------------------------------------------------- forms */
+fieldset {
+  margin: 0 0 var(--sp-4); padding: var(--sp-4) 1.15rem; background: var(--bg-panel);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+legend { padding: 0 var(--sp-2); font-weight: 650; color: var(--fg-muted); }
+label { display: block; font-weight: 600; margin: .6rem 0 .2rem; }
+label.check { display: inline-flex; align-items: center; gap: .4rem; font-weight: normal; }
+input:not([type="checkbox"]):not([type="radio"]), select, textarea {
+  max-width: 100%; padding: .35rem .5rem; color: var(--fg); background: var(--bg-subtle);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+input:not([type="checkbox"]):not([type="radio"]):focus, select:focus, textarea:focus { border-color: var(--accent-border); }
+input::placeholder, textarea::placeholder { color: var(--fg-faint); opacity: .8; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width: auto; }
+td input:not([type="checkbox"]):not([type="radio"]), td select { width: 100%; }
+.form-row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; }

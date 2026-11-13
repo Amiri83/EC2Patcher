@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from ec2patcher import config
 from ec2patcher.models import CONNECTION_SSH, CONNECTION_SSM, CONNECTION_TYPES
 from ec2patcher.services import ssm_plugin
 from ec2patcher.validation import check_aws_profile, check_aws_region, check_instance_id
@@ -375,20 +376,57 @@ def _check_failed(target: SsmTarget, reason: str) -> str:
 # --- settings --------------------------------------------------------------------------
 
 
+SOURCE_SETTINGS = "settings"  # where a default profile/region came from
+# otherwise the name of the environment variable (config.AWS_PROFILE_ENV / AWS_REGION_ENV)
+
+
 @dataclass(frozen=True)
 class ConnectionDefaults:
     connection_type: str = CONNECTION_SSH
     profile: str | None = None
     region: str | None = None
+    # Where profile/region came from: SOURCE_SETTINGS, the env variable's name, or None.
+    # Only informative, so two defaults with the same values are equal.
+    profile_source: str | None = field(default=None, compare=False)
+    region_source: str | None = field(default=None, compare=False)
+
+    @property
+    def saved_profile(self) -> str | None:
+        """The profile saved in Settings (never one from the environment)."""
+        return self.profile if self.profile_source == SOURCE_SETTINGS else None
+
+    @property
+    def saved_region(self) -> str | None:
+        return self.region if self.region_source == SOURCE_SETTINGS else None
+
+
+def _env_default(name: str, check: Callable[[str], str | None]) -> str | None:
+    """A valid value of $AWS_PROFILE / $AWS_REGION, else None (an invalid one is ignored)."""
+    value = config.get_env_aws_default(name)
+    return value if value and check(value) is None else None
+
+
+def _default(db, setting: str, env: str, check) -> tuple[str | None, str | None]:
+    if saved := db.get_setting(setting):
+        return saved, SOURCE_SETTINGS
+    if value := _env_default(env, check):
+        return value, env
+    return None, None
 
 
 def load_defaults(db) -> ConnectionDefaults:
+    """The saved defaults; an unsaved profile/region falls back to $AWS_PROFILE / $AWS_REGION."""
     stored = db.get_setting(DEFAULT_CONNECTION_SETTING)
+    profile, profile_source = _default(
+        db, DEFAULT_PROFILE_SETTING, config.AWS_PROFILE_ENV, check_aws_profile
+    )
+    region, region_source = _default(
+        db, DEFAULT_REGION_SETTING, config.AWS_REGION_ENV, check_aws_region
+    )
     return ConnectionDefaults(
         stored if stored in CONNECTION_TYPES else CONNECTION_SSH,
-        db.get_setting(DEFAULT_PROFILE_SETTING) or None,
-        db.get_setting(DEFAULT_REGION_SETTING) or None,
-    )
+        profile, region, profile_source, region_source,
+    )  # fmt: skip
 
 
 def save_defaults(db, connection_type: str, profile: str, region: str) -> None:
@@ -409,10 +447,10 @@ def check_defaults(connection_type: str, profile: str, region: str) -> dict[str,
         errors["aws_profile"] = error
     if region and (error := check_aws_region(region)):
         errors["aws_region"] = error
-    if connection_type == CONNECTION_SSM:
-        if not profile:
+    if connection_type == CONNECTION_SSM:  # an unset one may come from $AWS_PROFILE / $AWS_REGION
+        if not profile and not _env_default(config.AWS_PROFILE_ENV, check_aws_profile):
             errors["aws_profile"] = "SSH over SSM as the default needs a default AWS profile."
-        if not region:
+        if not region and not _env_default(config.AWS_REGION_ENV, check_aws_region):
             errors["aws_region"] = "SSH over SSM as the default needs a default AWS region."
     return errors
 

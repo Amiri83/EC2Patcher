@@ -3,9 +3,9 @@
 {% block head %}{% if queue.is_running %}<noscript><meta http-equiv="refresh" content="3"></noscript>{% endif %}{% endblock %}
 {% block heading %}Patch All #{{ queue.id }}{% endblock %}
 {% block header_actions %}<div class="header-actions">
-  <button type="button" class="btn btn-secondary rp-needs-js" data-rp-show>Show progress</button>
-  <a href="/analysis/{{ queue.analysis_run_id }}" class="btn btn-secondary">Analysis #{{ queue.analysis_run_id }}</a>
-  <a href="/history" class="btn btn-secondary">History</a>
+  <button type="button" class="btn secondary rp-needs-js" data-rp-show>Show progress</button>
+  <a href="/analysis/{{ queue.analysis_run_id }}" class="btn secondary">Analysis #{{ queue.analysis_run_id }}</a>
+  <a href="/history" class="btn secondary">History</a>
 </div>{% endblock %}
 {% block overlay %}{% with progress_ref="queue-%d"|format(queue.id), progress_active=queue.is_running %}{% include "_run_progress.html" %}{% endwith %}{% endblock %}
 {% block content %}
@@ -22,7 +22,7 @@
   </dl>
   {% if queue.is_running %}<p class="progress-message">Patching&hellip; <span class="muted small">(this page refreshes automatically)</span></p>{% endif %}
   {% set not_run = queue.items|selectattr("status", "equalto", "NOT_RUN")|list %}
-  {% if not_run %}<div class="alert alert-warning"><strong>Not run ({{ not_run|length }}):</strong> {{ not_run|map(attribute="server_name")|join(", ") }}</div>{% endif %}
+  {% if not_run %}<div class="flash warn"><strong>Not run ({{ not_run|length }}):</strong> {{ not_run|map(attribute="server_name")|join(", ") }}</div>{% endif %}
 </div>
 
 <div class="card">
@@ -40,7 +40,7 @@
         <td>{% if ex %}<span class="badge {{ patch_badges.get(ex.state, 'badge-warning') }}">{{ patch_labels.get(ex.state, ex.state) }}</span>{% else %}-{% endif %}</td>
         <td>{% if ex and ex.reboot_status %}<span class="badge {{ reboot_badges.get(ex.reboot_status, 'badge-warning') }}">{{ reboot_labels.get(ex.reboot_status, ex.reboot_status) }}</span>{% else %}-{% endif %}</td>
         <td class="small">{{ item.detail or "" }}</td>
-        <td>{% if item.execution_id %}<a href="/patch/{{ item.execution_id }}" class="btn btn-secondary btn-sm">Details</a>{% endif %}</td>
+        <td>{% if item.execution_id %}<a href="/patch/{{ item.execution_id }}" class="btn secondary btn-sm">Details</a>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>

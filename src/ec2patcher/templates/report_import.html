@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Paste Security List{% endblock %}
 {% block heading %}Paste Security List{% endblock %}
-{% block header_actions %}<a href="/reports" class="btn btn-secondary">Back to Reports</a>{% endblock %}
+{% block header_actions %}<a href="/reports" class="btn secondary">Back to Reports</a>{% endblock %}
 {% block content %}
 {% if loaded %}
   <div class="card result-ok" id="import-loaded">
@@ -17,10 +17,10 @@
     </dl>
     <p class="muted small">It is now the latest report, ready to analyze.</p>
     <div class="form-actions">
-      <a href="/reports/latest/download" class="btn btn-secondary">Download JSON</a>
-      <a href="/patch-report" class="btn btn-secondary">Patch Report</a>
+      <a href="/reports/latest/download" class="btn secondary">Download JSON</a>
+      <a href="/patch-report" class="btn secondary">Patch Report</a>
       <span class="spacer"></span>
-      <a href="/reports#analysis" class="btn btn-primary">Go to Analysis</a>
+      <a href="/reports#analysis" class="btn">Go to Analysis</a>
     </div>
   </div>
 {% endif %}
@@ -34,10 +34,10 @@
       <textarea id="raw_text" name="raw_text" rows="12" spellcheck="false" class="paste-area">{{ raw_text }}</textarea>
     </div>
     <div class="form-actions">
-      <button type="submit" name="action" value="preview" class="btn btn-secondary">Preview</button>
+      <button type="submit" name="action" value="preview" class="btn secondary">Preview</button>
       {% if matched and not loaded %}
         <span class="spacer"></span>
-        <button type="submit" name="action" value="confirm" class="btn btn-primary"{% if not (matched|selectattr("server_name")|list) %} disabled{% endif %}>Confirm and Load</button>
+        <button type="submit" name="action" value="confirm" class="btn"{% if not (matched|selectattr("server_name")|list) %} disabled{% endif %}>Confirm and Load</button>
       {% endif %}
     </div>
   </form>
@@ -46,13 +46,13 @@
 {% if parsed %}
   {% set unknown = matched|rejectattr("server_name")|list %}
   {% if unknown %}
-    <div class="alert alert-warning" id="import-unknown">{{ unknown|length }} record{{ "" if unknown|length == 1 else "s" }} name{{ "s" if unknown|length == 1 else "" }} a host without a saved server and {{ "is" if unknown|length == 1 else "are" }} left out of the report. Add the server, then paste the list again.</div>
+    <div class="flash warn" id="import-unknown">{{ unknown|length }} record{{ "" if unknown|length == 1 else "s" }} name{{ "s" if unknown|length == 1 else "" }} a host without a saved server and {{ "is" if unknown|length == 1 else "are" }} left out of the report. Add the server, then paste the list again.</div>
   {% endif %}
   {% if parsed.without_host %}
-    <div class="alert alert-warning" id="import-no-host">{{ parsed.without_host|length }} CVE run{{ "" if parsed.without_host|length == 1 else "s" }} had no host in the text and {{ "was" if parsed.without_host|length == 1 else "were" }} dropped: {% for run in parsed.without_host %}{{ run|join(", ") }}{% if not loop.last %}; {% endif %}{% endfor %}</div>
+    <div class="flash warn" id="import-no-host">{{ parsed.without_host|length }} CVE run{{ "" if parsed.without_host|length == 1 else "s" }} had no host in the text and {{ "was" if parsed.without_host|length == 1 else "were" }} dropped: {% for run in parsed.without_host %}{{ run|join(", ") }}{% if not loop.last %}; {% endif %}{% endfor %}</div>
   {% endif %}
   {% if parsed.invalid_cves %}
-    <div class="alert alert-warning" id="import-invalid">Not valid CVE IDs, ignored: {{ parsed.invalid_cves|join(", ") }}</div>
+    <div class="flash warn" id="import-invalid">Not valid CVE IDs, ignored: {{ parsed.invalid_cves|join(", ") }}</div>
   {% endif %}
   {% if matched %}
     <div class="card" id="import-preview">
